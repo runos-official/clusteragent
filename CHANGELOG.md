@@ -7,6 +7,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.1
+
+- Fix: datastore tables are now correctly prefixed `cluster_agent_` in the shared
+  `runos` database. The GORM models' explicit `TableName()` returned unprefixed
+  names, which overrides the `NamingStrategy` table prefix, so migrations created
+  bare tables (e.g. `buildkit_jobs`). `TableName()` now returns the full prefixed
+  name (`cluster_agent_buildkit_jobs`, ...), with a regression test over the
+  migrated schema. No data migration: the agent re-provisions the prefixed tables
+  on the system Postgres; any bare tables from v1.1.0 are orphaned and can be
+  dropped.
+
 ## v1.1.0
 
 Datastore moves to the cluster's system PostgreSQL; the agent is now stateless.
