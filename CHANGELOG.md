@@ -7,6 +7,21 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.0.0
+
+First public release of the RunOS cluster agent.
+
+- Source-available under the Elastic License 2.0.
+- Published as a multiarch (`linux/amd64` + `linux/arm64`) container image to
+  `ghcr.io/runos-official/clusteragent`, built by GitHub Actions on a `v*` tag
+  with a keyless Sigstore build-provenance attestation. The rendered Kubernetes
+  deploy manifest and a `checksums.txt` ship as release assets.
+- Pre-release tags (`-rc.N`) publish a hidden release candidate: pushed and
+  pinnable by exact version, never tagged `:latest`, and excluded from the
+  "Latest release" pointer, so normal consumers keep getting the latest stable.
+- Verify a release image with:
+  `gh attestation verify oci://ghcr.io/runos-official/clusteragent:1.0.0 --repo runos-official/clusteragent`.
+
 ## v0.17.0
 
 Baseline of the public release pipeline.
