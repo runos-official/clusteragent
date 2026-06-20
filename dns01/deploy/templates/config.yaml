@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runos-config
+  namespace: runos
+data:
+  aid: "{{.AID}}"  # Replace with your actual AID value
+  server: "{{.NODEWARD_SERVER}}"  # Replace with your actual server URL
+  installer_url: "{{.INSTALLER_URL}}"  # URL for the installer
+  cd: "{{.CD}}"  # cluster domain like cid.aid.runos.xyz

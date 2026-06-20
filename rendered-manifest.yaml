@@ -1,0 +1,349 @@
+---
+# Source: runos-cluster-agent/templates/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runos-cluster-agent
+  namespace: "runos"
+  labels:
+    app: runos-cluster-agent
+---
+# Source: runos-cluster-agent/templates/config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runos-config
+  namespace: runos
+data:
+  aid: ""  # Replace with your actual AID value
+  server: ""  # Replace with your actual server URL
+  installer_url: ""  # URL for the installer
+  cd: ""  # cluster domain like cid.aid.runos.xyz
+---
+# Source: runos-cluster-agent/templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: runos-cluster-agent-data
+  namespace: "runos"
+  labels:
+    app: runos-cluster-agent
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+# Source: runos-cluster-agent/templates/rbac.yaml
+# For the webhook functionality - permissions needed by cert-manager
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: runos-cluster-agent:domain-solver
+  labels:
+    app: runos-cluster-agent
+rules:
+  - apiGroups:
+      - acme.runos.com
+    resources:
+      - '*'
+    verbs:
+      - 'create'
+---
+# Source: runos-cluster-agent/templates/rbac.yaml
+# For your main app - full admin access
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: runos-cluster-agent:admin
+  labels:
+    app: runos-cluster-agent
+rules:
+  - apiGroups:
+      - "*"
+    resources:
+      - "*"
+    verbs:
+      - "*"
+---
+# Source: runos-cluster-agent/templates/rbac.yaml
+# Bind the domain-solver role to cert-manager
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: runos-cluster-agent:domain-solver
+  labels:
+    app: runos-cluster-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: runos-cluster-agent:domain-solver
+subjects:
+  - apiGroup: ""
+    kind: ServiceAccount
+    name: cert-manager
+    namespace: cert-manager
+---
+# Source: runos-cluster-agent/templates/rbac.yaml
+# Bind the admin role to your app
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: runos-cluster-agent:admin
+  labels:
+    app: runos-cluster-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: runos-cluster-agent:admin
+subjects:
+  - apiGroup: ""
+    kind: ServiceAccount
+    name: runos-cluster-agent
+    namespace: runos
+---
+# Source: runos-cluster-agent/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: runos-cluster-agent:auth-delegator
+  labels:
+    app: runos-cluster-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - apiGroup: ""
+    kind: ServiceAccount
+    name: runos-cluster-agent
+    namespace: runos
+---
+# Source: runos-cluster-agent/templates/rbac.yaml
+# These remain the same - needed for the webhook functionality
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: runos-cluster-agent:webhook-authentication-reader
+  namespace: kube-system
+  labels:
+    app: runos-cluster-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - apiGroup: ""
+    kind: ServiceAccount
+    name: runos-cluster-agent
+    namespace: runos
+---
+# Source: runos-cluster-agent/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: runos-cluster-agent
+  namespace: "runos"
+  labels:
+    app: runos-cluster-agent
+    chart: runos-cluster-agent-0.1.0
+    release: runos-cluster-agent
+    heritage: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - port: 443
+      targetPort: https
+      protocol: TCP
+      name: https
+    - port: 80
+      targetPort: webhook
+      protocol: TCP
+      name: webhook
+  selector:
+    app: runos-cluster-agent
+    release: runos-cluster-agent
+---
+# Source: runos-cluster-agent/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runos-cluster-agent
+  namespace: "runos"
+  labels:
+    app: runos-cluster-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: runos-cluster-agent
+      release: runos-cluster-agent
+  template:
+    metadata:
+      labels:
+        app: runos-cluster-agent
+        release: runos-cluster-agent
+    spec:
+      serviceAccountName: runos-cluster-agent
+      # Conservative pod-level hardening. We deliberately do NOT set
+      # runAsNonRoot or readOnlyRootFilesystem here: the agent writes to the
+      # /data PVC and shells out to kubectl/helm/buildctl, so changing the
+      # user or making the root FS read-only can break it. seccomp is safe.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runos-cluster-agent
+          image: "ghcr.io/runos-official/clusteragent:0.17.0"
+          imagePullPolicy: Always
+          # Container-level hardening kept conservative for the same reason:
+          # drop all capabilities and forbid privilege escalation, but leave
+          # the user / root FS alone (the agent needs to write /data and run
+          # kubectl/helm/buildctl).
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --tls-cert-file=/tls/tls.crt
+            - --tls-private-key-file=/tls/tls.key
+          env:
+            - name: GROUP_NAME
+              value: "acme.runos.com"
+          envFrom:
+            - configMapRef:
+                name: runos-config
+          ports:
+            - name: https
+              containerPort: 443
+              protocol: TCP
+            - name: webhook
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+          volumeMounts:
+            - name: certs
+              mountPath: /tls
+              readOnly: true
+            - name: data
+              mountPath: /data
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+      volumes:
+        - name: certs
+          secret:
+            secretName: runos-cluster-agent-webhook-tls
+        - name: data
+          persistentVolumeClaim:
+            claimName: runos-cluster-agent-data
+---
+# Source: runos-cluster-agent/templates/apiservice.yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.acme.runos.com
+  labels:
+    app: runos-cluster-agent
+    chart: runos-cluster-agent-0.1.0
+    release: runos-cluster-agent
+    heritage: Helm
+  annotations:
+    cert-manager.io/inject-ca-from: "runos/runos-cluster-agent-webhook-tls"
+spec:
+  group: acme.runos.com
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  service:
+    name: runos-cluster-agent
+    namespace: runos
+  version: v1alpha1
+---
+# Source: runos-cluster-agent/templates/pki.yaml
+# Generate a CA Certificate used to sign certificates for the webhook
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: runos-cluster-agent-ca
+  namespace: "runos"
+  labels:
+    app: runos-cluster-agent
+    chart: runos-cluster-agent-0.1.0
+    release: runos-cluster-agent
+    heritage: Helm
+spec:
+  secretName: runos-cluster-agent-ca
+  duration: 43800h # 5y
+  issuerRef:
+    name: runos-cluster-agent-selfsign
+  commonName: "ca.example-webhook.cert-manager"
+  isCA: true
+---
+# Source: runos-cluster-agent/templates/pki.yaml
+# Finally, generate a serving certificate for the webhook to use
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: runos-cluster-agent-webhook-tls
+  namespace: "runos"
+  labels:
+    app: runos-cluster-agent
+    chart: runos-cluster-agent-0.1.0
+    release: runos-cluster-agent
+    heritage: Helm
+spec:
+  secretName: runos-cluster-agent-webhook-tls
+  duration: 8760h # 1y
+  issuerRef:
+    name: runos-cluster-agent-ca
+  dnsNames:
+  - runos-cluster-agent
+  - runos-cluster-agent.runos
+  - runos-cluster-agent.runos.svc
+---
+# Source: runos-cluster-agent/templates/pki.yaml
+# Create a selfsigned Issuer, in order to create a root CA certificate for
+# signing webhook serving certificates
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: runos-cluster-agent-selfsign
+  namespace: "runos"
+  labels:
+    app: runos-cluster-agent
+    chart: runos-cluster-agent-0.1.0
+    release: runos-cluster-agent
+    heritage: Helm
+spec:
+  selfSigned: {}
+---
+# Source: runos-cluster-agent/templates/pki.yaml
+# Create an Issuer that uses the above generated CA certificate to issue certs
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: runos-cluster-agent-ca
+  namespace: "runos"
+  labels:
+    app: runos-cluster-agent
+    chart: runos-cluster-agent-0.1.0
+    release: runos-cluster-agent
+    heritage: Helm
+spec:
+  ca:
+    secretName: runos-cluster-agent-ca

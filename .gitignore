@@ -1,0 +1,53 @@
+# Build output
+build/
+dist/
+bin/
+clusteragent
+*.exe
+*.so
+*.dylib
+
+# Test + coverage
+*.test
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependencies
+vendor/
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local AI-assistant / editor state (never shipped publicly)
+.claude/
+CLAUDE.md
+AGENTS.md
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Local SQLite build state
+*.db
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.log
