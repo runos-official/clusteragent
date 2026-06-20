@@ -2,8 +2,6 @@ package datastore
 
 import (
 	"testing"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestOneShotJob_Lifecycle(t *testing.T) {

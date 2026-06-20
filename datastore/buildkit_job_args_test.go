@@ -1,37 +1,60 @@
 package datastore
 
 import (
-	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
-// setupTestDB points the package-level db at a fresh temp SQLite file and runs
-// the same schema + migrations Initialize() would, without touching the
-// hardcoded /data path. Restores the previous handle on cleanup.
+// setupTestDB installs a fresh temp SQLite database (pure-Go glebarez driver, no
+// CGO) as the active handle DIRECTLY via setHandle, bypassing the reconcile
+// loop, the pointer ConfigMap, and Kubernetes entirely so the query-function
+// tests run with no Postgres and no cluster. AutoMigrate uses the SAME
+// NamingStrategy (cluster_agent_ prefix) Initialize()'s loop uses, so the schema
+// under test matches production. Restores the previous handle on cleanup.
+//
+// testDB returns the live handle so tests that need to read raw rows can do so.
 func setupTestDB(t *testing.T) {
 	t.Helper()
-	prev := db
-	t.Cleanup(func() {
-		if db != nil {
-			db.Close()
-		}
-		db = prev
-	})
 
-	var err error
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err = sql.Open("sqlite3", dbPath)
+	gdb, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+		NamingStrategy: schema.NamingStrategy{
+			TablePrefix: tablePrefix,
+		},
+	})
 	if err != nil {
 		t.Fatalf("open temp db: %v", err)
 	}
-	db.SetMaxOpenConns(1)
-	if err := createTables(); err != nil {
-		t.Fatalf("createTables: %v", err)
+	if err := gdb.AutoMigrate(allModels()...); err != nil {
+		t.Fatalf("automigrate: %v", err)
 	}
+
+	prev := setHandle(gdb)
+	t.Cleanup(func() {
+		if cur := setHandle(prev); cur != nil {
+			if sqlDB, err := cur.DB(); err == nil {
+				sqlDB.Close()
+			}
+		}
+	})
+}
+
+// testDB returns the active handle for tests that read raw model rows directly.
+// It fails the test if no handle is installed (setupTestDB must run first).
+func testDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	gdb, err := activeDB()
+	if err != nil {
+		t.Fatalf("no active test DB: %v", err)
+	}
+	return gdb
 }
 
 func TestInsertBuildKitJobArgs_RoundTrip(t *testing.T) {
@@ -131,25 +154,18 @@ func TestUploadTokenBuildArgs_EmptyDefault(t *testing.T) {
 	}
 }
 
-// queryJobArgs reads the buildkit_job_args rows for a job ordered by insertion.
+// queryJobArgs reads the buildkit_job_args rows for a job ordered by insertion
+// (the autoincrement id), straight from the model so the test exercises the
+// real persisted shape.
 func queryJobArgs(t *testing.T, jobID string) []BuildArg {
 	t.Helper()
-	rows, err := db.Query(`SELECT arg_key, arg_value, source FROM buildkit_job_args WHERE build_job_id = ? ORDER BY id ASC`, jobID)
-	if err != nil {
+	var rows []BuildKitJobArgModel
+	if err := testDB(t).Where("build_job_id = ?", jobID).Order("id ASC").Find(&rows).Error; err != nil {
 		t.Fatalf("query job args: %v", err)
 	}
-	defer rows.Close()
-
-	var out []BuildArg
-	for rows.Next() {
-		var a BuildArg
-		if err := rows.Scan(&a.Key, &a.Value, &a.Source); err != nil {
-			t.Fatalf("scan job arg: %v", err)
-		}
-		out = append(out, a)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows err: %v", err)
+	out := make([]BuildArg, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, BuildArg{Key: r.ArgKey, Value: r.ArgValue, Source: r.Source})
 	}
 	return out
 }

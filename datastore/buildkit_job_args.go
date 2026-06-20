@@ -18,19 +18,26 @@ type BuildArg struct {
 // A nil/empty slice is a no-op: deploys with no build args write zero rows,
 // exactly as before this feature existed. Callers pass the same list they
 // hand to BuildKit, so the persisted record reflects what actually produced
-// the image.
+// the image. Rows are created in slice order so the autoincrement id preserves
+// insertion order for readers.
 func InsertBuildKitJobArgs(buildJobID string, args []BuildArg) error {
 	if len(args) == 0 {
 		return nil
 	}
-	query := `
-		INSERT INTO buildkit_job_args (build_job_id, arg_key, arg_value, source)
-		VALUES (?, ?, ?, ?)
-	`
-	for _, a := range args {
-		if _, err := db.Exec(query, buildJobID, a.Key, a.Value, a.Source); err != nil {
-			return err
-		}
+	gdb, err := activeDB()
+	if err != nil {
+		return err
 	}
-	return nil
+	rows := make([]BuildKitJobArgModel, 0, len(args))
+	for _, a := range args {
+		rows = append(rows, BuildKitJobArgModel{
+			BuildJobID: buildJobID,
+			ArgKey:     a.Key,
+			ArgValue:   a.Value,
+			Source:     a.Source,
+		})
+	}
+	// CreateInBatches preserves slice order, so the autoincrement id keeps the
+	// caller's insertion order, matching the row-by-row INSERT it replaces.
+	return gdb.CreateInBatches(rows, len(rows)).Error
 }

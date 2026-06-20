@@ -12,7 +12,8 @@
 #                    CHANGELOG has a matching section, working tree clean & synced,
 #                    sensitivity scan (PUBLIC repo: fail closed on secret-shaped
 #                    content in the deploy payload).
-#   2. Code gates  - go build ./..., go vet ./..., go test ./... (CGO on).
+#   2. Code gates  - go build ./... (CGO off, proves the static/cross build),
+#                    go vet ./..., go test -race ./... (CGO on; race needs cgo).
 #   3. Deploy      - tag the dev commit and push the tag + dev. main is NOT
 #                    touched (the human merges main after personal verification).
 #   4. CI watch    - wait for the Release workflow run for this tag to succeed.
@@ -134,7 +135,7 @@ ok "no secret-shaped content in release payload"
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 git checkout --quiet "$INTEGRATION_BRANCH"
 
-step "Build";  CGO_ENABLED=1 go build ./... || die "go build failed"; ok "go build"
+step "Build";  CGO_ENABLED=0 go build ./... || die "go build failed"; ok "go build"
 step "Vet";    go vet ./...                  || die "go vet failed";   ok "go vet"
 step "Test";   CGO_ENABLED=1 go test -race ./... || die "go test failed"; ok "go test"
 

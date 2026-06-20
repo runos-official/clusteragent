@@ -24,7 +24,16 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      # CGO is on for the mattn/go-sqlite3 driver; the ubuntu runner ships gcc.
+      # The production build is CGO-free (pure-Go GORM + Postgres + glebarez
+      # SQLite drivers). Verify it builds with CGO off so a C dependency can't
+      # creep back in and break the static cross-compiled release image.
+      - name: Build (CGO off)
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      # The race detector needs cgo; the ubuntu runner ships gcc and runs this
+      # natively on amd64, so CGO is on here only for -race.
       - name: Run tests
         env:
           CGO_ENABLED: "1"

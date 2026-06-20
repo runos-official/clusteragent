@@ -19,9 +19,10 @@ spec:
     spec:
       serviceAccountName: {{ .Chart.Name }}
       # Conservative pod-level hardening. We deliberately do NOT set
-      # runAsNonRoot or readOnlyRootFilesystem here: the agent writes to the
-      # /data PVC and shells out to kubectl/helm/buildctl, so changing the
-      # user or making the root FS read-only can break it. seccomp is safe.
+      # runAsNonRoot or readOnlyRootFilesystem here: the agent shells out to
+      # kubectl/helm/buildctl, so changing the user or making the root FS
+      # read-only can break it. seccomp is safe. The agent is stateless (its
+      # state lives in the system PostgreSQL), so there is no PVC.
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -31,8 +32,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # Container-level hardening kept conservative for the same reason:
           # drop all capabilities and forbid privilege escalation, but leave
-          # the user / root FS alone (the agent needs to write /data and run
-          # kubectl/helm/buildctl).
+          # the user / root FS alone (the agent runs kubectl/helm/buildctl).
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -44,6 +44,13 @@ spec:
           env:
             - name: GROUP_NAME
               value: {{ .Values.groupName | quote }}
+            # The agent discovers the cluster's system PostgreSQL via this
+            # ConfigMap (maintained by the control plane) and self-provisions
+            # its own database there; no DB credentials live in this manifest.
+            - name: RUNOS_SYSTEM_DB_REF
+              value: {{ .Values.systemDb.configMapName | quote }}
+            - name: RUNOS_SYSTEM_DB_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
           envFrom:
             - configMapRef:
                 name: runos-config
@@ -68,17 +75,12 @@ spec:
             - name: certs
               mountPath: /tls
               readOnly: true
-            - name: data
-              mountPath: /data
           resources:
 {{ toYaml .Values.resources | indent 12 }}
       volumes:
         - name: certs
           secret:
             secretName: {{ include "example-webhook.servingCertificate" . }}
-        - name: data
-          persistentVolumeClaim:
-            claimName: {{ .Chart.Name }}-data
     {{- with .Values.nodeSelector }}
       nodeSelector:
 {{ toYaml . | indent 8 }}

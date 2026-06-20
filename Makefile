@@ -27,10 +27,11 @@ HELM_FILES := $(shell find dns01/deploy -type f)
 # Development
 # ============================================================================
 
-# Build a local binary (CGO on for the sqlite driver) stamped with the version.
+# Build a local binary stamped with the version. CGO is off: the datastore now
+# uses pure-Go GORM drivers, so the binary is static and cross-compiles cleanly.
 .PHONY: build
 build:
-	@CGO_ENABLED=1 $(GO) build -ldflags "$(LDFLAGS)" -o clusteragent .
+	@CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o clusteragent .
 
 .PHONY: test
 test:

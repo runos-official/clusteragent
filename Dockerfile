@@ -3,9 +3,13 @@
 # bump, resolve the new multi-arch index digest with:
 #   docker buildx imagetools inspect golang:1.24-alpine3.20   # copy the Digest
 #   docker buildx imagetools inspect alpine:3.18
-FROM golang:1.24-alpine3.20@sha256:9f98e9893fbc798c710f3432baa1e0ac6127799127c3101d2c263c3a954f0abe AS build_deps
+# The build stage runs natively on the BUILD platform (no QEMU) and
+# cross-compiles to the TARGET platform with Go's own toolchain. The agent is
+# now CGO-free (pure-Go GORM + Postgres + glebarez SQLite drivers), so no C
+# toolchain or sqlite-dev is needed and the resulting binary is already static.
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine3.20@sha256:9f98e9893fbc798c710f3432baa1e0ac6127799127c3101d2c263c3a954f0abe AS build_deps
 
-RUN apk add --no-cache git gcc musl-dev sqlite-dev
+RUN apk add --no-cache git
 
 WORKDIR /workspace
 
@@ -18,13 +22,13 @@ FROM build_deps AS build
 
 COPY . .
 
-ARG TARGETARCH
+ARG TARGETOS TARGETARCH
 # VERSION is injected by the release pipeline (the pushed git tag) and stamped
 # into version.Version via -ldflags -X. Defaults to "dev" for plain builds.
 ARG VERSION=dev
-RUN CGO_ENABLED=1 GOARCH=${TARGETARCH} go build -o runos \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o runos \
     -trimpath \
-    -ldflags "-w -extldflags \"-static\" -X github.com/runos-official/clusteragent/version.Version=${VERSION}" .
+    -ldflags "-w -X github.com/runos-official/clusteragent/version.Version=${VERSION}" .
 
 FROM alpine:3.18@sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f
 
@@ -66,10 +70,10 @@ RUN apk add --no-cache ca-certificates wget curl git && \
 
 COPY --from=build /workspace/runos /usr/local/bin/runos
 
-# Runs as root deliberately (no non-root USER). The agent writes its SQLite
-# datastore to the /data PVC and shells out to kubectl/helm/buildctl for
-# privileged in-cluster operations; dropping to a non-root UID here breaks
-# /data writes and the tooling without a coordinated PVC fsGroup + tool
-# permission change. The deployment manifest documents the same rationale at
+# Runs as root deliberately (no non-root USER). The agent shells out to
+# kubectl/helm/buildctl for privileged in-cluster operations; dropping to a
+# non-root UID here breaks the tooling without a coordinated permission change.
+# State now lives in Postgres (no local /data PVC), so persistence no longer
+# constrains the UID. The deployment manifest documents the same rationale at
 # the pod securityContext. Revisit together if hardening to non-root.
 ENTRYPOINT ["runos"]

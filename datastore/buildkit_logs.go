@@ -4,7 +4,8 @@ import (
 	"time"
 )
 
-// BuildKitLog represents a build log entry
+// BuildKitLog represents a build log entry returned to callers. JSON tags are
+// the LIST_BUILD_LOGS wire contract; the persistence shape is BuildKitLogModel.
 type BuildKitLog struct {
 	ID        int64     `json:"id"`
 	JobID     string    `json:"job_id"`
@@ -12,14 +13,23 @@ type BuildKitLog struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+func (m BuildKitLogModel) toDTO() BuildKitLog {
+	return BuildKitLog{
+		ID:        int64(m.ID),
+		JobID:     m.JobID,
+		LogEntry:  m.LogEntry,
+		CreatedAt: m.CreatedAt,
+	}
+}
+
 // InsertBuildKitLog inserts a new log entry for a build job
 func InsertBuildKitLog(jobID, logEntry string) error {
-	query := `
-		INSERT INTO buildkit_logs (job_id, log_entry)
-		VALUES (?, ?)
-	`
-	_, err := db.Exec(query, jobID, logEntry)
-	return err
+	gdb, err := activeDB()
+	if err != nil {
+		return err
+	}
+	entry := BuildKitLogModel{JobID: jobID, LogEntry: logEntry}
+	return gdb.Create(&entry).Error
 }
 
 // QueryBuildKitLogsOptions holds filter options for querying logs
@@ -32,49 +42,32 @@ type QueryBuildKitLogsOptions struct {
 
 // QueryBuildKitLogs retrieves logs for a specific job with optional filters
 func QueryBuildKitLogs(opts QueryBuildKitLogsOptions) ([]BuildKitLog, error) {
-	query := `
-		SELECT id, job_id, log_entry, created_at
-		FROM buildkit_logs
-		WHERE job_id = ?
-	`
-	args := []any{opts.JobID}
-
-	if opts.SinceID > 0 {
-		query += " AND id > ?"
-		args = append(args, opts.SinceID)
-	}
-
-	if opts.Desc {
-		query += " ORDER BY id DESC"
-	} else {
-		query += " ORDER BY id ASC"
-	}
-
-	if opts.Limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, opts.Limit)
-	}
-
-	rows, err := db.Query(query, args...)
+	gdb, err := activeDB()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	q := gdb.Model(&BuildKitLogModel{}).Where("job_id = ?", opts.JobID)
 
-	var logs []BuildKitLog
-	for rows.Next() {
-		var log BuildKitLog
-		err := rows.Scan(
-			&log.ID,
-			&log.JobID,
-			&log.LogEntry,
-			&log.CreatedAt,
-		)
-		if err != nil {
-			return nil, err
-		}
-		logs = append(logs, log)
+	if opts.SinceID > 0 {
+		q = q.Where("id > ?", opts.SinceID)
+	}
+	if opts.Desc {
+		q = q.Order("id DESC")
+	} else {
+		q = q.Order("id ASC")
+	}
+	if opts.Limit > 0 {
+		q = q.Limit(opts.Limit)
 	}
 
-	return logs, rows.Err()
+	var models []BuildKitLogModel
+	if err := q.Find(&models).Error; err != nil {
+		return nil, err
+	}
+
+	var logs []BuildKitLog
+	for _, m := range models {
+		logs = append(logs, m.toDTO())
+	}
+	return logs, nil
 }

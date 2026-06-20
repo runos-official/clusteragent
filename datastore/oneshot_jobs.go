@@ -1,9 +1,10 @@
 package datastore
 
 import (
-	"database/sql"
 	"fmt"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // OneShotJob is the audit record for a `runos run` one-off task: a Kubernetes
@@ -39,33 +40,64 @@ const (
 	OneShotStatusTimeout = "timeout"
 )
 
+func (m OneShotJobModel) toDTO() OneShotJob {
+	return OneShotJob{
+		ID:             int64(m.ID),
+		RunID:          m.RunID,
+		OSID:           m.OSID,
+		Namespace:      m.Namespace,
+		Image:          m.Image,
+		Command:        m.Command,
+		K8sJobName:     m.K8sJobName,
+		Status:         m.Status,
+		ExitCode:       m.ExitCode,
+		Actor:          m.Actor,
+		TimeoutSeconds: m.TimeoutSeconds,
+		CreatedAt:      m.CreatedAt,
+		UpdatedAt:      m.UpdatedAt,
+		CompletedAt:    m.CompletedAt,
+	}
+}
+
 // CreateOneShotJob inserts the audit record at dispatch time, before the Job
 // has reached a terminal state. exit_code and completed_at are filled in later
 // by UpdateOneShotJobResult.
 func CreateOneShotJob(runID, osid, namespace, image, command, k8sJobName, actor string, timeoutSeconds int) error {
-	query := `
-		INSERT INTO one_shot_jobs (run_id, osid, namespace, image, command, k8s_job_name, status, actor, timeout_seconds)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-	_, err := db.Exec(query, runID, osid, namespace, image, command, k8sJobName, OneShotStatusPending, actor, timeoutSeconds)
-	return err
+	gdb, err := activeDB()
+	if err != nil {
+		return err
+	}
+	job := OneShotJobModel{
+		RunID:          runID,
+		OSID:           osid,
+		Namespace:      namespace,
+		Image:          image,
+		Command:        command,
+		K8sJobName:     k8sJobName,
+		Status:         OneShotStatusPending,
+		Actor:          actor,
+		TimeoutSeconds: timeoutSeconds,
+	}
+	return gdb.Create(&job).Error
 }
 
 // UpdateOneShotJobStatus moves a run to a non-terminal status (e.g. running)
 // without recording an exit code.
 func UpdateOneShotJobStatus(runID, status string) error {
-	result, err := db.Exec(
-		`UPDATE one_shot_jobs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE run_id = ?`,
-		status, runID,
-	)
+	gdb, err := activeDB()
 	if err != nil {
 		return err
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
+	res := gdb.Model(&OneShotJobModel{}).
+		Where("run_id = ?", runID).
+		Updates(map[string]any{
+			"status":     status,
+			"updated_at": gorm.Expr("CURRENT_TIMESTAMP"),
+		})
+	if res.Error != nil {
+		return res.Error
 	}
-	if rows == 0 {
+	if res.RowsAffected == 0 {
 		return fmt.Errorf("one-shot job not found: %s", runID)
 	}
 	return nil
@@ -74,20 +106,22 @@ func UpdateOneShotJobStatus(runID, status string) error {
 // UpdateOneShotJobResult records the terminal outcome: status, the container's
 // real exit code, and the completion timestamp. Idempotent on re-call.
 func UpdateOneShotJobResult(runID, status string, exitCode int) error {
-	result, err := db.Exec(
-		`UPDATE one_shot_jobs
-		 SET status = ?, exit_code = ?, updated_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP
-		 WHERE run_id = ?`,
-		status, exitCode, runID,
-	)
+	gdb, err := activeDB()
 	if err != nil {
 		return err
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
+	res := gdb.Model(&OneShotJobModel{}).
+		Where("run_id = ?", runID).
+		Updates(map[string]any{
+			"status":       status,
+			"exit_code":    exitCode,
+			"updated_at":   gorm.Expr("CURRENT_TIMESTAMP"),
+			"completed_at": gorm.Expr("CURRENT_TIMESTAMP"),
+		})
+	if res.Error != nil {
+		return res.Error
 	}
-	if rows == 0 {
+	if res.RowsAffected == 0 {
 		return fmt.Errorf("one-shot job not found: %s", runID)
 	}
 	return nil
@@ -95,35 +129,14 @@ func UpdateOneShotJobResult(runID, status string, exitCode int) error {
 
 // GetOneShotJob retrieves a single run by run_id.
 func GetOneShotJob(runID string) (*OneShotJob, error) {
-	query := `
-		SELECT id, run_id, osid, namespace, image, command, k8s_job_name, status, exit_code, actor, timeout_seconds, created_at, updated_at, completed_at
-		FROM one_shot_jobs
-		WHERE run_id = ?
-	`
-	var job OneShotJob
-	var exitCode sql.NullInt64
-	err := db.QueryRow(query, runID).Scan(
-		&job.ID,
-		&job.RunID,
-		&job.OSID,
-		&job.Namespace,
-		&job.Image,
-		&job.Command,
-		&job.K8sJobName,
-		&job.Status,
-		&exitCode,
-		&job.Actor,
-		&job.TimeoutSeconds,
-		&job.CreatedAt,
-		&job.UpdatedAt,
-		&job.CompletedAt,
-	)
+	gdb, err := activeDB()
 	if err != nil {
 		return nil, err
 	}
-	if exitCode.Valid {
-		ec := int(exitCode.Int64)
-		job.ExitCode = &ec
+	var m OneShotJobModel
+	if err := gdb.Where("run_id = ?", runID).First(&m).Error; err != nil {
+		return nil, err
 	}
-	return &job, nil
+	dto := m.toDTO()
+	return &dto, nil
 }

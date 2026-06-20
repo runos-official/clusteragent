@@ -1,9 +1,12 @@
 package datastore
 
 import (
-	"database/sql"
+	"errors"
 	"fmt"
 	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type SQLSchemaCache struct {
@@ -17,33 +20,47 @@ type SQLSchemaCache struct {
 // GetSQLSchemaCache retrieves a cached schema entry by connection hash.
 // Returns nil, nil if no entry is found.
 func GetSQLSchemaCache(connectionHash string) (*SQLSchemaCache, error) {
-	row := db.QueryRow(
-		`SELECT id, connection_hash, schema_json, created_at, updated_at
-		 FROM sql_schema_cache WHERE connection_hash = ?`,
-		connectionHash,
-	)
-
-	var entry SQLSchemaCache
-	err := row.Scan(&entry.ID, &entry.ConnectionHash, &entry.SchemaJSON, &entry.CreatedAt, &entry.UpdatedAt)
-	if err == sql.ErrNoRows {
+	gdb, err := activeDB()
+	if err != nil {
+		return nil, err
+	}
+	var m SQLSchemaCacheModel
+	err = gdb.Where("connection_hash = ?", connectionHash).First(&m).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query schema cache: %w", err)
 	}
-	return &entry, nil
+	return &SQLSchemaCache{
+		ID:             int64(m.ID),
+		ConnectionHash: m.ConnectionHash,
+		SchemaJSON:     m.SchemaJSON,
+		CreatedAt:      m.CreatedAt,
+		UpdatedAt:      m.UpdatedAt,
+	}, nil
 }
 
-// UpsertSQLSchemaCache inserts or replaces a cached schema entry.
+// UpsertSQLSchemaCache inserts or replaces a cached schema entry. On a
+// connection_hash conflict it overwrites schema_json and bumps updated_at,
+// matching the original ON CONFLICT DO UPDATE behaviour.
 func UpsertSQLSchemaCache(connectionHash, schemaJSON string) error {
-	_, err := db.Exec(
-		`INSERT INTO sql_schema_cache (connection_hash, schema_json, updated_at)
-		 VALUES (?, ?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(connection_hash) DO UPDATE SET
-		   schema_json = excluded.schema_json,
-		   updated_at = CURRENT_TIMESTAMP`,
-		connectionHash, schemaJSON,
-	)
+	gdb, err := activeDB()
+	if err != nil {
+		return err
+	}
+	entry := SQLSchemaCacheModel{
+		ConnectionHash: connectionHash,
+		SchemaJSON:     schemaJSON,
+		UpdatedAt:      time.Now(),
+	}
+	err = gdb.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "connection_hash"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"schema_json": schemaJSON,
+			"updated_at":  gorm.Expr("CURRENT_TIMESTAMP"),
+		}),
+	}).Create(&entry).Error
 	if err != nil {
 		return fmt.Errorf("failed to upsert schema cache: %w", err)
 	}
@@ -52,7 +69,11 @@ func UpsertSQLSchemaCache(connectionHash, schemaJSON string) error {
 
 // DeleteSQLSchemaCache removes a cached schema entry by connection hash.
 func DeleteSQLSchemaCache(connectionHash string) error {
-	_, err := db.Exec(`DELETE FROM sql_schema_cache WHERE connection_hash = ?`, connectionHash)
+	gdb, err := activeDB()
+	if err != nil {
+		return err
+	}
+	err = gdb.Where("connection_hash = ?", connectionHash).Delete(&SQLSchemaCacheModel{}).Error
 	if err != nil {
 		return fmt.Errorf("failed to delete schema cache: %w", err)
 	}

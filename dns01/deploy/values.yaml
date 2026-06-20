@@ -26,9 +26,11 @@ resources:
     cpu: 200m
     memory: 256Mi
 
-storage:
-  size: 1Gi
-  # storageClassName: ""  # Uncomment to specify a storage class
+# The agent is stateless: its state lives in the cluster's system PostgreSQL,
+# which it discovers via this ConfigMap (maintained by the control plane) and
+# self-provisions into. No PersistentVolume is needed.
+systemDb:
+  configMapName: runos-system-db
 
 nodeSelector: {}
 
