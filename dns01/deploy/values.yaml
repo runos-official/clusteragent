@@ -5,7 +5,7 @@ certManager:
   serviceAccountName: cert-manager
 
 image:
-  repository: ghcr.io/runos-official/clusteragent-dns
+  repository: ghcr.io/runos-official/clusteragent
   tag: latest
   pullPolicy: Always
 
