@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/runos-official/clusteragent/commons"
 
@@ -16,6 +17,10 @@ import (
 	k8s "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+// putSecretK8sTimeout bounds the Secret create/update API calls so a slow or
+// unreachable API server can't hang the handler indefinitely.
+const putSecretK8sTimeout = 30 * time.Second
 
 // secretAlreadyExists reports whether a Secret Create error means the secret
 // is already present (and so the agent should fall back to Update). It exists
@@ -132,7 +137,10 @@ func PutSecretFile(jsonB64 string) (string, string, error) {
 		return "PUT_SECRET_FILE_RESPONSE", jsonResponse, nil
 	}
 
-	ctx := context.Background()
+	// Bound the k8s write so a slow/unreachable API server can't hang the
+	// handler (and the stream worker behind it) indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), putSecretK8sTimeout)
+	defer cancel()
 
 	// Create the secret
 	secret := &corev1.Secret{

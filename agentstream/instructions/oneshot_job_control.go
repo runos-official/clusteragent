@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/runos-official/clusteragent/commons"
 	"github.com/runos-official/clusteragent/datastore"
@@ -11,6 +12,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// oneShotDeleteTimeout bounds the Job delete API call so a slow/unreachable API
+// server can't hang the cleanup handler indefinitely.
+const oneShotDeleteTimeout = 30 * time.Second
 
 // OneShotJobStatusRequest queries a run's terminal state. The conductor polls
 // this alongside LIST_BUILD_LOGS to learn when the run has finished and with
@@ -128,7 +133,9 @@ func CleanupOneShotJob(jsonB64 string) (string, string, error) {
 
 	// Foreground propagation so the Job's pod is removed with it.
 	policy := metav1.DeletePropagationForeground
-	err = clientset.BatchV1().Jobs(namespace).Delete(context.Background(), jobName, metav1.DeleteOptions{
+	ctx, cancel := context.WithTimeout(context.Background(), oneShotDeleteTimeout)
+	defer cancel()
+	err = clientset.BatchV1().Jobs(namespace).Delete(ctx, jobName, metav1.DeleteOptions{
 		PropagationPolicy: &policy,
 	})
 	if err != nil && !errors.IsNotFound(err) {

@@ -1,10 +1,18 @@
 package sqlwrapper
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
+	"time"
 )
+
+// schemaQueryTimeout bounds each schema-introspection query so a slow or
+// unresponsive tenant database can't hang the SQL_SCHEMA handler (and the
+// stream worker behind it) indefinitely. Schema reads previously ran with no
+// deadline at all.
+const schemaQueryTimeout = 30 * time.Second
 
 // FetchSchema introspects the target database and returns all schemas, databases, and tables.
 func FetchSchema(params ConnectionParams) ([]SchemaDatabase, error) {
@@ -40,7 +48,9 @@ func fetchPostgresSchema(params ConnectionParams) ([]SchemaDatabase, error) {
 		return nil, fmt.Errorf("failed to connect to postgres database: %w", err)
 	}
 
-	rows, err := db.Query(`SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname`)
+	ctx, cancel := context.WithTimeout(context.Background(), schemaQueryTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list databases: %w", err)
 	}
@@ -107,7 +117,9 @@ func fetchPostgresTables(db *sql.DB) ([]SchemaTable, error) {
 			)
 		ORDER BY t.table_schema, t.table_name, c.ordinal_position`
 
-	rows, err := db.Query(query)
+	ctx, cancel := context.WithTimeout(context.Background(), schemaQueryTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query postgres schema: %w", err)
 	}
@@ -136,7 +148,9 @@ func fetchMySQLSchema(params ConnectionParams) ([]SchemaDatabase, error) {
 		return nil, fmt.Errorf("failed to connect to mysql: %w", err)
 	}
 
-	rows, err := db.Query(`SHOW DATABASES`)
+	ctx, cancel := context.WithTimeout(context.Background(), schemaQueryTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SHOW DATABASES`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list databases: %w", err)
 	}
@@ -193,7 +207,9 @@ func fetchMySQLTables(db *sql.DB, databaseName string) ([]SchemaTable, error) {
 			AND t.TABLE_TYPE = 'BASE TABLE'
 		ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME, c.ORDINAL_POSITION`
 
-	rows, err := db.Query(query, databaseName)
+	ctx, cancel := context.WithTimeout(context.Background(), schemaQueryTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, query, databaseName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query mysql schema: %w", err)
 	}

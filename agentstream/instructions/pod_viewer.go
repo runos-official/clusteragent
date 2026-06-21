@@ -18,6 +18,17 @@ import (
 	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
+const (
+	// podListTimeout bounds the pod + metrics list calls so a slow/unreachable
+	// API server can't hang the handler indefinitely.
+	podListTimeout = 30 * time.Second
+	// podListServerCap bounds how many pod objects we pull from the API server
+	// in one List. Filtering by searchTerm happens client-side, so this is a
+	// memory safety cap (a huge cluster shouldn't be paged entirely into the
+	// agent), set well above the per-request display Limit.
+	podListServerCap = 2000
+)
+
 type k8sRequest struct {
 	SearchTerm string `json:"searchTerm"`
 	Limit      int    `json:"limit"`
@@ -70,17 +81,19 @@ func K8sPodStatsRequestFromServer(jsonB64 string) (string, string, error) {
 		return "", "", err
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), podListTimeout)
+	defer cancel()
 
-	// Get all pods
-	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	// List pods, bounded server-side so a huge cluster can't be paged entirely
+	// into the agent. Filtering by searchTerm is applied client-side below.
+	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{Limit: podListServerCap})
 	if err != nil {
 		log.Printf("Failed to list pods: %v", err)
 		return "", "", err
 	}
 
 	// Get metrics for all pods
-	podMetricsList, err := metricsClient.MetricsV1beta1().PodMetricses("").List(ctx, metav1.ListOptions{})
+	podMetricsList, err := metricsClient.MetricsV1beta1().PodMetricses("").List(ctx, metav1.ListOptions{Limit: podListServerCap})
 	if err != nil {
 		log.Printf("Failed to list pod metrics: %v", err)
 	}

@@ -1,7 +1,9 @@
 package instructions
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/runos-official/clusteragent/commons"
 	"gopkg.in/yaml.v3"
@@ -60,6 +63,12 @@ type VcsFetchSourceResponse struct {
 }
 
 const maxManifestFileSize = 1 * 1024 * 1024 // 1 MB cap per yaml file
+
+// gitStepTimeout bounds each individual git invocation (clone, fetch, checkout)
+// so a hung clone against an unreachable or slow remote can't pin a worker
+// indefinitely. GIT_TERMINAL_PROMPT=0 already prevents stdin hangs on bad
+// creds; this also covers a server that accepts the connection then stalls.
+const gitStepTimeout = 5 * time.Minute
 
 var serviceYamlNamePattern = regexp.MustCompile(`^runos\.service\.[^/\\]+\.yaml$`)
 
@@ -225,7 +234,11 @@ func gitFetchSHA(authedURL, sha, workdir string) error {
 	}
 
 	for _, args := range steps {
-		cmd := exec.Command(args[0], args[1:]...)
+		// Each git step gets its own timeout via CommandContext so a hung
+		// network op (slow/unreachable remote that accepts the TCP connection
+		// then stalls) is killed instead of pinning the worker forever.
+		ctx, cancel := context.WithTimeout(context.Background(), gitStepTimeout)
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 		cmd.Env = append(os.Environ(),
 			// Disable interactive prompts; if creds in the URL fail we want
 			// a fast hard error, not a hung process waiting on stdin.
@@ -233,12 +246,16 @@ func gitFetchSHA(authedURL, sha, workdir string) error {
 			"GIT_ASKPASS=/bin/true",
 		)
 		out, err := cmd.CombinedOutput()
+		cancel()
 		if err != nil {
 			// Strip the URL from any error string so embedded creds don't
 			// land in conductor logs / job state. The URL appears in the
 			// first step's command, never in stderr — but redact just in
 			// case git ever decides to echo it.
 			msg := strings.ReplaceAll(string(out), authedURL, "<repoUrl>")
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("git %s timed out after %s: %s", args[1], gitStepTimeout, strings.TrimSpace(msg))
+			}
 			return fmt.Errorf("git %s failed: %s", args[1], strings.TrimSpace(msg))
 		}
 	}

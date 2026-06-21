@@ -13,6 +13,26 @@ import (
 	"strings"
 )
 
+// webFinalStatus renders the status line to report for a completed follow flow.
+// It returns resp.Status (e.g. "302 Found", "401 Unauthorized") so the caller
+// sees the real final HTTP status instead of a hardcoded "200 OK". A nil resp
+// (no hop completed) or a resp with an empty Status falls back to a synthetic
+// status derived from the status code, or "000 unknown" when nothing is known.
+// Kept as a tiny pure helper so the nil-guard and real-status behaviour are
+// unit-testable without standing up an HTTP server.
+func webFinalStatus(resp *http.Response) string {
+	if resp == nil {
+		return "000 unknown"
+	}
+	if resp.Status != "" {
+		return resp.Status
+	}
+	if resp.StatusCode != 0 {
+		return fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	return "000 unknown"
+}
+
 // WebRequestFollowFromServer performs a multi-step HTTP flow that follows redirects,
 // maintains cookies, and can auto-submit login forms.
 //
@@ -105,7 +125,14 @@ func WebRequestFollowFromServer(jsonB64 string) (string, string, error) {
 				// Log host+path only: a redirect Location can carry credentials
 				// or tokens in its query string (common in OAuth callbacks).
 				log.Printf("  Redirect -> %s", webURLHostPath(redirectURL.String()))
-				current, _ = http.NewRequest("GET", redirectURL.String(), nil)
+				// A malformed redirect target makes http.NewRequest return a nil
+				// request; feeding that to client.Do panics. Break on the error
+				// and return the response we already have instead.
+				next, newReqErr := http.NewRequest("GET", redirectURL.String(), nil)
+				if newReqErr != nil {
+					return body, resp, nil
+				}
+				current = next
 				continue
 			}
 			break
@@ -140,7 +167,7 @@ func WebRequestFollowFromServer(jsonB64 string) (string, string, error) {
 	}
 
 	log.Printf("Step 1: %s %s", method, webURLHostPath(request.URL))
-	body, _, err := doAndFollow(initialReq)
+	body, finalResp, err := doAndFollow(initialReq)
 	if err != nil {
 		return "", "", fmt.Errorf("step 1: %w", err)
 	}
@@ -170,11 +197,16 @@ func WebRequestFollowFromServer(jsonB64 string) (string, string, error) {
 		loginForm.Set("login", request.LoginCredentials.Username)
 		loginForm.Set("password", request.LoginCredentials.Password)
 
-		loginReq, _ := http.NewRequest("POST", loginURL.String(), strings.NewReader(loginForm.Encode()))
+		// A bad login URL makes http.NewRequest return a nil request; passing
+		// that to client.Do panics. Check the error and bail with a real error.
+		loginReq, newReqErr := http.NewRequest("POST", loginURL.String(), strings.NewReader(loginForm.Encode()))
+		if newReqErr != nil {
+			return "", "", fmt.Errorf("step 2: building login request: %w", newReqErr)
+		}
 		loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 		log.Printf("Step 2: POST %s", webURLHostPath(loginURL.String()))
-		body, _, err = doAndFollow(loginReq)
+		body, finalResp, err = doAndFollow(loginReq)
 		if err != nil {
 			return "", "", fmt.Errorf("step 2 login: %w", err)
 		}
@@ -182,9 +214,14 @@ func WebRequestFollowFromServer(jsonB64 string) (string, string, error) {
 		log.Printf("Step 2: Login flow completed")
 	}
 
+	// Return the real final HTTP status, not a hardcoded "200 OK". A 4xx/5xx on
+	// the last hop was previously masked as success, hiding auth/redirect
+	// failures from the caller. finalResp is nil only if the flow made zero
+	// successful hops, which doAndFollow can't reach without erroring first.
+	responseStatus := webFinalStatus(finalResp)
 	responseJsonB64, err := commons.JsonB64Encode(responseType{
 		ResponseBody:       body,
-		ResponseStatusCode: "200 OK",
+		ResponseStatusCode: responseStatus,
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("encoding response: %w", err)
