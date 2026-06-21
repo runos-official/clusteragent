@@ -7,6 +7,40 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.2
+
+Reliability + robustness pass (from an audit), plus regression tests pinning the
+agent's defensive logic.
+
+### Fixed
+- **Bootstrap no longer crashes the pod on a transient error during cluster
+  creation.** The startup chain (k8s client, runos-config ConfigMap, TLS secret,
+  credential generation, initial connect) was a series of `log.Fatalf`, so any
+  transient hiccup at the most fragile moment (API server warming up, a secret not
+  yet propagated by the installer, Nodeward briefly unreachable, DNS not ready)
+  turned into CrashLoopBackOff with a raw Go fatal. It now retries transients with
+  per-step timeouts and throttled log lines; only a malformed cert already at rest
+  is fatal (with a `kubectl delete secret` remediation hint).
+- **Reconnect is now indefinite** with capped exponential backoff (was a hard exit
+  after 10 attempts, which required a pod restart for any control-plane outage
+  longer than ~10 minutes). Disconnection is surfaced via the health endpoint
+  instead of exiting.
+- **The upload + liveness webhook servers can no longer kill the agent** — they log
+  and retry their bind on failure instead of `log.Fatalf`, so the :8081 upload
+  server can't sever the gRPC control link.
+- **`WEB_REQUEST_FOLLOW`** no longer panics on a malformed redirect/login URL
+  (unchecked `http.NewRequest` error) and returns the real final HTTP status (was
+  hardcoded `"200 OK"`).
+- **Context-bounded** the git clone/fetch shell-outs and several previously
+  unbounded k8s/SQL calls (secret writes, pod listing with a server-side cap, job
+  delete, schema introspection) so a hung remote/API can't wedge a handler.
+
+### Tests
+- Pin the retryable-vs-fatal bootstrap classification + the backoff schedule, the
+  web-request nil-guard + real-status, the SQL read/write classification incl. the
+  comment/whitespace/SET/CTE bypass cases, the VCS path-traversal guard (incl.
+  sibling-prefix escape), and BuildKit credential redaction.
+
 ## v1.1.1
 
 - Fix: datastore tables are now correctly prefixed `cluster_agent_` in the shared
