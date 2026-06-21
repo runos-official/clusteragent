@@ -2,7 +2,6 @@ package instructions
 
 import (
 	"bytes"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -80,13 +79,17 @@ func WebRequestFromServer(jsonB64 string) (string, string, error) {
 	// the raw payload, header values, or the query string.
 	log.Printf("WebRequestFromServer called - %s", webRequestLogLine(request.Method, request.Url, request.Headers))
 
+	// SSRF guard: reject a non-http(s) scheme up front; the transport's dialer
+	// additionally refuses loopback/link-local/cloud-metadata IPs on every hop
+	// (including redirects) and pins the dial to defeat DNS rebinding.
+	if err := validateOutboundScheme(request.Url); err != nil {
+		log.Printf("WebRequestFromServer refused: %v", err)
+		return "", "", err
+	}
+
 	client := &http.Client{
-		Timeout: webRequestTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: request.AllowInsecure, //nolint:gosec // AllowInsecure is an explicit opt-in for self-signed in-cluster endpoints
-			},
-		},
+		Timeout:   webRequestTimeout,
+		Transport: newGuardedTransport(request.AllowInsecure),
 	}
 
 	// Create HTTP request

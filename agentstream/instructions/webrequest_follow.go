@@ -1,7 +1,6 @@
 package instructions
 
 import (
-	"crypto/tls"
 	"fmt"
 	"github.com/runos-official/clusteragent/commons"
 	"io"
@@ -75,19 +74,24 @@ func WebRequestFollowFromServer(jsonB64 string) (string, string, error) {
 	// string, or credentials.
 	log.Printf("WebRequestFollowFromServer called - %s", webRequestLogLine(request.Method, request.URL, request.Headers))
 
+	// SSRF guard: reject a non-http(s) scheme up front; the transport's dialer
+	// additionally refuses loopback/link-local/cloud-metadata IPs on every hop
+	// (this flow follows redirects manually, and each hop dials through the same
+	// guarded transport) and pins the dial to defeat DNS rebinding.
+	if err := validateOutboundScheme(request.URL); err != nil {
+		log.Printf("WebRequestFollowFromServer refused: %v", err)
+		return "", "", err
+	}
+
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return "", "", fmt.Errorf("error creating cookie jar: %w", err)
 	}
 
 	client := &http.Client{
-		Jar:     jar,
-		Timeout: webRequestTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: request.AllowInsecure, //nolint:gosec // AllowInsecure is an explicit opt-in for self-signed in-cluster endpoints
-			},
-		},
+		Jar:       jar,
+		Timeout:   webRequestTimeout,
+		Transport: newGuardedTransport(request.AllowInsecure),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

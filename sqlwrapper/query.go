@@ -55,16 +55,12 @@ func ExecuteQuery(params ConnectionParams, query string, readWrite bool) (*Query
 	//     authoritative gate here.
 	//   - MySQL: `SET SESSION TRANSACTION READ ONLY` only constrains the next
 	//     explicit transaction; it does NOT reliably block autocommit DML/DDL
-	//     the way Postgres does. So for MySQL the authoritative read-only gate
-	//     is the isReadStatement keyword classification below, NOT the SET
-	//     statement: a statement whose first keyword isn't in the read set is
-	//     routed to executeWriteQuery, which is the only path that issues a
-	//     write, and a read-only caller (readWrite=false) is contractually
-	//     expected to send only read statements. The SET statement is
-	//     defense-in-depth for MySQL, not a complete barrier; isReadStatement is
-	//     the primary guard. (Tightening this into a hard server-side block for
-	//     MySQL would require rejecting non-read statements outright when
-	//     readWrite is false; left as-is since no concrete bypass is in scope.)
+	//     the way Postgres does. So for MySQL the authoritative read-only gate is
+	//     the isReadStatement keyword classification: when readWrite is false a
+	//     non-read statement is REJECTED outright (rejectNonReadUnderReadOnly
+	//     below) before it can reach executeWriteQuery, so a write can never hit
+	//     the database on a read-only connection regardless of engine. The SET
+	//     statement remains defense-in-depth.
 	var modeStmt string
 	switch params.DatabaseType {
 	case "postgres":
@@ -84,10 +80,30 @@ func ExecuteQuery(params ConnectionParams, query string, readWrite bool) (*Query
 		return nil, fmt.Errorf("failed to set transaction mode: %w", err)
 	}
 
+	// Defense-in-depth read-only gate: refuse a non-read statement outright when
+	// the caller asked for read-only, rather than routing it to the write path.
+	// On MySQL this is the AUTHORITATIVE gate (the SET above does not block
+	// autocommit DML/DDL); on Postgres it backs up the server-enforced
+	// default_transaction_read_only.
+	if rejectNonReadUnderReadOnly(readWrite, query) {
+		return nil, fmt.Errorf("read-only connection: refusing to execute a non-read statement")
+	}
+
 	if isReadStatement(query) {
 		return executeReadQuery(ctx, conn, query, start)
 	}
 	return executeWriteQuery(ctx, conn, query, start)
+}
+
+// rejectNonReadUnderReadOnly reports whether a statement must be refused before
+// execution: a non-read statement on a read-only (readWrite=false) connection.
+// This makes read-only a hard block instead of relying on per-engine session
+// settings — the authoritative gate for MySQL (whose SET SESSION READ ONLY does
+// not block autocommit DML), and defense-in-depth on Postgres. A statement that
+// isReadStatement does not recognise as a read (incl. a comment- or
+// whitespace-prefixed write, SET, or DDL) is treated as a write and rejected.
+func rejectNonReadUnderReadOnly(readWrite bool, query string) bool {
+	return !readWrite && !isReadStatement(query)
 }
 
 // isReadStatement checks the first keyword of the query to determine if it's a read operation.

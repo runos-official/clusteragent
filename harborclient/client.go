@@ -33,6 +33,11 @@ const (
 	// harborErrBodyLimit caps how much of an error response body we read into
 	// an error message.
 	harborErrBodyLimit = 64 << 10 // 64 KiB
+	// maxArchiveLayerBytes is a hard ceiling on a single CLI-archive layer we
+	// will stream out of Harbor. CLI deploy archives are small (well under this);
+	// the cap stops a compromised or corrupt registry layer from filling the
+	// destination (disk/memory) unbounded.
+	maxArchiveLayerBytes = 1 << 30 // 1 GiB
 )
 
 // httpClient is used for Harbor's plain REST API (list / ensure project). The
@@ -135,15 +140,41 @@ func PullArchive(ctx context.Context, cfg Config, osid, cliUploadID string, w io
 	if len(manifest.Layers) == 0 {
 		return fmt.Errorf("manifest has no layers")
 	}
-	layerRC, err := repo.Fetch(ctx, manifest.Layers[0])
+	layer := manifest.Layers[0]
+	layerRC, err := repo.Fetch(ctx, layer)
 	if err != nil {
 		return fmt.Errorf("fetch layer: %w", err)
 	}
 	defer layerRC.Close()
-	if _, err := io.Copy(w, layerRC); err != nil {
+	if _, err := copyBoundedLayer(w, layerRC, layer.Size, maxArchiveLayerBytes); err != nil {
 		return fmt.Errorf("stream layer: %w", err)
 	}
 	return nil
+}
+
+// copyBoundedLayer streams r into w, refusing to write more than the layer's
+// advertised size (so a lying descriptor that streams more than it claims can't
+// overrun w) and rejecting an advertised size over the hard ceiling. An
+// advertised size <= 0 (unknown) is bounded to the ceiling. Extracted as a pure
+// helper so the bound is unit-testable without a live registry.
+func copyBoundedLayer(w io.Writer, r io.Reader, advertisedSize, ceiling int64) (int64, error) {
+	if advertisedSize > ceiling {
+		return 0, fmt.Errorf("layer advertises %d bytes, over the %d-byte limit", advertisedSize, ceiling)
+	}
+	limit := advertisedSize
+	if limit <= 0 {
+		limit = ceiling
+	}
+	// Read one extra byte so a layer that exceeds its advertised size is detected
+	// rather than silently truncated.
+	n, err := io.Copy(w, io.LimitReader(r, limit+1))
+	if err != nil {
+		return n, err
+	}
+	if n > limit {
+		return n, fmt.Errorf("layer streamed more than its advertised %d bytes (possible decompression bomb)", limit)
+	}
+	return n, nil
 }
 
 // ListArchives queries Harbor's v2 REST API for all artifacts under the OSID

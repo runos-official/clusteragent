@@ -7,6 +7,32 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.3
+
+Security hardening (audit follow-ups), with regression tests.
+
+### Security
+- **SSRF guard on the web-request handlers.** `WEB_REQUEST` and
+  `WEB_REQUEST_FOLLOW` now refuse to connect to loopback, link-local, or cloud
+  instance-metadata (`169.254.169.254`) addresses, and pin the dial to the
+  validated IP so DNS cannot rebind to a blocked address between the check and
+  the connection. The check lives in the dialer, so it also covers every redirect
+  hop (a vetted URL that 3xx-redirects to the metadata IP is blocked). In-cluster
+  private (RFC1918) targets stay allowed and `allowInsecure` still controls TLS
+  verification only. Mirrors the node agent's guard. Closes the path by which a
+  single inbound instruction could exfiltrate cloud IAM credentials.
+- **Read-only SQL connections hard-block writes.** With `readWrite=false`, a
+  non-read statement (including comment-/whitespace-prefixed writes, `SET`, and
+  DDL) is refused before execution rather than routed to the write path. This is
+  the authoritative gate for MySQL (whose `SET SESSION READ ONLY` does not block
+  autocommit DML) and defense-in-depth for Postgres.
+
+### Fixed
+- **`PullArchive` size cap.** Streaming a CLI-archive layer out of Harbor is now
+  bounded to the layer's advertised size (a descriptor that streams more than it
+  claims is rejected) and to a 1 GiB hard ceiling, so a compromised or corrupt
+  registry layer cannot fill disk/memory unbounded.
+
 ## v1.1.2
 
 Reliability + robustness pass (from an audit), plus regression tests pinning the
