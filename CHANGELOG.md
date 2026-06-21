@@ -7,6 +7,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.4
+
+### Fixed
+- **A panic in any instruction handler can no longer crash the agent pod.** The
+  inbound-instruction dispatch (`go handleInstruction`) had no recover boundary
+  anywhere in the binary, so a single handler panic (a control-plane payload
+  parse, a client-go / SQL / serialization edge, or any future handler) would
+  unwind the goroutine and CrashLoopBackOff the whole per-cluster control surface
+  (uploads, webhooks, builds, SQL, Harbor). Dispatch now goes through
+  `safeHandleInstruction`, which recovers, logs the value + stack, replies with an
+  error for the instruction's tag (so the caller is not left hanging), and lets
+  the stream keep serving. Mirrors the node agent's existing guard.
+
 ## v1.1.3
 
 Security hardening (audit follow-ups), with regression tests.

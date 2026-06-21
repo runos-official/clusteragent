@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 	"io"
 	"log"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -357,8 +358,9 @@ func (sm *streamManager) listenForInstructions(stream grpc.BidiStreamingClient[l
 			return fmt.Errorf("error receiving instruction: %w", err)
 		}
 
-		// Process the instruction in a separate goroutine
-		go handleInstruction(instruction)
+		// Process the instruction in a separate goroutine, inside a recover
+		// boundary so a panic in any handler can't crash the whole agent pod.
+		go safeHandleInstruction(instruction)
 	}
 }
 
@@ -413,6 +415,32 @@ func SendToServer(msg *l2sec.FromClusterAgent) error {
 
 func validateUUID(id string) (uuid.UUID, error) {
 	return uuid.Parse(id)
+}
+
+// safeHandleInstruction wraps handleInstruction in a recover boundary so a panic
+// in ANY handler can never unwind the goroutine and crash the agent pod. The
+// cluster agent is a single per-cluster process with no worker-pool isolation,
+// so one unrecovered panic would CrashLoopBackOff the entire control surface
+// (uploads, webhooks, builds, SQL, Harbor). On panic it logs the value + stack
+// and replies with an error for the instruction's tag (so the caller is not left
+// hanging), then returns; the stream loop keeps serving. Mirrors the node
+// agent's stream.go safeHandleInstruction.
+func safeHandleInstruction(instruction *l2sec.ToClusterAgent) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Defensive: the panic may itself have come from a nil/garbage
+			// instruction, so the recovery path must never panic again.
+			var tag string
+			if instruction != nil {
+				tag = instruction.Tag
+			}
+			log.Printf("Recovered from panic handling instruction (tag %s): %v\n%s", tag, r, string(debug.Stack()))
+			if tagID, err := validateUUID(tag); err == nil {
+				respondWithErr(fmt.Sprintf("internal error handling instruction: %v", r), tagID)
+			}
+		}
+	}()
+	handleInstruction(instruction)
 }
 
 func handleInstruction(instruction *l2sec.ToClusterAgent) {
