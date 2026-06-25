@@ -7,6 +7,34 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.5-rc.1
+
+Candidate for VCS/CI deploy env-file resolution. Hidden prerelease for targeted
+dev verification (cluster pin), not advertised.
+
+### Fixed
+- **VCS/CI deploys resolve committed `env:` / `secretEnv:` file paths against
+  the manifest's own directory, not the repo clone-root.** A monorepo app whose
+  config yaml lives in a subdirectory had its referenced env files looked up at
+  the clone-root, found nothing, and deployed with EMPTY env. Security teeth: an
+  empty env drops keys like the source-IP allowlist (`ALLOWED_CIDRS`), silently
+  disabling an in-app control with no error. Paths are now anchored at the config
+  yaml's directory, traversal outside the clone is rejected, and a
+  committed-but-missing `env:` file fails the fetch loudly instead of shipping
+  empty. A gitignored `secretEnv:` file that is absent on the checkout is
+  expected and tolerated (secrets come from server state).
+
+### Changed
+- **VCS source-fetch now carries the resolved env contract the conductor
+  consumes**, mirroring a CLI deploy. The response ships `resolvedEnvVars` /
+  `resolvedSecretEnvVars` with explicit three-state present/absent semantics:
+  field omitted (no `env:`/`secretEnv:` key) -> conductor preserves live
+  ConfigMap/Secret; field present, including empty `{}` -> conductor applies
+  (full replace, an empty committed file legitimately clears it). The cluster
+  agent holds the checkout and dotenv-parses the files (the conductor has no
+  parser), with the parser kept byte-for-byte in lockstep with the CLI's so a
+  committed `.config.env` is interpreted identically on both deploy paths.
+
 ## v1.1.4
 
 ### Fixed
