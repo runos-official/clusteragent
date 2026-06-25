@@ -54,12 +54,39 @@ type VcsFetchSourceServiceYaml struct {
 // reconcile (runos.yaml + every sibling runos.service.*.yaml of the
 // configPath directory) plus a cache key the subsequent VCS_BUILD call
 // references to find the cloned workdir on disk.
+//
+// ResolvedEnvVars / ResolvedSecretEnvVars carry the RESOLVED key/value
+// contents of the committed env files the manifest references via `env:` /
+// `secretEnv:`, read from the manifest's own directory in the checkout and
+// dotenv-parsed here — the cluster agent is the only party with the checkout
+// on a VCS deploy, and the conductor has no dotenv parser, so resolution
+// lives on the side holding the file (the VCS analogue of what the CLI does
+// locally). They mirror the customEnvVars / customSecretEnvVars the CLI
+// sends on a CLI deploy: the conductor applies ResolvedEnvVars to the app
+// ConfigMap and ResolvedSecretEnvVars to its Secret.
+//
+// PRESENT vs ABSENT is load-bearing, so these are pointers (not bare maps):
+// an empty committed file MUST be distinguishable from "no `env:` key",
+// otherwise the conductor can't tell "clear the env" from "preserve it".
+//   - field OMITTED (nil) → the manifest has no env:/secretEnv: key → the
+//     conductor PRESERVES the live ConfigMap/Secret, so env pushed via
+//     `apps sync` / console between deploys is not wiped. The common case.
+//   - field PRESENT (incl. {}) → the manifest names a file that exists → the
+//     conductor APPLIES it (full replace of that ConfigMap/Secret, matching
+//     CLI deploy semantics); an empty committed file legitimately clears it.
+// A missing committed plain `env:` file FAILS the fetch (Success:false)
+// rather than ship a half-state. A missing gitignored `secretEnv:` file is
+// EXPECTED (VCS secrets are server-state managed), so it omits the secret
+// field (→ preserve) and never fails. Contract agreed with the Conductor IA
+// (TS-64 Q29).
 type VcsFetchSourceResponse struct {
-	Success         bool                        `json:"success"`
-	WorkdirCacheKey string                      `json:"workdirCacheKey,omitempty"`
-	RunosYamlBase64 string                      `json:"runosYamlBase64,omitempty"`
-	ServiceYamls    []VcsFetchSourceServiceYaml `json:"serviceYamls,omitempty"`
-	Message         string                      `json:"message,omitempty"`
+	Success               bool                        `json:"success"`
+	WorkdirCacheKey       string                      `json:"workdirCacheKey,omitempty"`
+	RunosYamlBase64       string                      `json:"runosYamlBase64,omitempty"`
+	ServiceYamls          []VcsFetchSourceServiceYaml `json:"serviceYamls,omitempty"`
+	ResolvedEnvVars       *map[string]string          `json:"resolvedEnvVars,omitempty"`
+	ResolvedSecretEnvVars *map[string]string          `json:"resolvedSecretEnvVars,omitempty"`
+	Message               string                      `json:"message,omitempty"`
 }
 
 const maxManifestFileSize = 1 * 1024 * 1024 // 1 MB cap per yaml file
@@ -199,6 +226,18 @@ func VcsFetchSource(jsonB64 string) (string, string, error) {
 		})
 	}
 
+	// Resolve the committed env files the manifest references, anchored at
+	// the manifest's own directory (NOT the clone-root). A missing committed
+	// plain-env file fails loud here rather than letting the app deploy with
+	// empty env (the silent-allowlist-disable footgun this fixes).
+	plainEnv, secretEnv, err := resolveManifestEnvVars(resolvedYamlPath, workdir, configDir)
+	if err != nil {
+		return reply(replyType, VcsFetchSourceResponse{
+			Success: false,
+			Message: fmt.Sprintf("resolve env files for %s: %v", configPath, err),
+		})
+	}
+
 	cacheKey := vcsWorkdirCacheKey(req.OSID, req.SHA)
 	vcsWorkdirCachePut(req.OSID, req.SHA, VcsWorkdirBuildPaths{
 		Workdir:            workdir,
@@ -207,15 +246,26 @@ func VcsFetchSource(jsonB64 string) (string, string, error) {
 		DockerfileFilename: paths.DockerfileFilename,
 	})
 
-	log.Printf("VCS_FETCH_SOURCE: osid=%s sha=%s workdir=%s configPath=%s context=%s dockerfile=%s/%s manifests=%d",
-		req.OSID, req.SHA, workdir, configPath, paths.ContextPath, paths.DockerfileDir, paths.DockerfileFilename, len(serviceYamls))
+	// -1 = field omitted on the wire (conductor preserves live state); >=0 =
+	// present (conductor applies, full replace), value is the key count.
+	plainEnvKeys, secretEnvKeys := -1, -1
+	if plainEnv != nil {
+		plainEnvKeys = len(*plainEnv)
+	}
+	if secretEnv != nil {
+		secretEnvKeys = len(*secretEnv)
+	}
+	log.Printf("VCS_FETCH_SOURCE: osid=%s sha=%s workdir=%s configPath=%s context=%s dockerfile=%s/%s manifests=%d plainEnvKeys=%d secretEnvKeys=%d (-1=omitted/preserve)",
+		req.OSID, req.SHA, workdir, configPath, paths.ContextPath, paths.DockerfileDir, paths.DockerfileFilename, len(serviceYamls), plainEnvKeys, secretEnvKeys)
 
 	fetchOK = true
 	return reply(replyType, VcsFetchSourceResponse{
-		Success:         true,
-		WorkdirCacheKey: cacheKey,
-		RunosYamlBase64: runosYaml,
-		ServiceYamls:    serviceYamls,
+		Success:               true,
+		WorkdirCacheKey:       cacheKey,
+		RunosYamlBase64:       runosYaml,
+		ServiceYamls:          serviceYamls,
+		ResolvedEnvVars:       plainEnv,
+		ResolvedSecretEnvVars: secretEnv,
 	})
 }
 
@@ -389,6 +439,124 @@ func readSiblingServiceYamls(configDir string) ([]VcsFetchSourceServiceYaml, err
 	}
 
 	return services, nil
+}
+
+// runosYamlEnvRefs is the slice of runos.yaml the cluster agent reads to
+// locate the env files the manifest references. Both fields are FILENAMES
+// (paths relative to the manifest's directory), matching the CLI's
+// DeployConfig.Env / .SecretEnv so a yaml is interpreted identically on both
+// deploy paths.
+type runosYamlEnvRefs struct {
+	Env       string `yaml:"env"`
+	SecretEnv string `yaml:"secretEnv"`
+}
+
+// resolveManifestEnvVars reads the env: / secretEnv: references from the
+// committed runos.yaml at resolvedYamlPath and returns the resolved
+// key/value maps the conductor reconciles into the app's ConfigMap (plain)
+// and Secret (secret). Both refs resolve relative to the manifest's own
+// directory (configDir), NOT the repo clone-root — resolving against the
+// clone-root is the bug this fixes: a monorepo-subdir app loaded EMPTY env
+// (dropping ALLOWED_CIDRS and silently disabling its in-app IP allowlist).
+//
+// The return is a POINTER per side so the conductor can tell apart "no env:
+// key → preserve live state" (nil) from "committed file present but empty →
+// apply, clearing it" (non-nil &{}). See VcsFetchSourceResponse.
+//
+// Plain env (`env:`, committed to VCS): an explicit reference to a file
+// missing from the checkout is an operator mistake (typo, wrong relative
+// path); we FAIL LOUD rather than deploy empty, mirroring the CLI's
+// VerifyExplicitEnvFiles. That is what surfaces the empty-allowlist footgun
+// instead of hiding it.
+//
+// Secret env (`secretEnv:`, gitignored by convention): the secret file is
+// NOT committed, so on a VCS checkout it is normally absent. Its absence is
+// EXPECTED, not an error — VCS secrets are managed in server state
+// (`runos apps secret-env-vars set`) and injected by the conductor, not read
+// from the clone. A missing secret file therefore returns nil (omit field →
+// preserve live Secret); we resolve+ship it only if it IS present in the
+// checkout. Failing loud here would break every conventional VCS deploy.
+func resolveManifestEnvVars(resolvedYamlPath, workdir, configDir string) (plain, secret *map[string]string, err error) {
+	data, err := os.ReadFile(resolvedYamlPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	var refs runosYamlEnvRefs
+	if err := yaml.Unmarshal(data, &refs); err != nil {
+		// A yaml that doesn't parse is surfaced to the conductor by
+		// readRunosYaml (which runs first); env resolution just no-ops.
+		return nil, nil, nil
+	}
+
+	plain, err = readEnvFileRef(strings.TrimSpace(refs.Env), workdir, configDir, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	secret, err = readEnvFileRef(strings.TrimSpace(refs.SecretEnv), workdir, configDir, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return plain, secret, nil
+}
+
+// readEnvFileRef resolves one env-file reference relative to configDir,
+// confined to the clone (workdir), reads it, and dotenv-parses it into a
+// key/value map. Returns a pointer so a present-but-empty file (non-nil
+// &{}) is distinguishable from an absent ref (nil → conductor preserves live
+// state). An empty ref returns (nil, nil). failOnMissing chooses the
+// missing-file policy: true for the committed plain-env file (a missing
+// explicit reference is an operator error → fail loud), false for the
+// gitignored secret-env file (expected absence on a checkout → nil/preserve).
+func readEnvFileRef(ref, workdir, configDir string, failOnMissing bool) (*map[string]string, error) {
+	if ref == "" {
+		return nil, nil
+	}
+	// Anchor the ref at the manifest's directory and confine the result to
+	// the clone, reusing the same traversal guard as sourceDir / service
+	// yamls. An interior `..` that stays inside the repo (a shared env file
+	// at a parent path) is allowed; an escape to the worker FS is rejected.
+	rel := filepath.Join(relTo(workdir, configDir), ref)
+	resolved, err := resolveInsideWorkdir(workdir, rel)
+	if err != nil {
+		return nil, fmt.Errorf("invalid env file ref %q: %v", ref, err)
+	}
+
+	info, err := os.Stat(resolved)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if failOnMissing {
+				shown, relErr := filepath.Rel(workdir, resolved)
+				if relErr != nil {
+					shown = ref
+				}
+				return nil, fmt.Errorf(
+					"env file %q referenced by runos.yaml is not committed at this SHA (looked at %q). "+
+						"Commit the file, or drop the `env:` field if the app needs no plain env vars — "+
+						"deploying with empty env would silently drop config like ALLOWED_CIDRS",
+					ref, shown,
+				)
+			}
+			// Secret-env (gitignored) absence is expected on a VCS checkout.
+			return nil, nil
+		}
+		return nil, err
+	}
+	if info.Size() > maxManifestFileSize {
+		return nil, fmt.Errorf("env file %q exceeds %d byte limit", ref, maxManifestFileSize)
+	}
+
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("read env file %q: %w", ref, err)
+	}
+	parsed := parseDotenv(data)
+	if err := validateDotenvValues(parsed); err != nil {
+		return nil, fmt.Errorf("env file %q: %w", ref, err)
+	}
+	// Non-nil pointer even when parsed is empty: a present-but-empty committed
+	// file means "apply, clearing this ConfigMap/Secret", distinct from an
+	// absent ref (nil → preserve live state).
+	return &parsed, nil
 }
 
 // resolveInsideWorkdir cleans rel against workdir and refuses any result
