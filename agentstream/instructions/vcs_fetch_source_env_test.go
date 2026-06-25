@@ -1,10 +1,13 @@
 package instructions
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/runos-official/clusteragent/commons"
 )
 
 // mustWriteEnvTest writes content at path, creating parent dirs.
@@ -44,22 +47,60 @@ func TestResolveManifestEnvVars_AnchorsToConfigDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := plain["ALLOWED_CIDRS"]; got != "10.0.0.0/8" {
+	if plain == nil {
+		t.Fatal("plain env should be present (env: names an existing file), got nil")
+	}
+	if got := (*plain)["ALLOWED_CIDRS"]; got != "10.0.0.0/8" {
 		t.Errorf("ALLOWED_CIDRS = %q, want sibling value 10.0.0.0/8 (resolved against clone-root decoy?)", got)
 	}
-	if got := plain["VA64_MARKER"]; got != "present" {
+	if got := (*plain)["VA64_MARKER"]; got != "present" {
 		t.Errorf("VA64_MARKER = %q, want present", got)
 	}
 	if secret != nil {
-		t.Errorf("secret = %v, want nil (no secretEnv referenced)", secret)
+		t.Errorf("secret = %v, want nil (no secretEnv referenced → preserve)", secret)
+	}
+}
+
+// TestResolveManifestEnvVars_PresentEmptyVsAbsent pins the load-bearing
+// three-state signal agreed with Conductor (TS-64 Q29): an empty COMMITTED
+// env file is present-but-empty (non-nil pointer to {}) so the conductor
+// APPLIES it (clears the ConfigMap), which must NOT collapse into the absent
+// case (nil pointer → preserve live state). If these two were indistinguish-
+// able the anti-wipe guarantee or the explicit-clear semantics would break.
+func TestResolveManifestEnvVars_PresentEmptyVsAbsent(t *testing.T) {
+	// (1) env: names an existing but EMPTY file → present, empty map (apply).
+	wd1 := t.TempDir()
+	cd1 := filepath.Join(wd1, "svc")
+	mustWriteEnvTest(t, filepath.Join(cd1, "runos.yaml"), "app: demo\nport: 8080\nenv: app.config.env\n")
+	mustWriteEnvTest(t, filepath.Join(cd1, "app.config.env"), "# only comments\n\n")
+	plain, _, err := resolveManifestEnvVars(filepath.Join(cd1, "runos.yaml"), wd1, cd1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plain == nil {
+		t.Fatal("empty committed env file must be PRESENT (non-nil &{}), got nil (would wrongly preserve)")
+	}
+	if len(*plain) != 0 {
+		t.Errorf("empty file should parse to 0 keys, got %v", *plain)
+	}
+
+	// (2) no env: key at all → absent (nil → preserve live state).
+	wd2 := t.TempDir()
+	cd2 := filepath.Join(wd2, "svc")
+	mustWriteEnvTest(t, filepath.Join(cd2, "runos.yaml"), "app: demo\nport: 8080\n")
+	plain2, _, err := resolveManifestEnvVars(filepath.Join(cd2, "runos.yaml"), wd2, cd2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plain2 != nil {
+		t.Errorf("no env: key must be ABSENT (nil → preserve), got %v", *plain2)
 	}
 }
 
 // TestResolveManifestEnvVars_MissingPlainFailsLoud pins defect (b): an
 // explicit `env:` reference to a file that isn't committed must ERROR, not
-// ship empty env. The error names the file and warns about dropped config so
-// the operator sees the real cause instead of an app that came up with an
-// empty allowlist.
+// ship empty/half-state. The error names the file and warns about dropped
+// config so the operator sees the real cause instead of an empty allowlist.
 func TestResolveManifestEnvVars_MissingPlainFailsLoud(t *testing.T) {
 	workdir := t.TempDir()
 	configDir := filepath.Join(workdir, "svc")
@@ -78,7 +119,8 @@ func TestResolveManifestEnvVars_MissingPlainFailsLoud(t *testing.T) {
 // TestResolveManifestEnvVars_MissingSecretIsTolerated pins the gitignored-
 // secret nuance: the secret-env file is conventionally NOT committed, so its
 // absence on a VCS checkout is expected (secrets come from server state). A
-// missing `secretEnv:` reference must NOT fail the deploy.
+// missing `secretEnv:` reference must NOT fail the deploy and must omit the
+// field (nil → conductor preserves the live Secret).
 func TestResolveManifestEnvVars_MissingSecretIsTolerated(t *testing.T) {
 	workdir := t.TempDir()
 	configDir := filepath.Join(workdir, "svc")
@@ -92,11 +134,11 @@ func TestResolveManifestEnvVars_MissingSecretIsTolerated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("missing gitignored secret file must not error, got: %v", err)
 	}
-	if plain["FOO"] != "bar" {
-		t.Errorf("plain FOO = %q, want bar", plain["FOO"])
+	if plain == nil || (*plain)["FOO"] != "bar" {
+		t.Errorf("plain FOO should be bar, got %v", plain)
 	}
 	if secret != nil {
-		t.Errorf("secret = %v, want nil (gitignored file absent)", secret)
+		t.Errorf("secret = %v, want nil (gitignored file absent → preserve)", secret)
 	}
 }
 
@@ -115,15 +157,15 @@ func TestResolveManifestEnvVars_SecretPresentIsShipped(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if plain != nil {
-		t.Errorf("plain = %v, want nil (no env: referenced)", plain)
+		t.Errorf("plain = %v, want nil (no env: referenced)", *plain)
 	}
-	if secret["TOKEN"] != "s3cr3t" {
-		t.Errorf("secret TOKEN = %q, want s3cr3t", secret["TOKEN"])
+	if secret == nil || (*secret)["TOKEN"] != "s3cr3t" {
+		t.Errorf("secret TOKEN should be s3cr3t, got %v", secret)
 	}
 }
 
 // TestResolveManifestEnvVars_NoRefs: a manifest with neither env: nor
-// secretEnv: yields two nil maps and no error.
+// secretEnv: yields two nil pointers (absent → preserve) and no error.
 func TestResolveManifestEnvVars_NoRefs(t *testing.T) {
 	workdir := t.TempDir()
 	configDir := workdir
@@ -174,6 +216,47 @@ func TestResolveManifestEnvVars_ControlCharFailsLoud(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "control byte") {
 		t.Errorf("error should name the control byte, got: %v", err)
+	}
+}
+
+// TestVcsFetchSourceResponse_EnvWireShape pins the on-the-wire three-state
+// the conductor switches on (TS-64 Q29), through the SAME codec the agent
+// stream uses (commons.JsonB64Encode):
+//   - nil pointer        → field OMITTED          → conductor preserves live state
+//   - non-nil &{}        → "resolvedEnvVars":{}    → conductor applies (clears)
+//   - non-nil &{k:v}     → "resolvedEnvVars":{...} → conductor applies (replace)
+// If omitempty ever collapsed present-empty into absent, the anti-wipe vs
+// explicit-clear distinction would silently break.
+func TestVcsFetchSourceResponse_EnvWireShape(t *testing.T) {
+	// wireJSON returns the JSON the agent stream actually sends, by running the
+	// response through the real codec and base64-decoding back to bytes.
+	wireJSON := func(r VcsFetchSourceResponse) string {
+		b64, err := commons.JsonB64Encode(r)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			t.Fatalf("b64 decode: %v", err)
+		}
+		return string(raw)
+	}
+
+	// Absent: nil pointer → key omitted entirely → conductor preserves.
+	if got := wireJSON(VcsFetchSourceResponse{Success: true}); strings.Contains(got, "resolvedEnvVars") {
+		t.Errorf("nil ResolvedEnvVars should be omitted, got: %s", got)
+	}
+
+	// Present-empty: non-nil pointer to {} → key present as {} → apply (clear).
+	empty := map[string]string{}
+	if got := wireJSON(VcsFetchSourceResponse{Success: true, ResolvedEnvVars: &empty}); !strings.Contains(got, `"resolvedEnvVars":{}`) {
+		t.Errorf(`present-empty must serialize as "resolvedEnvVars":{}, got: %s`, got)
+	}
+
+	// Present-populated.
+	vals := map[string]string{"ALLOWED_CIDRS": "10.0.0.0/8"}
+	if got := wireJSON(VcsFetchSourceResponse{Success: true, ResolvedEnvVars: &vals}); !strings.Contains(got, "ALLOWED_CIDRS") {
+		t.Errorf("populated ResolvedEnvVars must carry the keys, got: %s", got)
 	}
 }
 
