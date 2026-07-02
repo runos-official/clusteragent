@@ -7,6 +7,29 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.5
+
+Finalizes v1.1.5-rc.1 (VCS/CI deploy env-file resolution, dev-verified via
+cluster pin) and raises the exec-sql read cap.
+
+### Fixed
+- **VCS/CI deploys resolve committed `env:` / `secretEnv:` file paths against
+  the manifest's own directory, not the repo clone-root** (from v1.1.5-rc.1).
+  Paths are anchored at the config yaml's directory, traversal outside the
+  clone is rejected, and a committed-but-missing `env:` file fails the fetch
+  loudly instead of shipping empty env (which silently dropped keys like a
+  source-IP allowlist). A gitignored `secretEnv:` file absent on the checkout
+  stays tolerated (secrets come from server state).
+
+### Changed
+- **VCS source-fetch carries the resolved env contract the conductor consumes**
+  (from v1.1.5-rc.1): `resolvedEnvVars` / `resolvedSecretEnvVars` with explicit
+  three-state present/absent semantics, dotenv-parsed in lockstep with the CLI
+  parser.
+- **exec-sql SELECT row cap raised from 10 to 100** (postgres and mysql). 10
+  rows made read-only introspection awkward; 100 matches the ClickHouse
+  exec-sql cap. Truncation behavior and the `truncated` flag are unchanged.
+
 ## v1.1.5-rc.1
 
 Candidate for VCS/CI deploy env-file resolution. Hidden prerelease for targeted
