@@ -7,6 +7,24 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.6-rc.1
+
+Candidate for the read-only cluster AI assistant (Phase 2). Hidden prerelease for
+targeted dev verification (cluster pin), not advertised.
+
+### Added
+- **`RUN_READONLY_KUBECTL` instruction.** Runs an arbitrary kubectl argv on
+  behalf of the conductor's cluster assistant and returns stdout/stderr/exit
+  code. The argv is deliberately NOT allow-listed: it executes inside a
+  dedicated `runos-assistant-reader-exec` pod whose ServiceAccount is a
+  read-only identity (`runos-assistant-reader`: get/list/watch, no Secrets, no
+  write verbs), so Kubernetes RBAC is the sole guardrail. That pod holds no
+  admin token, so a local-file read cannot escalate and a write is denied by the
+  API server. The cluster agent lazily creates the SA + ClusterRole + kubeconfig
+  ConfigMap + pod on first use, execs `["kubectl", ...args]` into it via the k8s
+  exec API, and idle-reaps the shared pod after 15 minutes. The kubectl image is
+  `alpine/k8s:1.34.1` by default, overridable via `ASSISTANT_KUBECTL_IMAGE`.
+
 ## v1.1.5
 
 Finalizes v1.1.5-rc.1 (VCS/CI deploy env-file resolution, dev-verified via

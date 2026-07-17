@@ -28,4 +28,5 @@ var Map = map[string]func(string) (string, string, error){
 	"RUN_ONESHOT_JOB":         RunOneShotJob,
 	"ONESHOT_JOB_STATUS":      OneShotJobStatus,
 	"CLEANUP_ONESHOT_JOB":     CleanupOneShotJob,
+	"RUN_READONLY_KUBECTL":    RunReadonlyKubectl,
 }
