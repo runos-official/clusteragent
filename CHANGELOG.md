@@ -7,6 +7,32 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.6-rc.2
+
+Follow-up candidate to v1.1.6-rc.1 from the assistant's adversarial review:
+makes the reader RBAC upgradeable and widens it to the operator groups the
+assistant actually needs. Hidden prerelease for targeted dev verification
+(cluster pin), not advertised.
+
+### Fixed
+- **Reader RBAC now reconciles instead of sticking at first-write.** The
+  ClusterRole rules and the kubeconfig ConfigMap were create-if-missing, and the
+  ensure ran only when the reader pod was absent, so a newer agent's rule set
+  could never take effect on an existing cluster (it needed a manual ClusterRole
+  delete). Both now reconcile, once per agent process, independent of pod
+  presence, so an upgrade lands the new rules while a prior version's shared pod
+  is still running. The ClusterRole updates only on actual drift, so a restart
+  with unchanged rules writes nothing.
+
+### Added
+- **Reader RBAC covers the remaining platform read surface**, which previously
+  returned 403 and made the assistant report resources as absent: CNPG backups
+  (`barmancloud.cnpg.io`), GPU (`nvidia.com`), node feature discovery
+  (`nfd.k8s-sigs.io`), volume snapshots (`snapshot.storage.k8s.io`), and the
+  kubelet-served node subresources `nodes/metrics`, `nodes/stats`, `nodes/proxy`
+  (get only; exec/attach need `create`, which stays ungranted). Still
+  get/list/watch only, and still no Secrets.
+
 ## v1.1.6-rc.1
 
 Candidate for the read-only cluster AI assistant (Phase 2). Hidden prerelease for
