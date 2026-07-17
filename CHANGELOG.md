@@ -7,6 +7,36 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.1.6
+
+Finalizes v1.1.6-rc.1 + v1.1.6-rc.2 (dev-verified via cluster pin on tc5-gan).
+Ships the read-only cluster AI assistant's in-cluster execution path.
+
+### Added
+- **`RUN_READONLY_KUBECTL` instruction** for the conductor cluster assistant.
+  Runs an arbitrary kubectl argv inside a dedicated `runos-assistant-reader-exec`
+  pod whose ServiceAccount is a read-only identity (`runos-assistant-reader`:
+  get/list/watch, no Secrets, no write verbs), so Kubernetes RBAC is the sole
+  guardrail and the LLM's argv needs no allow-listing. That pod holds no admin
+  token, so a local-file read cannot escalate and a write is API-server denied.
+  The agent lazily creates the SA + ClusterRole + kubeconfig ConfigMap + pod on
+  first use, execs `["kubectl", ...args]` via the k8s exec API, and idle-reaps
+  the shared pod after 15 minutes. Image `alpine/k8s:1.34.1` by default,
+  overridable via `ASSISTANT_KUBECTL_IMAGE`.
+- **Reader RBAC covers the full platform read surface** the assistant needs
+  (previously 403 → the assistant reported resources as absent): CNPG backups
+  (`barmancloud.cnpg.io`), GPU (`nvidia.com`), node feature discovery
+  (`nfd.k8s-sigs.io`), volume snapshots (`snapshot.storage.k8s.io`), and the
+  kubelet-served node subresources `nodes/metrics`, `nodes/stats`, `nodes/proxy`
+  (get only). Still get/list/watch only, still no Secrets.
+
+### Fixed
+- **Reader RBAC now reconciles instead of sticking at first-write.** The
+  ClusterRole rules and kubeconfig ConfigMap reconcile once per agent process,
+  independent of whether the reader pod already exists, so a newer agent's rule
+  set takes effect on upgrade instead of requiring a manual ClusterRole delete.
+  The ClusterRole updates only on actual drift.
+
 ## v1.1.6-rc.2
 
 Follow-up candidate to v1.1.6-rc.1 from the assistant's adversarial review:
