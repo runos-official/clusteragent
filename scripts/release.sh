@@ -12,7 +12,9 @@
 #                    CHANGELOG has a matching section, working tree clean & synced,
 #                    sensitivity scan (PUBLIC repo: fail closed on secret-shaped
 #                    content in the deploy payload).
-#   2. Code gates  - go build ./... (CGO off, proves the static/cross build),
+#   2. Code gates  - leak gate (PUBLIC repo: whole-tree scan for credentials and
+#                    un-baselined internal identifiers, cannot be skipped), then
+#                    go build ./... (CGO off, proves the static/cross build),
 #                    go vet ./..., go test -race ./... (CGO on; race needs cgo).
 #   3. Deploy      - tag the dev commit and push the tag + dev. main is NOT
 #                    touched (the human merges main after personal verification).
@@ -113,6 +115,10 @@ fi
 # ---- Sensitivity scan: this is a PUBLIC repo ------------------------------
 # Deterministic, fail-closed floor over the exact payload being deployed (every
 # added line since the last shipped point). High-precision secret patterns only.
+# Internal identifiers (lab machine names, account ids, IP address literals) are
+# covered by the leak gate in section 2, which reads the whole tree. Everything
+# else that needs judgment (org and customer names, context-dependent leaks) is
+# the skill's reasoning audit, NOT this gate.
 step "Sensitivity scan (public repo, ${PAYLOAD_BASE}..${INTEGRATION_BRANCH})"
 ADDED_LINES="$(git diff "$PAYLOAD_BASE..$INTEGRATION_BRANCH" -- . | grep '^+' | grep -v '^+++' || true)"
 SECRET_RE='(gh[pousr]_[A-Za-z0-9]{20,})'
@@ -134,6 +140,32 @@ ok "no secret-shaped content in release payload"
 # =============================================================================
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 git checkout --quiet "$INTEGRATION_BRANCH"
+
+# ---- Leak gate: internal identifiers (PUBLIC repo) -------------------------
+# The floor above covers CREDENTIAL shapes in the payload diff. This gate covers
+# the other half of the rule, INTERNAL IDENTIFIERS (lab machine names, account
+# ids, IP address literals), and it reads the WHOLE TRACKED TREE, not the diff,
+# because a public repo publishes the tree and not just the newest commits.
+#
+# It runs here, after the checkout, and not in Preflight: the tree scan has to
+# read the branch being released, so running it earlier would scan whatever
+# branch the operator happened to be standing on.
+#
+# It is a ratchet, not a blanket ban: findings already recorded in
+# scripts/leakcheck.baseline pass, anything NEW fails. That is deliberate. A
+# blanket ban on a repo that already carries published violations would block
+# every commit and get the gate switched off within a day.
+#
+# This gate CANNOT be skipped. The pre-commit hook in .githooks/ runs the same
+# checker over the staged diff and CAN be skipped with --no-verify, which is why
+# this one exists.
+step "Leak gate (public repo, whole tree)"
+command -v python3 >/dev/null 2>&1 || die "python3 is required for the leak gate"
+if ! LEAK_OUTPUT="$(python3 "$REPO_ROOT/scripts/leakcheck.py" 2>&1)"; then
+  printf '%s\n' "$LEAK_OUTPUT" >&2
+  die "leak gate failed (public repo): remove the identifiers above before releasing. Do not hand-edit scripts/leakcheck.baseline."
+fi
+ok "$(printf '%s' "$LEAK_OUTPUT" | tail -1)"
 
 step "Build";  CGO_ENABLED=0 go build ./... || die "go build failed"; ok "go build"
 step "Vet";    go vet ./...                  || die "go vet failed";   ok "go vet"

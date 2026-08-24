@@ -76,6 +76,38 @@ $(OUT)/rendered-manifest.yaml: $(HELM_FILES)
 		dns01/deploy > $@
 
 # ============================================================================
+# Leak gate (PUBLIC repo)
+# ============================================================================
+
+# Install the tracked git hooks for this clone. .git/hooks is not tracked, so
+# every clone must do this once. Run it right after you clone.
+.PHONY: hooks
+hooks:
+	@git config core.hooksPath .githooks
+	@echo "$(GREEN)core.hooksPath = .githooks$(NC) (pre-commit now runs leakcheck on the staged diff)"
+
+# Scan every tracked file for credentials and un-baselined internal identifiers.
+.PHONY: leakcheck
+leakcheck:
+	@python3 scripts/leakcheck.py
+
+# Scan only the staged diff, the same way the pre-commit hook does.
+.PHONY: leakcheck-staged
+leakcheck-staged:
+	@python3 scripts/leakcheck.py --staged
+
+# Ratchet the baseline down after you REMOVE an identifier from the source.
+# Never run this to get a new identifier past the gate.
+.PHONY: leakcheck-update
+leakcheck-update:
+	@python3 scripts/leakcheck.py --update
+
+# Test the checker itself: what it must catch and what it must not.
+.PHONY: leakcheck-test
+leakcheck-test:
+	@python3 scripts/leakcheck_test.py
+
+# ============================================================================
 # Release
 # ============================================================================
 
@@ -103,6 +135,12 @@ help:
 	@echo ""
 	@echo "  make image                       Build the multiarch image locally (no push)"
 	@echo "  make rendered-manifest.yaml      Render the deploy manifest from the Helm chart"
+	@echo ""
+	@echo "  make hooks            Install the tracked git hooks (run once per clone)"
+	@echo "  make leakcheck        Scan every tracked file for leaks (PUBLIC repo gate)"
+	@echo "  make leakcheck-staged Scan only the staged diff"
+	@echo "  make leakcheck-update Ratchet the baseline down after removing an identifier"
+	@echo "  make leakcheck-test   Test the leak checker itself"
 	@echo ""
 	@echo "  make release RELEASE_VERSION=vX.Y.Z          Cut a release (gates, tag, push, verify)"
 	@echo "  make release RELEASE_VERSION=vX.Y.Z CHECK=1  Run release gates only, no tag/push"
