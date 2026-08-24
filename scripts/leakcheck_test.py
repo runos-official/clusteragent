@@ -6,11 +6,22 @@ This file is IDENTICAL in every public RunOS repo. Run it with:
     make leakcheck-test          (or: python3 scripts/leakcheck_test.py)
 
 IMPORTANT, and it is the reason this file looks the way it does. This is a
-PUBLIC repo, so the test must not itself publish the things it tests for. No
-real internal identifier is ever written as a literal here. Every one is
-assembled at run time from fragments that leakcheck cannot match, so this file
-is clean when leakcheck scans the tree. Fixtures that need a harmless address
-use the RFC 5737 documentation ranges.
+PUBLIC repo, so the test must not itself publish the things it tests for.
+
+Two rules follow from that.
+
+1. The only internal identifiers here are the machine names and the account id
+   that scripts/leakcheck.config already holds. They are LOAD BEARING: the test
+   asserts that the checker matches its CONFIGURED tokens, so an invented name
+   would assert nothing. Each one is assembled at run time from fragments that
+   leakcheck cannot match, so this file stays clean when leakcheck scans the
+   tree, and each one is a BARE TOKEN. Never give one context. Do not name a
+   disk, a datacenter, a cluster, a node or a role next to it.
+2. Every address, cluster id and node name here is INVENTED. A must-catch
+   fixture cannot use RFC 5737, because the checker allows that range on
+   purpose, so it uses RFC 1918 for the private side and the RFC 2544
+   benchmarking range for the public side. Both are reserved, so neither names
+   a host. Must-not-catch fixtures use RFC 5737 and RFC 3849.
 """
 
 from __future__ import annotations
@@ -50,11 +61,16 @@ SECOND_BOX = "ftb" + "2"
 RENTED_BOX = "fttb" + "3"
 ACCOUNT_ID = "rj" + "wrn"
 
-# The two addresses from the real incident: a line of pasted terminal output
-# that shipped in cmd/preflight/tls_failure_kind_test.go. Assembled octet by
-# octet so no dotted quad appears in this file.
-PASTED_SRC = dotted(192, 168, 0, 226)
-PASTED_DST = dotted(116, 203, 136, 98)
+# The SHAPE of the real incident: one line of pasted terminal output, carrying
+# a private source address and a public destination address, that shipped in
+# cmd/preflight/tls_failure_kind_test.go. What the test needs is two distinct
+# non-allowed addresses on ONE line, so both values below are invented:
+# RFC 1918 for the source, and the RFC 2544 benchmarking range, which is
+# reserved and routable-looking, for the destination. The real addresses are
+# deliberately absent. Assembled octet by octet so no dotted quad appears in
+# this file.
+PASTED_SRC = dotted(10, 1, 2, 3)
+PASTED_DST = dotted(198, 18, 0, 42)
 PASTED_ERROR = "read tcp %s:52618->%s:9191: i/o timeout" % (PASTED_SRC, PASTED_DST)
 GLOBAL_V6 = ":".join(["2606", "4700", "4700"]) + "::" + "1111"
 
@@ -128,19 +144,19 @@ def main() -> int:
     # The exact incident: the lab box name in a Go comment.
     expect_catch(
         "lab box name in a Go comment",
-        "// (LINSTOR replicated-2 on %s's SAS spindles, under nested guests), so that\n" % LAB_BOX,
+        "// The figure above was measured on %s, so that\n" % LAB_BOX,
         LAB_BOX,
     )
     expect_catch(
         "lab box name in prose",
-        "All three guests sat on ONE backing device: LINSTOR replicated-2 on %s's SAS spindles.\n" % LAB_BOX,
+        "The measurement above was taken on %s.\n" % LAB_BOX,
         LAB_BOX,
     )
     expect_catch("second lab box name", "// Measured on %s after a reset.\n" % SECOND_BOX, SECOND_BOX)
-    expect_catch("rented box name with digits", "# provisioned %s in fsn1\n" % RENTED_BOX, RENTED_BOX)
+    expect_catch("rented box name with digits", "# provisioned %s for the run\n" % RENTED_BOX, RENTED_BOX)
     expect_catch("lab box name inside a hyphenated word", "host node-%s-a rebooted\n" % LAB_BOX, LAB_BOX)
     expect_catch("lab box name in mixed case", "Measured on %s.\n" % LAB_BOX.upper(), LAB_BOX)
-    expect_catch("account id in a node name", 'want "n02-ede-%s" in the detail\n' % ACCOUNT_ID, ACCOUNT_ID)
+    expect_catch("account id in a node name", 'want "n02-abc-%s" in the detail\n' % ACCOUNT_ID, ACCOUNT_ID)
 
     # The already-shipped pasted output, both addresses in one line.
     expect_catch("pasted source address in a shipped test comment", '// "the secure handshake FAILED: %s",\n' % PASTED_ERROR, PASTED_SRC)
