@@ -5,6 +5,17 @@ This file is IDENTICAL in every public RunOS repo (nodeagent, clusteragent,
 desktop, cli). Do not fork it. Change it here, then copy it across and bump
 LEAKCHECK_VERSION so drift is visible in a diff.
 
+WHERE IT RUNS
+-------------
+1. .github/workflows/leakcheck.yml   every push and every pull request. This is
+                                     the gate that stands between a commit and
+                                     GitHub, and nobody can skip it.
+2. .githooks/pre-commit              opt-in per clone (`make hooks`), skippable
+                                     with --no-verify. Fast feedback only.
+3. scripts/release.sh                the release gate. It runs after the branch
+                                     is already pushed, so it is a last check,
+                                     not the first one.
+
 It has no dependency beyond python3 and git.
 
 TWO SEVERITIES
@@ -49,7 +60,7 @@ import re
 import subprocess
 import sys
 
-LEAKCHECK_VERSION = "1.0.0"
+LEAKCHECK_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Credential shapes. Kept in step with SECRET_RE in scripts/release.sh.
@@ -65,6 +76,31 @@ CREDENTIAL_RE = re.compile(
     r"|((api[_-]?key|secret|password|passwd|token|bearer)[\"' ]*[:=][\"' ]*[\"'][A-Za-z0-9/+_.=-]{16,}[\"'])",
     re.IGNORECASE,
 )
+
+# 1.0.1: a quoted assignment is only a credential when the VALUE could be one.
+# Two shapes never are, and both already ship in these public repos:
+#
+#     "password": "POSTGRES_PASSWORD"      an env var NAME, not its value
+#     RefreshToken: "some-refresh-token"   a placeholder in a test table
+#
+# release.sh's own comment says prose like `password: POSTGRES_PASSWORD` must
+# not trip the floor. Requiring quotes was meant to achieve that and does not,
+# because JSON and Go quote the name too, so the rule is enforced here instead.
+# Neither shape can hide a real credential: a real one is not a bare
+# SCREAMING_SNAKE identifier, and it is not a run of lowercase English words
+# joined by hyphens. High-entropy values keep failing, including an all
+# lowercase value with no hyphen.
+#
+# This filter applies to the quoted-assignment shape ONLY. The provider token
+# prefixes, the cloud key id and the PEM header are never filtered.
+QUOTED_VALUE_RE = re.compile(r"[\"']([A-Za-z0-9/+_.=-]{16,})[\"']\s*$")
+NOT_A_SECRET_VALUE_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[a-z]+(?:-[a-z]+)+)$")
+
+
+def is_placeholder_credential(matched: str) -> bool:
+    """True when a `key: "value"` match holds a value that cannot be a secret."""
+    value = QUOTED_VALUE_RE.search(matched)
+    return bool(value) and bool(NOT_A_SECRET_VALUE_RE.match(value.group(1)))
 
 # ---------------------------------------------------------------------------
 # IP literals.
@@ -194,6 +230,34 @@ def build_identifier_patterns(cfg: dict) -> list:
 # ---------------------------------------------------------------------------
 # Scanning
 # ---------------------------------------------------------------------------
+def is_ipv4_netmask(addr) -> bool:
+    """True for a contiguous IPv4 netmask of prefix length 8 or longer.
+
+    1.1.0. A subnet mask is a MASK, not an address. It names nobody and
+    nothing: no host, no network, no machine. Ratcheting one only spends
+    baseline rows on lines a reader can see at a glance are not identifiers,
+    and six such rows already sat in one repo's baseline.
+
+    The first octet must be 255, so the rule covers exactly the masks people
+    write in documentation and console output (prefix length 8 through 32) and
+    refuses prefix lengths 1 through 7. That limit matters: the masks for
+    prefix lengths 1, 2 and 3 are also plausible NETWORK BASES and a leak could
+    hide in one, whereas the whole 255/8 range is reserved, so no host address
+    and no network base can fall inside it. This rule cannot hide a leak.
+
+    "Contiguous" means ones then zeros: the inverted value must be 2^k - 1. A
+    mask-shaped quad that is not contiguous stays ratcheted, and so does a
+    wildcard (inverse) mask, whose first octet is not 255.
+    """
+    if addr.version != 4:
+        return False
+    value = int(addr)
+    if value >> 24 != 0xFF:
+        return False
+    inverted = (~value) & 0xFFFFFFFF
+    return inverted & (inverted + 1) == 0
+
+
 def classify_ip(token: str):
     """Return the address if it must be reported, or None if it is allowed."""
     try:
@@ -203,6 +267,8 @@ def classify_ip(token: str):
     for net in ALLOWED_NETS:
         if addr.version == net.version and addr in net:
             return None
+    if is_ipv4_netmask(addr):
+        return None
     return addr
 
 
@@ -213,6 +279,8 @@ def scan_line(path: str, lineno: int, text: str, patterns: list) -> list:
         snippet = snippet[:157] + "..."
 
     for match in CREDENTIAL_RE.finditer(text):
+        if is_placeholder_credential(match.group(0)):
+            continue
         findings.append(Finding(path, lineno, "credential", match.group(0)[:40], snippet))
 
     for kind, pattern in patterns:
@@ -264,14 +332,33 @@ def scan_files(paths, patterns, skip_globs) -> list:
 
 # leakcheck's own config names the internal machines and its baseline lists the
 # published tokens, so both would report themselves. Skipping them is not a
-# loophole: neither file may hold anything but bare tokens. Matched by basename
-# so the skip does not depend on where the files sit.
-SELF_FILES = {"leakcheck.config", "leakcheck.baseline"}
+# loophole: neither file may hold anything but bare tokens.
+#
+# 1.1.0: matched by EXACT repo-relative path, not by basename. The basename rule
+# left every file called leakcheck.config or leakcheck.baseline unscanned
+# wherever it sat, so a tracked docs/leakcheck.baseline holding a cloud key id,
+# a lab box name and a lab address passed the whole-tree scan with exit 0.
+# Only these two paths are the checker's own data. Anything else with the same
+# name is ordinary tracked content and gets scanned like everything else.
+SELF_RELPATHS = frozenset({"scripts/leakcheck.config", "scripts/leakcheck.baseline"})
+
+# The same two files by absolute path, so --paths and a scan run from any
+# working directory skip them too. Derived from this file's own location.
+SELF_ABSPATHS = frozenset(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    for name in ("leakcheck.config", "leakcheck.baseline")
+)
+
+
+def is_self_file(path: str, norm: str) -> bool:
+    return norm in SELF_RELPATHS or os.path.abspath(path) in SELF_ABSPATHS
 
 
 def is_skipped(path: str, skip_globs) -> bool:
     norm = path.replace(os.sep, "/")
-    if os.path.basename(norm) in SELF_FILES:
+    while norm.startswith("./"):
+        norm = norm[2:]
+    if is_self_file(path, norm):
         return True
     for glob in skip_globs:
         if fnmatch.fnmatch(norm, glob) or norm.endswith("/" + glob):
@@ -279,37 +366,71 @@ def is_skipped(path: str, skip_globs) -> bool:
     return False
 
 
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
 def scan_diff(diff_text: str, patterns: list, skip_globs) -> list:
     """Scan only the added lines of a unified diff.
 
     Line numbers come from the hunk headers, so a finding points at the line it
     will have in the committed file.
+
+    1.1.0: a "--- a/x" / "+++ b/y" pair names a file ONLY inside a file header,
+    which starts at a "diff --git" line and ends at that file's first hunk
+    header. Before this rule the parser accepted the pair anywhere, so CONTENT
+    could impersonate a header: a deleted line reading "-- a/x" renders as
+    "--- a/x" and an added line reading "++ b/scripts/leakcheck.config" renders
+    as "+++ b/scripts/leakcheck.config". The parser then pointed path at a
+    skipped file and dropped the rest of the hunk. Reproduced before the fix:
+    --staged reported clean and exited 0 while the whole-tree scan found the
+    lab box name in the same staged content.
+
+    Nothing is scanned before the first "diff --git", so an input that is not a
+    git diff yields no findings rather than mis-attributed ones.
     """
     findings = []
     path = None
     lineno = 0
-    skipping = False
-    saw_minus_header = False
-    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    skipping = True
+    in_header = False
+    awaiting_plus = False
 
     for raw in diff_text.splitlines():
-        if raw.startswith("--- ") and (raw[4:].strip() == "/dev/null" or raw[4:].strip().startswith("a/")):
-            saw_minus_header = True
-            continue
-        if saw_minus_header and raw.startswith("+++ "):
-            saw_minus_header = False
-            target = raw[4:].strip()
-            if target == "/dev/null":
-                path = None
-                skipping = True
-                continue
-            path = target[2:] if target.startswith("b/") else target
-            skipping = is_skipped(path, skip_globs)
-            continue
-        saw_minus_header = False
         if raw.startswith("diff --git"):
+            in_header = True
+            awaiting_plus = False
+            path = None
+            skipping = True
+            lineno = 0
             continue
-        head = hunk_re.match(raw)
+
+        if in_header:
+            if awaiting_plus:
+                awaiting_plus = False
+                if raw.startswith("+++ "):
+                    target = raw[4:].strip()
+                    if target == "/dev/null":
+                        path = None
+                        skipping = True
+                    else:
+                        path = target[2:] if target.startswith("b/") else target
+                        skipping = is_skipped(path, skip_globs)
+                    continue
+                # A "--- " with no "+++ " after it was not a header pair.
+            if raw.startswith("--- "):
+                target = raw[4:].strip()
+                if target == "/dev/null" or target.startswith("a/"):
+                    awaiting_plus = True
+                    continue
+            head = HUNK_RE.match(raw)
+            if head:
+                in_header = False
+                lineno = int(head.group(1))
+            # Every other header line (index, mode, similarity, rename, binary)
+            # carries nothing to scan.
+            continue
+
+        head = HUNK_RE.match(raw)
         if head:
             lineno = int(head.group(1))
             continue

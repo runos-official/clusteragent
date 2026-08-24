@@ -8,8 +8,16 @@
 #
 #     make hooks          (or: git config core.hooksPath .githooks)
 #
-# It scans ONLY the staged diff, so it stays fast. The authoritative scan is the
-# one in scripts/release.sh, which reads the whole tree and cannot be skipped.
+# It scans ONLY the staged diff, so it stays fast, and it is the FIRST of three
+# run points, not the last one:
+#
+#   1. this hook                          opt-in, skippable, fast
+#   2. .github/workflows/leakcheck.yml    every push and every pull request,
+#                                         whole tree, cannot be skipped
+#   3. scripts/release.sh                 the release gate, whole tree
+#
+# A fresh clone has core.hooksPath unset, so it has no hook at all until
+# somebody runs `make hooks`. Run point 2 is what actually holds the line.
 #
 set -euo pipefail
 
@@ -40,8 +48,9 @@ cat >&2 <<'MSG'
 
       git commit --no-verify
 
-  Skipping does NOT get the change released. scripts/release.sh runs the same
-  check over the whole tree and that gate cannot be skipped.
+  Skipping does NOT get the change onto GitHub clean. The Leak gate workflow
+  runs the same checker over the whole tree on every push and every pull
+  request, and scripts/release.sh runs it again. Neither can be skipped.
   --------------------------------------------------------------------------
 
 MSG
