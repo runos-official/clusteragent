@@ -121,13 +121,38 @@ fi
 # the skill's reasoning audit, NOT this gate.
 step "Sensitivity scan (public repo, ${PAYLOAD_BASE}..${INTEGRATION_BRANCH})"
 ADDED_LINES="$(git diff "$PAYLOAD_BASE..$INTEGRATION_BRANCH" -- . | grep '^+' | grep -v '^+++' || true)"
-SECRET_RE='(gh[pousr]_[A-Za-z0-9]{20,})'
-SECRET_RE+='|(github_pat_[A-Za-z0-9_]{20,})'
-SECRET_RE+='|(xox[baprs]-[A-Za-z0-9-]{10,})'
-SECRET_RE+='|(AKIA[0-9A-Z]{16})'
-SECRET_RE+='|(-----BEGIN [A-Z ]*PRIVATE KEY-----)'
-SECRET_RE+='|((api[_-]?key|secret|password|passwd|token|bearer)["'\'' ]*[:=]["'\'' ]*["'\''][A-Za-z0-9/+_.=-]{16,}["'\''])'
-SECRET_HITS="$(printf '%s\n' "$ADDED_LINES" | grep -niE "$SECRET_RE" || true)"
+# The quoted-assignment branch below matches `key: "value"`. A value that is a
+# bare SCREAMING_SNAKE identifier (an env var NAME) or a run of lowercase words
+# joined by hyphens (a test placeholder) cannot be a credential, so it is
+# filtered out here exactly as scripts/leakcheck.py 1.0.1 filters it. Without
+# that filter this floor fires on leakcheck.py's OWN comment, which documents
+# the two shapes as literal examples. The provider token prefixes, the cloud key
+# id and the PEM header are NEVER filtered: the filter reads the
+# quoted-assignment branch alone.
+read -r -d '' PLACEHOLDER_FILTER <<'PYFILTER' || true
+import re, sys
+
+CREDENTIAL = re.compile(
+    r"(gh[pousr]_[A-Za-z0-9]{20,})"
+    r"|(github_pat_[A-Za-z0-9_]{20,})"
+    r"|(xox[baprs]-[A-Za-z0-9-]{10,})"
+    r"|(AKIA[0-9A-Z]{16})"
+    r"|(-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+    r"|((api[_-]?key|secret|password|passwd|token|bearer)[\"' ]*[:=][\"' ]*[\"'][A-Za-z0-9/+_.=-]{16,}[\"'])",
+    re.IGNORECASE,
+)
+QUOTED_VALUE = re.compile(r"[\"']([A-Za-z0-9/+_.=-]{16,})[\"']\s*$")
+NOT_A_SECRET_VALUE = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[a-z]+(?:-[a-z]+)+)$")
+
+for number, line in enumerate(sys.stdin, 1):
+    for match in CREDENTIAL.finditer(line):
+        value = QUOTED_VALUE.search(match.group(0))
+        if value and NOT_A_SECRET_VALUE.match(value.group(1)):
+            continue
+        sys.stdout.write("%d:%s" % (number, line if line.endswith("\n") else line + "\n"))
+        break
+PYFILTER
+SECRET_HITS="$(printf '%s\n' "$ADDED_LINES" | python3 -c "$PLACEHOLDER_FILTER" || true)"
 if [[ -n "$SECRET_HITS" ]]; then
   warn "secret-shaped content in the deploy payload ($PAYLOAD_BASE..$INTEGRATION_BRANCH):"
   printf '%s\n' "$SECRET_HITS" | head -20 >&2
