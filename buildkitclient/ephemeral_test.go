@@ -104,7 +104,7 @@ func TestParseBuildSettings(t *testing.T) {
 		"memoryRequestMb":     "512",
 		"memoryLimitMb":       "4096",
 	})
-	want := BuildSettings{MaxConcurrentBuilds: 8, CPURequestMc: 250, CPULimitMc: 2000, MemoryRequestMb: 512, MemoryLimitMb: 4096}
+	want := BuildSettings{MaxConcurrentBuilds: 8, CPURequestMc: 250, CPULimitMc: 2000, MemoryRequestMb: 512, MemoryLimitMb: 4096, BuildCacheSizeGb: defaultBuildCacheSizeGb}
 	if got != want {
 		t.Errorf("full: got %+v, want %+v", got, want)
 	}
@@ -232,5 +232,122 @@ func TestSummarizePodState(t *testing.T) {
 	}
 	if got := summarizePodState(waiting); got != "phase=Pending; buildkitd waiting reason=ImagePullBackOff" {
 		t.Errorf("waiting: got %q", got)
+	}
+}
+
+// The scratch volume is the reason FPL27 exists: an uncapped emptyDir on the
+// node's kubelet disk let one build fill a node's root filesystem.
+func TestBuildCacheVolume_NodeDiskByDefault(t *testing.T) {
+	vol := buildCacheVolume(defaultBuildSettings())
+
+	if vol.Name != buildCacheVolumeName {
+		t.Fatalf("volume name: got %q, want %q", vol.Name, buildCacheVolumeName)
+	}
+	if vol.EmptyDir == nil {
+		t.Fatal("default settings must keep the build cache on the node's disk")
+	}
+	if vol.Ephemeral != nil {
+		t.Error("default settings must not provision a PVC")
+	}
+	if vol.EmptyDir.SizeLimit == nil {
+		t.Fatal("the emptyDir must be capped; uncapped is what fills the node")
+	}
+	if got := vol.EmptyDir.SizeLimit.String(); got != "50Gi" {
+		t.Errorf("size limit: got %q, want 50Gi", got)
+	}
+}
+
+func TestBuildCacheVolume_SizeAppliesToTheNodeDiskToo(t *testing.T) {
+	s := defaultBuildSettings()
+	s.BuildCacheSizeGb = 120
+	vol := buildCacheVolume(s)
+
+	if vol.EmptyDir == nil || vol.EmptyDir.SizeLimit == nil {
+		t.Fatal("expected a capped emptyDir")
+	}
+	if got := vol.EmptyDir.SizeLimit.String(); got != "120Gi" {
+		t.Errorf("size limit: got %q, want 120Gi", got)
+	}
+}
+
+// A generic ephemeral volume, not a hand-managed PVC: Kubernetes creates it
+// with the pod and deletes it with the pod, so no leasing or reclaim exists
+// to go wrong.
+func TestBuildCacheVolume_DistributedUsesGenericEphemeralVolume(t *testing.T) {
+	s := defaultBuildSettings()
+	s.BuildCacheStorageClass = "linstor-buildkit"
+	s.BuildCacheSizeGb = 80
+	vol := buildCacheVolume(s)
+
+	if vol.EmptyDir != nil {
+		t.Error("distributed mode must not fall back to the node's disk")
+	}
+	if vol.Ephemeral == nil || vol.Ephemeral.VolumeClaimTemplate == nil {
+		t.Fatal("distributed mode must use a generic ephemeral volume")
+	}
+	tmpl := vol.Ephemeral.VolumeClaimTemplate
+	if tmpl.Spec.StorageClassName == nil || *tmpl.Spec.StorageClassName != "linstor-buildkit" {
+		t.Errorf("storage class: got %v, want linstor-buildkit", tmpl.Spec.StorageClassName)
+	}
+	got := tmpl.Spec.Resources.Requests[corev1.ResourceStorage]
+	if got.String() != "80Gi" {
+		t.Errorf("requested size: got %q, want 80Gi", got.String())
+	}
+	// buildkitd needs exclusive access to /var/lib/buildkit; the volume is
+	// never shared between build pods.
+	if len(tmpl.Spec.AccessModes) != 1 || tmpl.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+		t.Errorf("access modes: got %v, want [ReadWriteOnce]", tmpl.Spec.AccessModes)
+	}
+}
+
+// An empty class is the only "off" signal, so a half-written ConfigMap must
+// fall back to the node's disk rather than ask for a StorageClass named "".
+func TestParseBuildSettings_BlankStorageClassMeansNodeDisk(t *testing.T) {
+	for _, data := range []map[string]string{
+		{},
+		{"buildCacheStorageClass": ""},
+		{"buildCacheStorageClass": "   "},
+	} {
+		if got := parseBuildSettings(data).BuildCacheStorageClass; got != "" {
+			t.Errorf("%v: got storage class %q, want empty", data, got)
+		}
+		if buildCacheVolume(parseBuildSettings(data)).EmptyDir == nil {
+			t.Errorf("%v: expected the node's disk", data)
+		}
+	}
+}
+
+func TestParseBuildSettings_ReadsCacheKeys(t *testing.T) {
+	got := parseBuildSettings(map[string]string{
+		"buildCacheSizeGb":       "200",
+		"buildCacheStorageClass": "linstor-buildkit",
+	})
+	if got.BuildCacheSizeGb != 200 {
+		t.Errorf("size: got %d, want 200", got.BuildCacheSizeGb)
+	}
+	if got.BuildCacheStorageClass != "linstor-buildkit" {
+		t.Errorf("class: got %q, want linstor-buildkit", got.BuildCacheStorageClass)
+	}
+
+	// An unparseable size keeps the default rather than provisioning a 0Gi volume.
+	if got := parseBuildSettings(map[string]string{"buildCacheSizeGb": "nonsense"}).BuildCacheSizeGb; got != defaultBuildCacheSizeGb {
+		t.Errorf("invalid size: got %d, want the default %d", got, defaultBuildCacheSizeGb)
+	}
+}
+
+// The pod must mount whichever shape it got, under the same path either way.
+func TestNewBuilderPod_MountsTheCacheVolumeInBothModes(t *testing.T) {
+	for _, class := range []string{"", "linstor-buildkit"} {
+		s := defaultBuildSettings()
+		s.BuildCacheStorageClass = class
+		pod := newBuilderPod("buildkit-build-x", BuilderMeta{JobID: "x"}, s)
+
+		if len(pod.Spec.Volumes) != 1 || pod.Spec.Volumes[0].Name != buildCacheVolumeName {
+			t.Fatalf("class %q: unexpected volumes %+v", class, pod.Spec.Volumes)
+		}
+		mounts := pod.Spec.Containers[0].VolumeMounts
+		if len(mounts) != 1 || mounts[0].Name != buildCacheVolumeName || mounts[0].MountPath != "/var/lib/buildkit" {
+			t.Errorf("class %q: unexpected mounts %+v", class, mounts)
+		}
 	}
 }

@@ -59,6 +59,15 @@ const (
 	// builderPollInterval is the pod-status poll cadence while waiting.
 	builderPollInterval = 2 * time.Second
 
+	// defaultBuildCacheSizeGb caps the per-build scratch volume when the
+	// build-settings ConfigMap is absent. Mirrors conductor's
+	// DEFAULT_BUILD_SETTINGS.buildCacheSizeGb; keep the two in sync.
+	defaultBuildCacheSizeGb = 50
+
+	// buildCacheVolumeName is the scratch volume's name in the pod spec. The
+	// generic ephemeral volume's PVC is named <pod>-<this> by Kubernetes.
+	buildCacheVolumeName = "buildkit-cache"
+
 	// builderPort is buildkitd's gRPC listener inside the pod. Pods have
 	// isolated network namespaces, so every concurrent build pod listens on
 	// this same port on its own pod IP.
@@ -106,6 +115,16 @@ type BuildSettings struct {
 	MemoryRequestMb int
 	// MemoryLimitMb is the per-pod memory limit in MB.
 	MemoryLimitMb int
+	// BuildCacheSizeGb caps the build's scratch volume. It applies in BOTH
+	// modes: it sizes the LINSTOR volume, and it caps the emptyDir. The cap
+	// is the point; before it existed a runaway build filled the node's root
+	// filesystem instead of failing its own build.
+	BuildCacheSizeGb int
+	// BuildCacheStorageClass names the StorageClass to draw the scratch
+	// volume from. Empty (the default) means the node's disk via emptyDir.
+	// Conductor sends the class name rather than a flag, so there is no way
+	// to be in "distributed" mode with nothing to ask for.
+	BuildCacheStorageClass string
 }
 
 // defaultBuildSettings mirrors conductor's DEFAULT_BUILD_SETTINGS; they must
@@ -117,6 +136,11 @@ func defaultBuildSettings() BuildSettings {
 		CPULimitMc:          1000,
 		MemoryRequestMb:     256,
 		MemoryLimitMb:       2048,
+		BuildCacheSizeGb:    defaultBuildCacheSizeGb,
+		// Empty: the node's disk. A cluster that never edited its build
+		// settings keeps the behaviour it had before this existed, except
+		// for the size cap.
+		BuildCacheStorageClass: "",
 	}
 }
 
@@ -139,6 +163,13 @@ func parseBuildSettings(data map[string]string) BuildSettings {
 	if n, err := strconv.Atoi(data["memoryLimitMb"]); err == nil && n > 0 {
 		s.MemoryLimitMb = n
 	}
+	if n, err := strconv.Atoi(data["buildCacheSizeGb"]); err == nil && n > 0 {
+		s.BuildCacheSizeGb = n
+	}
+	// Absent and empty both mean "node disk"; only a non-empty class switches
+	// modes, so a truncated or half-written ConfigMap falls back rather than
+	// asking for a StorageClass named "".
+	s.BuildCacheStorageClass = strings.TrimSpace(data["buildCacheStorageClass"])
 	// A request above its limit is rejected by the K8s API at pod create.
 	// Conductor refuses such a PATCH, but clamp defensively in case the
 	// ConfigMap was edited out-of-band.
@@ -258,8 +289,59 @@ func labelValue(s string) string {
 	return strings.Trim(v, "-")
 }
 
+// buildCacheVolume builds the pod's scratch volume for `/var/lib/buildkit`.
+//
+// Two shapes, one lifetime. Both are created with the pod and destroyed with
+// it; neither survives a build, because layer-cache reuse comes from the
+// Harbor registry cache (see Build), not from this directory.
+//
+//   - Node disk (default): an emptyDir, now with a sizeLimit. Exceeding the
+//     limit gets the pod evicted, which fails one build instead of filling
+//     the node's root filesystem and taking every workload on it down.
+//   - Distributed: a GENERIC EPHEMERAL VOLUME. Kubernetes creates the PVC
+//     when the pod is created and deletes it when the pod goes, so there is
+//     no volume pool to lease, no orphan to reclaim, and nothing for the
+//     startup sweep to do beyond deleting the pod as it already does. The
+//     class conductor points us at is WaitForFirstConsumer with one replica,
+//     so the volume is placed on whichever node the pod scheduled to and the
+//     build's I/O stays local.
+func buildCacheVolume(settings BuildSettings) corev1.Volume {
+	size := resource.MustParse(fmt.Sprintf("%dGi", settings.BuildCacheSizeGb))
+
+	if settings.BuildCacheStorageClass == "" {
+		return corev1.Volume{
+			Name:         buildCacheVolumeName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &size}},
+		}
+	}
+
+	storageClass := settings.BuildCacheStorageClass
+	return corev1.Volume{
+		Name: buildCacheVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Ephemeral: &corev1.EphemeralVolumeSource{
+				VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app.kubernetes.io/managed-by": "runos",
+							"runos.com/type":               builderTypeLabel,
+						},
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						StorageClassName: &storageClass,
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceStorage: size},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 // newBuilderPod assembles the per-build buildkitd pod: privileged (same
-// trust level the shared daemon ran at), ephemeral emptyDir cache,
+// trust level the shared daemon ran at), a per-build scratch volume,
 // requests + limits from the cluster's build settings (requests explicit:
 // omitting them would make Kubernetes default them to the limits), never
 // restarted (a failed daemon fails the build; the next build gets a fresh
@@ -327,7 +409,7 @@ func newBuilderPod(name string, meta BuilderMeta, settings BuildSettings) *corev
 						},
 					},
 					VolumeMounts: []corev1.VolumeMount{
-						{Name: "buildkit-cache", MountPath: "/var/lib/buildkit"},
+						{Name: buildCacheVolumeName, MountPath: "/var/lib/buildkit"},
 					},
 					// BuildKit serves grpc.health.v1.Health on its gRPC
 					// endpoint; ready means the TCP listener clients use is
@@ -344,9 +426,7 @@ func newBuilderPod(name string, meta BuilderMeta, settings BuildSettings) *corev
 					},
 				},
 			},
-			Volumes: []corev1.Volume{
-				{Name: "buildkit-cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-			},
+			Volumes: []corev1.Volume{buildCacheVolume(settings)},
 		},
 	}
 }

@@ -7,6 +7,51 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.2.0
+
+### Added
+- **Build cache on network storage.** Each build pod's scratch space
+  (`/var/lib/buildkit`) can now come from a LINSTOR volume instead of the
+  node's disk. Two new `build-settings` ConfigMap keys drive it:
+  `buildCacheStorageClass` (empty = the node's disk, the default) and
+  `buildCacheSizeGb` (default 50). Conductor sends the resolved StorageClass
+  name rather than a mode flag, so there is no way to be in "distributed" mode
+  with nothing to ask for; a blank or whitespace-only value falls back to the
+  node's disk.
+
+  The distributed shape is a GENERIC EPHEMERAL VOLUME, not a managed PVC:
+  Kubernetes creates the claim with the pod and deletes it with the pod, so
+  there is no volume pool to lease and no orphan to reclaim. Cache reuse is
+  unaffected either way, because layer cache comes from the Harbor registry
+  cache import/export, never from this directory.
+
+### Changed
+- **The build pod's `emptyDir` is now capped** at `buildCacheSizeGb` (default
+  50GB). This is a behaviour change on existing clusters. The volume was
+  previously unbounded and carried no `ephemeral-storage` request, so one
+  large build could fill a node's root filesystem and take down every workload
+  on that node. A build that exceeds the cap now gets its pod evicted, failing
+  that one build instead.
+
+### Added (build pipeline, no runtime effect)
+- **Leak gate on this public repo.** `scripts/leakcheck.py` blocks internal
+  identifiers and credentials from reaching a release. Credential shapes hard-fail
+  and can never be baselined; internal identifiers (lab machine names, account
+  ids, address literals outside the documentation ranges) ratchet against
+  `scripts/leakcheck.baseline`, so an existing finding passes and a new one fails.
+  Wired into a pre-commit hook (staged diff), `make leakcheck` (whole tree), a CI
+  workflow, and `scripts/release.sh`, where it cannot be skipped.
+
+### Fixed (build pipeline, no runtime effect)
+- The release script's own sensitivity floor carried a pre-1.0.1 regex and flagged
+  leakcheck's documentation comment, refusing every release in this repo. The floor
+  now applies the same value-shape filter as `leakcheck.py`.
+- The leak gate's own test fixtures assembled real lab addresses and a real cluster
+  id at run time, so the checker could not see them and the file that proves the
+  gate works was the one place still leaking. Replaced with stand-ins outside every
+  allow-listed range, so the catch assertions still fail if the gate breaks.
+
+
 ## v1.1.6
 
 Finalizes v1.1.6-rc.1 + v1.1.6-rc.2 (dev-verified via cluster pin on tc5-gan).
