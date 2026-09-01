@@ -16,6 +16,11 @@
 #                                         whole tree, cannot be skipped
 #   3. scripts/release.sh                 the release gate, whole tree
 #
+# All three run points also run scripts/unscannable_check.py, which makes a
+# tracked file leakcheck cannot read a hard failure rather than a quiet partial
+# scan. leakcheck reads UTF-8 text; other encodings it reads best effort or not
+# at all, so an unreadable tracked file is a hole in all three.
+#
 # A fresh clone has core.hooksPath unset, so it has no hook at all until
 # somebody runs `make hooks`. Run point 2 is what actually holds the line.
 #
@@ -29,6 +34,21 @@ CHECKER="$REPO_ROOT/scripts/leakcheck.py"
 if ! command -v python3 >/dev/null 2>&1; then
   printf '\033[0;33m  !\033[0m pre-commit: python3 not found, leakcheck skipped. The release gate still runs it.\n' >&2
   exit 0
+fi
+
+# leakcheck can only fully read UTF-8 text. Up to checker 1.1.0 it SKIPPED
+# anything else in silence: read_text() returned None and scan_files() just
+# continued. From 1.2.0 it recovers printable runs from the raw bytes, which is
+# best effort and not a scan. Measured on 1.2.0: a token in a UTF-32 file, and a
+# token broken up by NUL bytes, both passed with exit 0. So run the scannability
+# gate FIRST, or such a file walks straight past the line below.
+UNSCANNABLE="$REPO_ROOT/scripts/unscannable_check.py"
+if [[ -f "$UNSCANNABLE" ]]; then
+  if ! OUTPUT="$(python3 "$UNSCANNABLE" 2>&1)"; then
+    printf '%s\n' "$OUTPUT" >&2
+    printf '\n  COMMIT BLOCKED: a tracked file is one leakcheck cannot read.\n\n' >&2
+    exit 1
+  fi
 fi
 
 if OUTPUT="$(python3 "$CHECKER" --staged 2>&1)"; then

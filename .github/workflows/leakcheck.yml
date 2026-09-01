@@ -42,6 +42,14 @@ jobs:
       - name: Scan every tracked file
         run: python3 scripts/leakcheck.py
 
+      # leakcheck only fully reads UTF-8 text. A NUL-bearing or non-UTF-8 file
+      # is read best effort at most, and some encodings escape it entirely:
+      # measured on checker 1.2.0, a token in a UTF-32 file and a token broken
+      # up by NUL bytes both passed the step above with exit 0. This makes an
+      # unreadable tracked file a hard failure instead.
+      - name: Every tracked file must be one leakcheck can read
+        run: python3 scripts/unscannable_check.py
+
       # The checker's own tests: what it must catch and what it must not.
       - name: Test the checker itself
         run: python3 scripts/leakcheck_test.py

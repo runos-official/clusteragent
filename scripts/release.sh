@@ -193,6 +193,23 @@ if ! LEAK_OUTPUT="$(python3 "$REPO_ROOT/scripts/leakcheck.py" 2>&1)"; then
 fi
 ok "$(printf '%s' "$LEAK_OUTPUT" | tail -1)"
 
+# ---- Scannability gate: leakcheck must be able to READ every tracked file ---
+# The gate above only fully reads UTF-8 text. Up to checker 1.1.0 it SKIPPED
+# anything else in silence. From 1.2.0 it recovers printable runs from the raw
+# bytes, which is best effort and not a scan: measured on 1.2.0, a token in a
+# UTF-32 file and a token broken up by NUL bytes both passed it with exit 0.
+#
+# So a tracked file leakcheck cannot read is a hole in the gate above, and this
+# turns it into a hard failure. A file that has to stay unreadable is declared
+# in ALLOWED in scripts/unscannable_check.py, with a reason, by somebody who
+# has read it. This gate CANNOT be skipped either.
+step "Scannability gate (leakcheck must be able to read every tracked file)"
+if ! SCAN_OUTPUT="$(python3 "$REPO_ROOT/scripts/unscannable_check.py" 2>&1)"; then
+  printf '%s\n' "$SCAN_OUTPUT" >&2
+  die "scannability gate failed (public repo): leakcheck cannot read the files above, so it did not really scan them."
+fi
+ok "$(printf '%s' "$SCAN_OUTPUT" | tail -1)"
+
 step "Build";  CGO_ENABLED=0 go build ./... || die "go build failed"; ok "go build"
 step "Vet";    go vet ./...                  || die "go vet failed";   ok "go vet"
 step "Test";   CGO_ENABLED=1 go test -race ./... || die "go test failed"; ok "go test"

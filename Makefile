@@ -107,6 +107,15 @@ leakcheck-update:
 leakcheck-test:
 	@python3 scripts/leakcheck_test.py
 
+# Fail on a tracked file leakcheck cannot READ. leakcheck reads UTF-8 text; a
+# file holding a NUL byte or other bytes is read best effort at most, and some
+# encodings escape it entirely (measured on checker 1.2.0: a token in a UTF-32
+# file, and a token broken up by NUL bytes, both pass with exit 0). This target
+# turns such a file into a decision somebody records, not a silent gap.
+.PHONY: unscannable
+unscannable:
+	@python3 scripts/unscannable_check.py
+
 # ============================================================================
 # Release
 # ============================================================================
@@ -141,6 +150,7 @@ help:
 	@echo "  make leakcheck-staged Scan only the staged diff"
 	@echo "  make leakcheck-update Ratchet the baseline down after removing an identifier"
 	@echo "  make leakcheck-test   Test the leak checker itself"
+	@echo "  make unscannable      Fail on a tracked file leakcheck cannot read"
 	@echo ""
 	@echo "  make release RELEASE_VERSION=vX.Y.Z          Cut a release (gates, tag, push, verify)"
 	@echo "  make release RELEASE_VERSION=vX.Y.Z CHECK=1  Run release gates only, no tag/push"
