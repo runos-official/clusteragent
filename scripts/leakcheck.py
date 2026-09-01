@@ -60,7 +60,7 @@ import re
 import subprocess
 import sys
 
-LEAKCHECK_VERSION = "1.2.0"
+LEAKCHECK_VERSION = "1.2.1"
 
 # ---------------------------------------------------------------------------
 # Credential shapes. Kept in step with CREDENTIAL in scripts/release.sh.
@@ -372,6 +372,26 @@ def read_texts(path: str):
     runs = re.findall(rb"[\x20-\x7e]{8,}", blob)
     if runs:
         renderings.append(("bytes", b"\n".join(runs).decode("ascii")))
+
+    # 1.2.1. NUL-stripped. utf-32 puts THREE NUL bytes between characters, so it
+    # survives neither the utf-16 decode above nor the printable-run reading,
+    # which needs eight CONSECUTIVE printable bytes. Interleaving NULs by hand
+    # does the same thing and needs no encoder at all. Both passed
+    # `leakcheck: clean` exit 0 on 1.2.0.
+    #
+    # Deleting the NULs and reading what is left covers utf-32 in either byte
+    # order, any NUL-padded or NUL-interleaved format, and anything a future
+    # encoder pads the same way, without this file having to enumerate encodings
+    # one defect at a time. Only runs when the blob actually holds a NUL, so an
+    # ordinary text file pays nothing.
+    #
+    # It cannot invent a match: removing bytes can only bring characters
+    # together, and the credential patterns need a provider prefix plus twenty or
+    # more characters, a cloud key id, or a PEM header.
+    if b"\x00" in blob:
+        stripped = blob.replace(b"\x00", b"")
+        if stripped:
+            renderings.append(("nul-stripped", stripped.decode("latin-1")))
 
     return renderings
 

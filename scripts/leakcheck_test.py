@@ -248,6 +248,29 @@ def main() -> int:
         ".bin",
     )
 
+    # 1.2.1: the 1.2.0 fix above closed utf-16 and latin-1 and stopped there, and
+    # the remaining hole was found by a gate ADDED to catch files this scanner
+    # cannot read, which is the honest way round. Both cases below passed
+    # `leakcheck: clean` exit 0 on 1.2.0.
+    #
+    # utf-32 puts THREE NUL bytes between characters, so it survives neither the
+    # utf-16 decode nor the printable-run reading, which needs eight consecutive
+    # printable bytes. Interleaving NULs by hand does the same thing and needs no
+    # encoder at all.
+    expect_catch_bytes(
+        "a token in a utf-32 file", ENCODED_LINE.encode("utf-32"), ENCODED_TOKEN
+    )
+    expect_catch_bytes(
+        "a token in a utf-32-le file with no BOM",
+        ENCODED_LINE.encode("utf-32-le"),
+        ENCODED_TOKEN,
+    )
+    expect_catch_bytes(
+        "a token with a NUL byte between every character",
+        b"\x00".join(bytes([c]) for c in ENCODED_LINE.encode()),
+        ENCODED_TOKEN,
+    )
+
     print("MUST NOT CATCH")
 
     # RFC 5737 and RFC 3849. These exist so people can write about addresses.
