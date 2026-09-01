@@ -50,6 +50,12 @@ SECOND_BOX = "ftb" + "2"
 RENTED_BOX = "fttb" + "3"
 ACCOUNT_ID = "rj" + "wrn"
 
+# 1.2.0: RunOS's OWN token shape, assembled so this file does not carry a
+# matchable literal. The prefix is split exactly like the machine names above.
+RUNOS_TOKEN_PREFIX = "runos" + "_pat_"
+RUNOS_TOKEN = RUNOS_TOKEN_PREFIX + "AbCdEfGhJk.MnPqRsTuVwXyZ23456789AbCdEfGhJkMn"
+RUNOS_TOKEN_2 = RUNOS_TOKEN_PREFIX + "Zz9Yy8Xx7W.QqWwEeRrTtYyUuIiOoPpAaSsDdFfGg"
+
 # The SHAPE of the pasted terminal output that shipped in
 # cmd/preflight/tls_failure_kind_test.go: a private source address dialling a
 # public destination. Both are stand-ins, not the addresses from the incident,
@@ -88,6 +94,32 @@ def run_checker(text: str, extra_args=()):
             text=True,
         )
         return proc.returncode, proc.stdout
+
+
+def run_checker_bytes(blob: bytes, suffix: str = ".txt"):
+    """Write RAW BYTES to a temp file, scan it, return (exit code, stdout+stderr)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "fixture" + suffix)
+        with open(path, "wb") as fh:
+            fh.write(blob)
+        proc = subprocess.run(
+            [sys.executable, CHECKER, "--no-baseline", "--paths", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        return proc.returncode, proc.stdout
+
+
+def expect_catch_bytes(label: str, blob: bytes, token: str, suffix: str = ".txt") -> None:
+    global CHECKS
+    CHECKS += 1
+    code, out = run_checker_bytes(blob, suffix)
+    if code == 1 and token in out:
+        print("  PASS  catch    %s" % label)
+        return
+    FAILURES.append(label)
+    print("  FAIL  catch    %s (exit %d)\n%s" % (label, code, out))
 
 
 def expect_catch(label: str, text: str, token: str) -> None:
@@ -144,6 +176,22 @@ def main() -> int:
     expect_catch("lab box name in mixed case", "Measured on %s.\n" % LAB_BOX.upper(), LAB_BOX)
     expect_catch("account id in a node name", 'want "n02-cl1-%s" in the detail\n' % ACCOUNT_ID, ACCOUNT_ID)
 
+
+    # 1.2.0: RunOS's OWN token shape. The gate exists to keep RunOS secrets out
+    # of a public repo, and until 1.2.0 it did not recognise the format
+    # `runos login --api-key` stores. Measured 2026-08-31: a file carrying a
+    # real-shaped runos_pat_ passed clean in all five public repos, while a
+    # GitHub token on the line above it failed.
+    expect_catch(
+        "RunOS personal access token",
+        "runos login --api-key %s\n" % RUNOS_TOKEN,
+        RUNOS_TOKEN[:22],
+    )
+    expect_catch(
+        "RunOS token in an environment assignment",
+        "export RUNOS_API_KEY=%s\n" % RUNOS_TOKEN_2,
+        RUNOS_TOKEN_2[:22],
+    )
     # The already-shipped pasted output, both addresses in one line.
     expect_catch("pasted source address in a shipped test comment", '// "the secure handshake FAILED: %s",\n' % PASTED_ERROR, PASTED_SRC)
     expect_catch("pasted destination address in the same line", '// "the secure handshake FAILED: %s",\n' % PASTED_ERROR, PASTED_DST)
@@ -166,9 +214,47 @@ def main() -> int:
     expect_catch("high-entropy quoted assignment", REAL_LOOKING_VALUE + "\n", "aB3xK9zQ7mN2pR5tV8wY")
 
     print()
+    # 1.2.0: FILE ENCODING. read_text used to return None for a file holding a NUL
+    # byte or a byte sequence that is not valid utf-8, and the scan then SKIPPED
+    # that file WITHOUT A WORD. Measured before the fix: the SAME real-shaped token
+    # passed `leakcheck: clean` exit 0 in a utf-16 file, a latin-1 file and a file
+    # with two leading NUL bytes, while it was caught in a plain utf-8 file. Every
+    # public repo carried it. A gate that silently skips what it cannot parse is
+    # not a gate.
+    ENCODED_TOKEN = "gh" + "p_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    ENCODED_LINE = "export GITHUB_TOKEN=%s\n" % ENCODED_TOKEN
+    expect_catch_bytes(
+        "a token in a utf-16 file", ENCODED_LINE.encode("utf-16"), ENCODED_TOKEN
+    )
+    expect_catch_bytes(
+        "a token in a utf-16-le file with no BOM",
+        ENCODED_LINE.encode("utf-16-le"),
+        ENCODED_TOKEN,
+    )
+    expect_catch_bytes(
+        "a token in a latin-1 file",
+        ("# caf\xe9\n" + ENCODED_LINE).encode("latin-1"),
+        ENCODED_TOKEN,
+    )
+    expect_catch_bytes(
+        "a token in a file that starts with NUL bytes",
+        b"\x00\x00" + ENCODED_LINE.encode(),
+        ENCODED_TOKEN,
+    )
+    expect_catch_bytes(
+        "a token buried in a kilobyte of arbitrary bytes",
+        bytes(range(256)) * 4 + ENCODED_LINE.encode(),
+        ENCODED_TOKEN,
+        ".bin",
+    )
+
     print("MUST NOT CATCH")
 
     # RFC 5737 and RFC 3849. These exist so people can write about addresses.
+    expect_clean(
+        "RunOS token placeholder in documentation",
+        "runos login --api-key %s<id>.<secret>\n" % RUNOS_TOKEN_PREFIX,
+    )
     expect_clean("RFC 5737 TEST-NET-1", "gateway %s\n" % dotted(192, 0, 2, 1))
     expect_clean("RFC 5737 TEST-NET-2", "peer %s\n" % dotted(198, 51, 100, 7))
     expect_clean("RFC 5737 TEST-NET-3", "endpoint %s:51820\n" % dotted(203, 0, 113, 5))

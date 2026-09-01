@@ -60,16 +60,27 @@ import re
 import subprocess
 import sys
 
-LEAKCHECK_VERSION = "1.1.0"
+LEAKCHECK_VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
-# Credential shapes. Kept in step with SECRET_RE in scripts/release.sh.
+# Credential shapes. Kept in step with CREDENTIAL in scripts/release.sh.
 # High precision on purpose: it must not fire on commit SHAs, pinned action
 # SHAs, or the public OIDC identity URL.
+#
+# 1.2.0: RunOS's OWN token shape was missing. `runos_pat_<id>.<secret>` is the
+# format `runos login --api-key` stores and the format every RunOS API key is
+# minted in, and the gate that exists to keep RunOS secrets out of a public repo
+# did not recognise it. Measured 2026-08-31: a file carrying a real-shaped
+# `runos_pat_` passed `make leakcheck` clean in all five public repos, while a
+# GitHub token on the line above it failed. The pattern requires the full
+# id-dot-secret shape, so a doc placeholder like `runos_pat_<id>.<secret>` does
+# not trip it. No public repo contained the string at all when this was added,
+# so it introduced no false positive.
 # ---------------------------------------------------------------------------
 CREDENTIAL_RE = re.compile(
     r"(gh[pousr]_[A-Za-z0-9]{20,})"
     r"|(github_pat_[A-Za-z0-9_]{20,})"
+    r"|(runos_pat_[A-Za-z0-9]{6,}\.[A-Za-z0-9]{20,})"
     r"|(xox[baprs]-[A-Za-z0-9-]{10,})"
     r"|(AKIA[0-9A-Z]{16})"
     r"|(-----BEGIN [A-Z ]*PRIVATE KEY-----)"
@@ -302,19 +313,67 @@ def scan_line(path: str, lineno: int, text: str, patterns: list) -> list:
     return findings
 
 
-def read_text(path: str):
-    """Return the file's text, or None when it is binary or unreadable."""
+def read_texts(path: str):
+    """Return every readable rendering of a file, as (label, text) pairs.
+
+    1.2.0. This used to return ONE utf-8 string, or None for a file holding a NUL
+    byte or a byte sequence that is not valid utf-8, and the scan then SKIPPED it
+    without a word. That is a hole, not a safeguard, and it was measured: a real
+    shaped GitHub token in a utf-16 file, in a latin-1 file, and in a file with two
+    leading NUL bytes all passed `leakcheck: clean` with exit 0, while the SAME
+    token in a plain utf-8 file was caught. Every public repo carried it.
+
+    A gate that silently skips what it cannot parse is not a gate. So the file is
+    now rendered every way a secret could plausibly hide, and each rendering is
+    scanned:
+
+      utf-8      the ordinary case.
+      utf-16     a token in a utf-16 file survives no other way, because its bytes
+                 are `g\x00h\x00p\x00...` and every byte-wise reading sees single
+                 characters separated by NULs.
+      bytes      printable ASCII runs of eight characters or more, pulled out of
+                 the raw bytes the way `strings` does. This is what catches latin-1,
+                 a NUL-prefixed file, and a token embedded in any other byte soup.
+
+    Duplicate findings across renderings are collapsed by the caller. The credential
+    patterns are high precision (a provider prefix plus twenty or more characters, a
+    cloud key id, a PEM header), so pulling ASCII runs out of a genuine binary does
+    not invent matches.
+    """
     try:
         with open(path, "rb") as fh:
             blob = fh.read()
     except OSError:
-        return None
-    if b"\x00" in blob:
-        return None
+        return []
+    if not blob:
+        return []
+
+    renderings = []
     try:
-        return blob.decode("utf-8")
+        renderings.append(("utf-8", blob.decode("utf-8")))
     except UnicodeDecodeError:
-        return None
+        pass
+
+    # utf-16 only when the result really looks like text, so a random binary that
+    # happens to have an even length does not become a page of noise.
+    if len(blob) % 2 == 0:
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+            try:
+                candidate = blob.decode(encoding)
+            except (UnicodeDecodeError, UnicodeError, ValueError):
+                continue
+            if not candidate:
+                continue
+            legible = sum(1 for ch in candidate if ch.isprintable() or ch.isspace())
+            if legible / len(candidate) > 0.9:
+                renderings.append((encoding, candidate))
+                break
+
+    runs = re.findall(rb"[\x20-\x7e]{8,}", blob)
+    if runs:
+        renderings.append(("bytes", b"\n".join(runs).decode("ascii")))
+
+    return renderings
 
 
 def scan_files(paths, patterns, skip_globs) -> list:
@@ -322,11 +381,19 @@ def scan_files(paths, patterns, skip_globs) -> list:
     for path in paths:
         if is_skipped(path, skip_globs):
             continue
-        text = read_text(path)
-        if text is None:
-            continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            findings.extend(scan_line(path, lineno, line, patterns))
+        seen = set()
+        for label, text in read_texts(path):
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                for finding in scan_line(path, lineno, line, patterns):
+                    # The same secret shows up in several renderings of one file.
+                    # Report it once, and prefer the utf-8 line number when there
+                    # is one, because that is the line a human will go and edit.
+                    key = (finding.path, finding.kind, finding.token)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    findings.append(finding)
+            del label
     return findings
 
 
