@@ -1,0 +1,78 @@
+# the RunOS cluster agent release pipeline, run by foreman on the foreman HOST (FCR #188).
+#
+# This repo is PUBLIC and its artefacts are built by GitHub Actions, not here.
+# Foreman's job is therefore narrower than for a cluster deploy: run this repo's
+# own gate chain, tag, push, then WATCH the workflow that does the building and
+# verify what it published.
+#
+# The gate chain is NOT reimplemented here, on purpose. scripts/release.sh
+# carries an unskippable leak gate that exists because real internal identifiers
+# were published to a public repo and could not be unpublished. A second copy in
+# foreman would be the copy that drifts, and the one that drifts is the one that
+# fails open. So step one calls the script's own --check mode, which runs every
+# gate and stops before any side effect.
+#
+# What foreman adds over running the script by hand: each step is recorded with
+# its command, exit code, duration and output, and the run appears in the same
+# deploy history as the cluster rollouts, so "list all the deploys" means all of
+# them rather than one list per mechanism.
+#
+# gh authenticates from the host keyring, so no credential is injected here. The
+# token never has to exist in foreman's store to begin with.
+
+name: Release the RunOS cluster agent
+description: Run this repo's full gate chain, tag and push, then watch the GitHub Actions release and verify what it published.
+kind: github_release
+
+steps:
+  - name: Gate chain
+    description: "scripts/release.sh --check: preflight, sensitivity scan, leak gate, scannability gate and the build/vet/test suite. Every gate, no side effects, and it cannot be skipped."
+    run: scripts/release.sh "${{ version }}" --check
+    timeout: 1800
+
+  - name: Tag and push
+    description: Tags the integration branch and pushes both. main is never touched here; the human merges it after their own verification.
+    run: |
+      git checkout --quiet ${{ target.branch }}
+      sha="$(git rev-parse --short HEAD)"
+      git tag "${{ version }}"
+      git push --quiet origin ${{ target.branch }}
+      git push --quiet origin "${{ version }}"
+      echo "tagged ${{ version }} at $sha and pushed"
+
+  - name: Wait for the release workflow
+    description: GitHub builds the artefacts. Poll for the run this tag started, then block on it. A failed workflow fails the deploy.
+    run: |
+      run_id=""; waited=0
+      while [ -z "$run_id" ] && [ "$waited" -lt 120 ]; do
+        run_id="$(gh run list --workflow=release.yml --limit 15 \
+          --json databaseId,headBranch,event \
+          -q "[.[] | select(.headBranch==\"${{ version }}\" and .event==\"push\")][0].databaseId" 2>/dev/null || true)"
+        [ -n "$run_id" ] && break
+        sleep 10; waited=$((waited + 10))
+      done
+      test -n "$run_id" || { echo "no release run found for ${{ version }}"; exit 1; }
+      echo "watching run $run_id"
+      gh run watch "$run_id" --exit-status >/dev/null 2>&1 \
+        || { echo "release workflow $run_id failed (gh run view $run_id --log-failed)"; exit 1; }
+      echo "release workflow succeeded"
+    timeout: 1800
+
+  - name: Verify the published image attestation
+    description: This repo publishes an IMAGE rather than release assets, so the attestation is verified against the OCI reference. A WARN rather than a hard failure, matching the script this replaces, because the check can be unavailable for reasons unrelated to the build.
+    run: |
+      nwo="$(gh api repos/{owner}/{repo} --jq .full_name)"
+      ref="oci://ghcr.io/runos-official/clusteragent:$(echo "${{ version }}" | sed "s/^v//")"
+      if gh attestation verify "$ref" --repo "$nwo" >/dev/null 2>&1; then
+        echo "image attestation verified for $ref"
+      else
+        echo "WARN: could not verify the image attestation automatically; verify by hand with: gh attestation verify $ref --repo $nwo"
+      fi
+    timeout: 300
+
+  - name: Advance the deployed branch
+    description: The record of what has actually shipped. Fast-forwarded only now, on success. main stays clean for the human.
+    run: |
+      git branch -f deployed ${{ target.branch }}
+      git push --quiet origin deployed
+      echo "deployed now at $(git rev-parse --short deployed)"
