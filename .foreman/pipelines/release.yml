@@ -24,6 +24,13 @@ name: Release the RunOS cluster agent
 description: Run this repo's full gate chain, tag and push, then watch the GitHub Actions release and verify what it published.
 kind: github_release
 
+# What this release advertises once the workflow has published it (foreman
+# FCR: an objective-scoped release that advertises nothing is a tag nobody can
+# reach). The component names the env_config key; env comes from the target.
+advertises:
+  component: cluster_agent
+  env: ${{ target.env }}
+
 steps:
   - name: Gate chain
     description: "scripts/release.sh --check: preflight, sensitivity scan, leak gate, scannability gate and the build/vet/test suite. Every gate, no side effects, and it cannot be skipped."
