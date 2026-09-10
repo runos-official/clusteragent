@@ -80,6 +80,9 @@ steps:
   - name: Advance the deployed branch
     description: The record of what has actually shipped. Fast-forwarded only now, on success. main stays clean for the human.
     run: |
-      git branch -f deployed ${{ target.branch }}
-      git push --quiet origin deployed
-      echo "deployed now at $(git rev-parse --short deployed)"
+      # The record ref comes from the target: an objective-scoped deploy records
+      # on its own rc ref, never on the shared one, so the literal name is refused.
+      record="${{ target.deployed_branch }}"
+      git branch -f "$record" ${{ target.branch }}
+      git push --quiet origin "$record"
+      echo "$record now at $(git rev-parse --short "$record")"
