@@ -7,6 +7,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.2.1-rc.1
+
+Release gate and pipeline fixes only. The agent binary behaves exactly as in v1.2.0.
+
+### Fixed
+- **The leak gate catches more.** It now finds RunOS personal access tokens, a
+  token hidden by NUL padding, and a tracked file it cannot read. It used to skip
+  an unreadable file silently and pass.
+
+### Changed
+- **The release pipeline is declared for foreman.** It states what the release
+  advertises, and records the release on the branch the target names.
+
 ## v1.2.0
 
 ### Added
