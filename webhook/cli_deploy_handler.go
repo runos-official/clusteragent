@@ -116,14 +116,12 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	k8sClient, err := agentstream.NewK8sClient()
 	if err != nil {
-		log.Printf("Failed to create K8s client: %v", err)
-		http.Error(w, "Internal error", http.StatusInternalServerError)
+		failUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("Internal error: create Kubernetes client: %v", err))
 		return
 	}
 	buildkitConfig, err := k8sClient.GetBuildKitConfig(ctx)
 	if err != nil {
-		log.Printf("Failed to get BuildKit config: %v", err)
-		http.Error(w, "Internal error", http.StatusInternalServerError)
+		failUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("Internal error: read the build config: %v", err))
 		return
 	}
 
@@ -156,8 +154,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		Username: buildkitConfig.HarborUsername,
 		Password: buildkitConfig.HarborPassword,
 	}, osid, uploadID, tarballData); err != nil {
-		log.Printf("Failed to push archive to Harbor (osid=%s, uploadID=%s): %v", osid, uploadID, err)
-		http.Error(w, "Failed to store archive", http.StatusInternalServerError)
+		failUpload(w, osid, uploadID, http.StatusInternalServerError, archiveStoreFailure(err))
 		return
 	}
 	log.Printf("Pushed CLI archive to Harbor: osid=%s uploadID=%s", osid, uploadID)

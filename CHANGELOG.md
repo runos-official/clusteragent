@@ -7,6 +7,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## Unreleased
+
+### Fixed
+- **A failed upload now ends the deploy job.** When the agent cannot store the
+  CLI source archive (for example the registry certificate does not verify), it
+  writes a failed build row with one `ERROR:` line under the upload id, so the
+  conductor deploy job ends failed with that reason instead of waiting at
+  "Wait for build". The CLI now sees the cause after "Failed to store archive"
+  instead of the bare phrase. A missing Kubernetes client or build config fails
+  the same way.
+
 ## v1.2.1-rc.1
 
 Release gate and pipeline fixes only. The agent binary behaves exactly as in v1.2.0.
