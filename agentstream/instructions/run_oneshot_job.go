@@ -39,6 +39,9 @@ type RunOneShotJobRequest struct {
 	ImagePullSecret string   `json:"imagePullSecret,omitempty"` // Harbor pull secret name; omitted when the image is public
 	TimeoutSeconds  int      `json:"timeoutSeconds,omitempty"`  // hard deadline; defaults to defaultOneShotTimeoutSeconds when <= 0
 	Actor           string   `json:"actor,omitempty"`           // who triggered the run, for the audit record
+	// Resources is optional. Absent (an older conductor), the container gets
+	// small requests and no limits; see oneShotResourceRequirements.
+	Resources *OneShotResources `json:"resources,omitempty"`
 }
 
 // RunOneShotJobResponse acknowledges that the Job was created. The terminal
@@ -205,6 +208,9 @@ func buildOneShotJob(jobName, namespace string, req RunOneShotJobRequest, envCon
 							Image:   req.Image,
 							Command: req.Command,
 							EnvFrom: envFrom,
+							// Never BestEffort: requests are always set, so disk
+							// pressure does not evict a migration first.
+							Resources: oneShotResourceRequirements(req.Resources),
 						},
 					},
 				},

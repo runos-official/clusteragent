@@ -1,9 +1,12 @@
 package instructions
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/runos-official/clusteragent/datastore"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestClassifyOneShotOutcome(t *testing.T) {
@@ -111,5 +114,102 @@ func TestLooksLikeSignalKill(t *testing.T) {
 		if got := looksLikeSignalKill(tc.code); got != tc.want {
 			t.Errorf("looksLikeSignalKill(%d) = %v, want %v", tc.code, got, tc.want)
 		}
+	}
+}
+
+// oneShotContainer builds a Job from a request and returns its only container.
+func oneShotContainer(t *testing.T, req RunOneShotJobRequest) corev1.Container {
+	t.Helper()
+	job := buildOneShotJob("runos-run-x", "myapp", req, "cm", "sec", 60)
+	cs := job.Spec.Template.Spec.Containers
+	if len(cs) != 1 {
+		t.Fatalf("want 1 container, got %d", len(cs))
+	}
+	return cs[0]
+}
+
+func qty(t *testing.T, list corev1.ResourceList, name corev1.ResourceName) string {
+	t.Helper()
+	q, ok := list[name]
+	if !ok {
+		return ""
+	}
+	return q.String()
+}
+
+func TestOneShotResourcesFromRequest(t *testing.T) {
+	c := oneShotContainer(t, RunOneShotJobRequest{
+		Image: "img", Command: []string{"x"},
+		Resources: &OneShotResources{
+			CPURequestMc: 100, CPULimitMc: 1000,
+			MemoryRequestMb: 256, MemoryLimitMb: 2048,
+			EphemeralStorageRequestMb: 2048, EphemeralStorageLimitMb: 2048,
+		},
+	})
+	r := c.Resources
+	want := map[string][3]string{
+		"cpu":               {"100m", "1", ""},
+		"memory":            {"256Mi", "2Gi", ""},
+		"ephemeral-storage": {"2Gi", "2Gi", ""},
+	}
+	for name, w := range want {
+		if got := qty(t, r.Requests, corev1.ResourceName(name)); got != w[0] {
+			t.Errorf("request %s = %q, want %q", name, got, w[0])
+		}
+		if got := qty(t, r.Limits, corev1.ResourceName(name)); got != w[1] {
+			t.Errorf("limit %s = %q, want %q", name, got, w[1])
+		}
+	}
+}
+
+// An old conductor sends no block. The pod must still never be BestEffort, and
+// the agent adds no limit, so a run that worked before cannot start to be killed.
+func TestOneShotResourcesDefaultWhenAbsent(t *testing.T) {
+	c := oneShotContainer(t, RunOneShotJobRequest{Image: "img", Command: []string{"x"}})
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
+		if qty(t, c.Resources.Requests, name) == "" {
+			t.Errorf("default request for %s is missing; the pod would be BestEffort", name)
+		}
+	}
+	if len(c.Resources.Limits) != 0 {
+		t.Errorf("default must add no limits, got %v", c.Resources.Limits)
+	}
+}
+
+func TestOneShotResourcesPartialAndInconsistent(t *testing.T) {
+	t.Run("limit only: request follows the limit for storage, defaults for the rest", func(t *testing.T) {
+		c := oneShotContainer(t, RunOneShotJobRequest{Resources: &OneShotResources{EphemeralStorageLimitMb: 1024, MemoryLimitMb: 512}})
+		if got := qty(t, c.Resources.Requests, corev1.ResourceEphemeralStorage); got != "1Gi" {
+			t.Errorf("storage request = %q, want 1Gi", got)
+		}
+		if qty(t, c.Resources.Requests, corev1.ResourceCPU) == "" {
+			t.Error("cpu request must fall back to the default")
+		}
+	})
+	t.Run("request above limit is lowered to the limit so the API accepts the Job", func(t *testing.T) {
+		c := oneShotContainer(t, RunOneShotJobRequest{Resources: &OneShotResources{MemoryRequestMb: 4096, MemoryLimitMb: 512}})
+		if got := qty(t, c.Resources.Requests, corev1.ResourceMemory); got != "512Mi" {
+			t.Errorf("memory request = %q, want 512Mi", got)
+		}
+	})
+	t.Run("negative values count as unset", func(t *testing.T) {
+		c := oneShotContainer(t, RunOneShotJobRequest{Resources: &OneShotResources{CPULimitMc: -5, MemoryLimitMb: -1}})
+		if len(c.Resources.Limits) != 0 {
+			t.Errorf("negative limits must be ignored, got %v", c.Resources.Limits)
+		}
+	})
+}
+
+// A new conductor may send fields this agent does not know, and an old conductor
+// sends no block: both must decode.
+func TestOneShotRequestJSONCompat(t *testing.T) {
+	var old RunOneShotJobRequest
+	if err := json.Unmarshal([]byte(`{"runId":"r","osid":"o","image":"i","command":["c"]}`), &old); err != nil || old.Resources != nil {
+		t.Fatalf("old request: err=%v resources=%v", err, old.Resources)
+	}
+	var newer RunOneShotJobRequest
+	body := `{"runId":"r","resources":{"cpuLimitMc":500,"futureField":1},"futureTop":true}`
+	if err := json.Unmarshal([]byte(body), &newer); err != nil || newer.Resources == nil || newer.Resources.CPULimitMc != 500 {
+		t.Fatalf("new request: err=%v resources=%+v", err, newer.Resources)
 	}
 }

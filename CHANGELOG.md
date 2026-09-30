@@ -9,7 +9,7 @@ as the GitHub release notes, so every released version needs a section here.
 
 ## v1.2.1
 
-Release gate and pipeline fixes, and one deploy fix. Everything else behaves as in v1.2.0.
+Release gate and pipeline fixes, one deploy fix and one one-shot run fix. Everything else behaves as in v1.2.0.
 
 ### Fixed
 - **A failed upload now ends the deploy job.** When the agent cannot store the
@@ -22,10 +22,36 @@ Release gate and pipeline fixes, and one deploy fix. Everything else behaves as 
 - **The leak gate catches more.** It now finds RunOS personal access tokens, a
   token hidden by NUL padding, and a tracked file it cannot read. It used to skip
   an unreadable file silently and pass.
+- **One-shot run pods are no longer BestEffort.** The Job that `runos apps run`
+  creates (database migrations) had no requests or limits, so it was the first
+  pod evicted under node disk pressure (exit 143 or 137). `RUN_ONESHOT_JOB`
+  takes an optional `resources` block (CPU and memory requests and limits,
+  ephemeral-storage request and limit) that the conductor fills from the cluster
+  settings. The Job container always gets CPU, memory and ephemeral-storage
+  requests. Without the block (an older conductor) the agent sets small
+  requests only (100m CPU, 256 MiB memory, 1 GiB ephemeral storage) and no
+  limits, so a run that worked before cannot start to fail on a new cap. An
+  unknown field in the block is ignored, so an older agent accepts a newer
+  conductor's request and keeps today's behaviour.
 
 ### Changed
 - **The release pipeline is declared for foreman.** It states what the release
   advertises, and records the release on the branch the target names.
+
+## v1.2.1-rc.3
+
+### Fixed
+- **One-shot run pods are no longer BestEffort.** The Job that `runos apps run`
+  creates (database migrations) had no requests or limits, so it was the first
+  pod evicted under node disk pressure (exit 143 or 137). `RUN_ONESHOT_JOB`
+  takes an optional `resources` block (CPU and memory requests and limits,
+  ephemeral-storage request and limit) that the conductor fills from the cluster
+  settings. The Job container always gets CPU, memory and ephemeral-storage
+  requests. Without the block (an older conductor) the agent sets small
+  requests only (100m CPU, 256 MiB memory, 1 GiB ephemeral storage) and no
+  limits, so a run that worked before cannot start to fail on a new cap. An
+  unknown field in the block is ignored, so an older agent accepts a newer
+  conductor's request and keeps today's behaviour.
 
 ## v1.2.1-rc.2
 
