@@ -7,7 +7,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
-## Unreleased
+## v1.2.2-rc.1
 
 A restart of the agent no longer kills running builds, and a restart no longer leaves a build row open for ever.
 
