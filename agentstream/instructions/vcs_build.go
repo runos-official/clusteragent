@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/runos-official/clusteragent/commons"
 	"github.com/runos-official/clusteragent/datastore"
+	"github.com/runos-official/clusteragent/drain"
 )
 
 // VcsBuildRequest is the input for VCS_BUILD.
@@ -102,6 +103,10 @@ type VcsBuildExecutorInput struct {
 // and webhook (which depends on agentstream).
 var VcsBuildExecutor func(VcsBuildExecutorInput)
 
+// beginWork registers one build or one-shot job with the drain tracker, so a
+// restart of the agent waits for it. Tests replace it to model a draining agent.
+var beginWork = drain.Begin
+
 // VcsBuild handles the VCS_BUILD instruction.
 //
 // Looks up the workdir populated by an earlier VCS_FETCH_SOURCE call,
@@ -124,6 +129,20 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 			Message: "osid, sha, and jobId are required",
 		})
 	}
+
+	// Refuse before anything is written: a build row for a refused build would
+	// never get a build. end is called here on every early return, and by the
+	// build goroutine once the build is over.
+	end, err := beginWork()
+	if err != nil {
+		return replyVcsBuild(replyType, VcsBuildResponse{Success: false, Message: err.Error()})
+	}
+	started := false
+	defer func() {
+		if !started {
+			end()
+		}
+	}()
 
 	if VcsBuildExecutor == nil {
 		return replyVcsBuild(replyType, VcsBuildResponse{
@@ -158,32 +177,36 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 
 	osid, sha := req.OSID, req.SHA
 	workdir := paths.Workdir
-	go VcsBuildExecutor(VcsBuildExecutorInput{
-		OSID:               osid,
-		SHA:                sha,
-		JobID:              buildJobID,
-		Workdir:            workdir,
-		ContextPath:        paths.ContextPath,
-		DockerfileDir:      paths.DockerfileDir,
-		DockerfileFilename: paths.DockerfileFilename,
-		BuildArgs:          req.BuildArgs,
-		BuildOnly:          req.BuildOnly,
-		Repo:               cleanRepoURL,
-		Branch:             req.Branch,
-		// Cleanup deletes the specific workdir this build used. We can't
-		// chase the cache (vcsWorkdirCacheDelete) because workdirs are now
-		// unique per VCS_FETCH_SOURCE call: a concurrent fetch for the
-		// same {osid, sha} may have overwritten the cache entry between
-		// fetch return and build cleanup, and we don't want to wipe its
-		// fresh tree. We only clear the cache entry if it still points
-		// at our workdir.
-		Cleanup: func() {
-			if err := os.RemoveAll(workdir); err != nil {
-				log.Printf("VCS_BUILD: cleanup of workdir %s: %v", workdir, err)
-			}
-			vcsWorkdirCacheDeleteIfPath(osid, sha, workdir)
-		},
-	})
+	started = true
+	go func() {
+		defer end()
+		VcsBuildExecutor(VcsBuildExecutorInput{
+			OSID:               osid,
+			SHA:                sha,
+			JobID:              buildJobID,
+			Workdir:            workdir,
+			ContextPath:        paths.ContextPath,
+			DockerfileDir:      paths.DockerfileDir,
+			DockerfileFilename: paths.DockerfileFilename,
+			BuildArgs:          req.BuildArgs,
+			BuildOnly:          req.BuildOnly,
+			Repo:               cleanRepoURL,
+			Branch:             req.Branch,
+			// Cleanup deletes the specific workdir this build used. We can't
+			// chase the cache (vcsWorkdirCacheDelete) because workdirs are now
+			// unique per VCS_FETCH_SOURCE call: a concurrent fetch for the
+			// same {osid, sha} may have overwritten the cache entry between
+			// fetch return and build cleanup, and we don't want to wipe its
+			// fresh tree. We only clear the cache entry if it still points
+			// at our workdir.
+			Cleanup: func() {
+				if err := os.RemoveAll(workdir); err != nil {
+					log.Printf("VCS_BUILD: cleanup of workdir %s: %v", workdir, err)
+				}
+				vcsWorkdirCacheDeleteIfPath(osid, sha, workdir)
+			},
+		})
+	}()
 
 	// Return the unique row id so conductor polls listBuildLogs against the
 	// actual row, not against the SHA-only id it sent.

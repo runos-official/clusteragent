@@ -7,6 +7,29 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## Unreleased
+
+A restart of the agent no longer kills running builds, and a restart no longer leaves a build row open for ever.
+
+### Fixed
+- **The agent drains before it exits.** On SIGTERM the agent refuses new builds
+  and one-shot runs ("draining"), keeps its stream to the conductor open, and
+  waits for the running ones for up to 35 minutes. Set
+  `CLUSTER_AGENT_DRAIN_TIMEOUT` (a Go duration such as `90s`) to change the
+  wait. When the wait ends, the agent fails the build rows that are still open,
+  with an `ERROR:` log line that names the shutdown. The upload endpoint
+  answers 503 with `Retry-After` and does not use up the upload token. The
+  Deployment's termination grace period must stay above the drain timeout.
+- **A restart closes the build rows the previous process left open.** Before,
+  a build killed by a restart stayed pending or busy for ever, and its app
+  showed "building" with no end. At startup the agent now marks every pending
+  or busy build row failed ("interrupted by agent restart"). The agent takes no
+  new work until this finishes and the startup pod sweep is done, so the cleanup
+  cannot fail a row, or delete a pod, that a new build just made. If the
+  database stays unreadable for two minutes, the agent accepts work anyway and
+  logs that the rows stay open. This closes the rows that older agents left
+  open, the first time the fixed agent starts.
+
 ## v1.2.1
 
 Release gate and pipeline fixes, one deploy fix and one one-shot run fix. Everything else behaves as in v1.2.0.

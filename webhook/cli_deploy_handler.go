@@ -18,6 +18,7 @@ import (
 	"github.com/runos-official/clusteragent/agentstream"
 	"github.com/runos-official/clusteragent/buildkitclient"
 	"github.com/runos-official/clusteragent/datastore"
+	"github.com/runos-official/clusteragent/drain"
 	"github.com/runos-official/clusteragent/harborclient"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -43,6 +44,14 @@ var (
 	MaxEntryCount = 50000
 )
 
+// beginWork registers one upload and build with the drain tracker, so a restart
+// of the agent waits for it. Tests replace it to model a draining agent.
+var beginWork = drain.Begin
+
+// drainRetryAfterSeconds is the retry hint the upload endpoint sends while the
+// agent drains. The restart ends in seconds to minutes, so a short hint is enough.
+const drainRetryAfterSeconds = "30"
+
 // HandleCLIDeployUpload processes CLI deployment tarball uploads with presigned tokens
 func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -57,6 +66,23 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := pathParts[0]
+
+	// Refuse while the agent drains for a restart. This runs BEFORE the token
+	// lookup: the token is single use and is marked used below, so a refusal
+	// after that point would burn the user's token. end is called on every
+	// early return, and by the build goroutine once the build is over.
+	end, err := beginWork()
+	if err != nil {
+		w.Header().Set("Retry-After", drainRetryAfterSeconds)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	started := false
+	defer func() {
+		if !started {
+			end()
+		}
+	}()
 
 	// Validate token. The endpoint serves both app-deploy uploads and
 	// app-less build-image uploads (obj-47); GetUploadableToken matches
@@ -138,7 +164,11 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		repo := uploadToken.BuildTarget.Repo
 		tags := uploadToken.BuildTarget.Tags
 		log.Printf("Received build-image upload: %d bytes for repo=%s, tags=%v, uploadID=%s, token=%s...", len(tarballData), repo, tags, uploadID, token[:8])
-		go processBuildImageDeployment(tarballData, osid, uploadID, repo, tags, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig)
+		started = true
+		go func() {
+			defer end()
+			processBuildImageDeployment(tarballData, osid, uploadID, repo, tags, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig)
+		}()
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte("Upload received, processing build-image"))
 		return
@@ -163,7 +193,11 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// uploadToken.Dockerfile carries the path inside the tarball (iter-27 I27-Y);
 	// empty defaults to "Dockerfile" at the tarball root. uploadToken.BuildArgs
 	// carries the effective build args captured when the token was minted.
-	go processCLIDeployment(tarballData, osid, uploadID, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig)
+	started = true
+	go func() {
+		defer end()
+		processCLIDeployment(tarballData, osid, uploadID, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig)
+	}()
 
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte("Upload received, processing CLI deployment"))

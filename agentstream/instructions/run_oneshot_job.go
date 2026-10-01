@@ -93,6 +93,20 @@ func RunOneShotJob(jsonB64 string) (string, string, error) {
 		})
 	}
 
+	// Refuse before the Job exists: a refused run leaves no Job and no audit
+	// row. end is called here on every early return, and by the tracker
+	// goroutine once the run is over.
+	end, err := beginWork()
+	if err != nil {
+		return replyOneShot(replyType, RunOneShotJobResponse{Success: false, Message: err.Error()})
+	}
+	started := false
+	defer func() {
+		if !started {
+			end()
+		}
+	}()
+
 	namespace := req.Namespace
 	if namespace == "" {
 		namespace = req.OSID
@@ -145,7 +159,11 @@ func RunOneShotJob(jsonB64 string) (string, string, error) {
 
 	// Track to completion asynchronously so the gRPC call returns promptly,
 	// matching the VCS_BUILD pattern.
-	go trackOneShotJob(clientset, namespace, jobName, req.RunID, timeoutSeconds)
+	started = true
+	go func() {
+		defer end()
+		trackOneShotJob(clientset, namespace, jobName, req.RunID, timeoutSeconds)
+	}()
 
 	return replyOneShot(replyType, RunOneShotJobResponse{
 		Success:    true,

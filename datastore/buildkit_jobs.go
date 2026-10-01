@@ -86,6 +86,55 @@ func UpdateBuildKitJobStatus(jobID, status string) error {
 	return nil
 }
 
+// FailNonTerminalBuildKitJobs closes every build row that is still pending or
+// busy: it marks the row failed and writes one "ERROR: <reason>" log line, so
+// the reason reaches whoever reads the build log. It returns how many rows it
+// closed.
+//
+// Only call it when no build can be running in this process: at startup, before
+// the agent accepts work (the previous process took its builds with it), or at
+// shutdown after the drain gave up. A row that a live build still owns would be
+// failed under it.
+func FailNonTerminalBuildKitJobs(reason string) (int, error) {
+	gdb, err := activeDB()
+	if err != nil {
+		return 0, err
+	}
+	closed := 0
+	err = gdb.Transaction(func(tx *gorm.DB) error {
+		var jobIDs []string
+		if err := tx.Model(&BuildKitJobModel{}).
+			Where("status IN ?", []string{JobStatusPending, JobStatusBusy}).
+			Pluck("job_id", &jobIDs).Error; err != nil {
+			return err
+		}
+		if len(jobIDs) == 0 {
+			return nil
+		}
+		res := tx.Model(&BuildKitJobModel{}).Where("job_id IN ?", jobIDs).Updates(map[string]any{
+			"status":       JobStatusFailed,
+			"updated_at":   gorm.Expr("CURRENT_TIMESTAMP"),
+			"completed_at": gorm.Expr("CURRENT_TIMESTAMP"),
+		})
+		if res.Error != nil {
+			return res.Error
+		}
+		logs := make([]BuildKitLogModel, 0, len(jobIDs))
+		for _, id := range jobIDs {
+			logs = append(logs, BuildKitLogModel{JobID: id, LogEntry: "ERROR: " + reason})
+		}
+		if err := tx.Create(&logs).Error; err != nil {
+			return err
+		}
+		closed = len(jobIDs)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return closed, nil
+}
+
 // GetBuildKitJob retrieves a single job by job_id
 func GetBuildKitJob(jobID string) (*BuildKitJob, error) {
 	gdb, err := activeDB()
