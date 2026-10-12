@@ -25,6 +25,13 @@ The agent is ready to run behind the nodehub agent gateway (FPL315). Every chang
   bootstrap retries use the same full jitter. A nodeward or nodehub restart no
   longer makes every agent reconnect in the same second. The agent also closes
   the old gRPC connection when it reconnects.
+
+### Fixed
+- **A dropped stream no longer leaves its heartbeat running.** Each stream now
+  has its own context, and its heartbeat sends only on that stream. Before,
+  when the stream dropped on a receive error, the old heartbeat went on to send
+  on the next stream, so every nodeward or nodehub restart added one more
+  heartbeat per agent until the agent restarted.
 - **The gRPC retry policy now applies.** The old service config nested its
   keys under `serviceConfig`, which gRPC ignores. The new config retries
   `UNAVAILABLE` up to 4 attempts (0.5 s, doubling, at most 5 s) on the

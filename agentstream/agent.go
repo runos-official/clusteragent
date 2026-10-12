@@ -49,7 +49,17 @@ type streamManager struct {
 	clusterAgentTLS *TLSData
 	serverHost      string
 	k8s             *K8sClient
+
+	// heartbeatInterval is how often the stream sends a heartbeat. Zero means
+	// defaultHeartbeatInterval; tests set it shorter.
+	heartbeatInterval time.Duration
 }
+
+const defaultHeartbeatInterval = 5 * time.Second
+
+// activeHeartbeats counts running heartbeat goroutines. There is at most one
+// per live stream.
+var activeHeartbeats atomic.Int32
 
 // Start brings up the agent's control link. The whole bootstrap (k8s client,
 // runos-config ConfigMap, TLS material, initial Nodeward connect) runs through
@@ -222,6 +232,12 @@ func validateTLSData(tlsData *TLSData) error {
 // non-retryable error reaching here is a programming error and we fatal with
 // the underlying message rather than spin.
 func retryStep[T any](name string, op func() (T, error)) T {
+	return retryStepWith(name, op, time.Sleep, nil)
+}
+
+// retryStepWith is retryStep with the sleep and the random source injected.
+// randInt63n nil means math/rand/v2.
+func retryStepWith[T any](name string, op func() (T, error), sleep func(time.Duration), randInt63n func(int64) int64) T {
 	attempt := 0
 	for {
 		attempt++
@@ -235,10 +251,10 @@ func retryStep[T any](name string, op func() (T, error)) T {
 		if !isRetryable(err) {
 			log.Fatalf("bootstrap: %s failed unrecoverably: %v", name, err)
 		}
-		delay := fullJitter(nextBackoff(attempt), nil)
+		delay := fullJitter(nextBackoff(attempt), randInt63n)
 		log.Printf("THROTTLED bootstrap: %s not ready (attempt %d): %v; retrying in %s",
 			name, attempt, err, delay)
-		time.Sleep(delay)
+		sleep(delay)
 	}
 }
 
@@ -257,11 +273,34 @@ func retryStepVoid(name string, op func() error) {
 // blip. Disconnection is surfaced via the health endpoint (StreamConnected),
 // not by crashing.
 func (sm *streamManager) runWithReconnect() {
-	bo := newReconnectBackoff(nil)
+	sm.reconnectLoop(reconnectDeps{
+		establish: sm.establishAndMaintainStream,
+		connect: func(ctx context.Context) (l2sec.NodewardClient, *grpc.ClientConn, error) {
+			return ConnectToServer(sm.clusterAgentTLS, sm.serverHost, ctx)
+		},
+		sleep:   time.Sleep,
+		now:     time.Now,
+		backoff: newReconnectBackoff(nil),
+	})
+}
+
+// reconnectDeps are the parts of the reconnect loop a test swaps out.
+type reconnectDeps struct {
+	establish func() error
+	connect   func(ctx context.Context) (l2sec.NodewardClient, *grpc.ClientConn, error)
+	sleep     func(time.Duration)
+	now       func() time.Time
+	backoff   *reconnectBackoff
+}
+
+func (sm *streamManager) reconnectLoop(d reconnectDeps) {
+	bo := d.backoff
 
 	for {
-		started := time.Now()
-		err := sm.establishAndMaintainStream()
+		// Only the time the stream was up counts towards the reset, not the
+		// sleep or the dial before it.
+		started := d.now()
+		err := d.establish()
 
 		if err == nil {
 			// Clean exit (e.g. server asked us to stop).
@@ -270,14 +309,14 @@ func (sm *streamManager) runWithReconnect() {
 
 		// Full jitter, no attempt ceiling. The schedule starts again only
 		// after the stream stayed up a while (FPL315).
-		bo.connectionEnded(time.Since(started))
+		bo.connectionEnded(d.now().Sub(started))
 		delay := bo.next()
 		log.Printf("THROTTLED stream disconnected: %v. Reconnecting in %s (attempt %d)", err, delay, bo.attempt)
-		time.Sleep(delay)
+		d.sleep(delay)
 
 		// Try to reconnect. A fresh per-attempt timeout, never a shared budget.
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrapConnectTimeout)
-		client, conn, connErr := ConnectToServer(sm.clusterAgentTLS, sm.serverHost, ctx)
+		client, conn, connErr := d.connect(ctx)
 		cancel()
 
 		if connErr != nil {
@@ -305,7 +344,11 @@ func SetOnConnectCallback(callback func()) {
 }
 
 func (sm *streamManager) establishAndMaintainStream() error {
-	streamCtx := context.Background()
+	// Each stream gets its own context. Cancelling it on the way out stops
+	// this stream's heartbeat and ends a Recv still blocked on it, so a
+	// dropped stream leaves no goroutine behind (FPL315).
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	defer cancelStream()
 	stream, err := sm.client.ClusterAgentStream(streamCtx)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
@@ -332,13 +375,15 @@ func (sm *streamManager) establishAndMaintainStream() error {
 	}()
 
 	go func() {
-		errChan <- sm.runHeartbeat()
+		errChan <- sm.runHeartbeat(streamCtx, stream)
 	}()
 
 	// Wait for any error
 	err = <-errChan
 
-	// Clean up
+	// Clean up. The other goroutine sees the cancel and returns into the
+	// buffered errChan.
+	cancelStream()
 	streamConnected.Store(false)
 	globalStreamMu.Lock()
 	globalStream = nil
@@ -375,17 +420,33 @@ func (sm *streamManager) listenForInstructions(stream grpc.BidiStreamingClient[l
 	}
 }
 
-func (sm *streamManager) runHeartbeat() error {
-	ticker := time.NewTicker(5 * time.Second)
+// runHeartbeat heartbeats on the stream it was started for until ctx ends or
+// three heartbeats in a row fail. It never sends on a later stream.
+func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent]) error {
+	activeHeartbeats.Add(1)
+	defer activeHeartbeats.Add(-1)
+	interval := sm.heartbeatInterval
+	if interval <= 0 {
+		interval = defaultHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	consecutiveFailures := 0
 	maxConsecutiveFailures := 3
+	send := func(msg *l2sec.FromClusterAgent) error { return sendOnStream(stream, msg) }
 
 	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ticker.C:
-			res, err := SendAndWaitForResponseWithTimeout(instructions.ClusterAgentHeartbeatToServer(), 10*time.Second)
+			hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			res, err := sendAndWait(hbCtx, send, instructions.ClusterAgentHeartbeatToServer())
+			cancel()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if err != nil {
 				consecutiveFailures++
 				log.Printf("Heartbeat failed (%d/%d): %v", consecutiveFailures, maxConsecutiveFailures, err)
@@ -407,6 +468,11 @@ func SendToServer(msg *l2sec.FromClusterAgent) error {
 	stream := globalStream
 	globalStreamMu.RUnlock()
 
+	return sendOnStream(stream, msg)
+}
+
+// sendOnStream sends msg on one given stream.
+func sendOnStream(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent], msg *l2sec.FromClusterAgent) error {
 	if stream == nil {
 		return fmt.Errorf("stream not initialized")
 	}
@@ -532,6 +598,11 @@ func respond(jsonB64, replyType string, tagID uuid.UUID) {
 }
 
 func SendAndWaitForResponse(ctx context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
+	return sendAndWait(ctx, SendToServer, msg)
+}
+
+// sendAndWait sends msg with send and waits for the reply on its tag.
+func sendAndWait(ctx context.Context, send func(*l2sec.FromClusterAgent) error, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
 	tagID := uuid.New()
 	msg.Tag = tagID.String()
 
@@ -539,7 +610,7 @@ func SendAndWaitForResponse(ctx context.Context, msg *l2sec.FromClusterAgent) (*
 	pendingResponses.Store(tagID.String(), responseChan)
 	defer pendingResponses.Delete(tagID.String())
 
-	if err := SendToServer(msg); err != nil {
+	if err := send(msg); err != nil {
 		return nil, fmt.Errorf("failed to send message: %w", err)
 	}
 
