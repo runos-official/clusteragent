@@ -7,6 +7,38 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## Unreleased
+
+The agent is ready to run behind the nodehub agent gateway (FPL315). Every change works with today's nodeward.
+
+### Security
+- **The agent refuses a server certificate that could be an agent certificate
+  (T-50).** After the normal CA and server-name checks, the agent refuses a
+  server leaf that has `ClientAuth` or any extension under `1.3.6.1.4.1.99999`.
+  Nodeward's server certificate has neither, so it still passes. The agent logs
+  one `ERROR refusing server certificate` line per refused handshake.
+
+### Changed
+- **Reconnects are spread out.** After the control stream drops, the agent
+  waits a random time between 0 and a cap, and the cap doubles from 1 s up to
+  30 s. The schedule starts again only after a connection stayed up 60 s. The
+  bootstrap retries use the same full jitter. A nodeward or nodehub restart no
+  longer makes every agent reconnect in the same second. The agent also closes
+  the old gRPC connection when it reconnects.
+- **The gRPC retry policy now applies.** The old service config nested its
+  keys under `serviceConfig`, which gRPC ignores. The new config retries
+  `UNAVAILABLE` up to 4 attempts (0.5 s, doubling, at most 5 s) on the
+  read-only methods `GetControlPlaneNodes` and `GetInstallVpnCommands` only.
+  It never retries `RegenerateCertificate`, `GetClusterAgentCredentials` or
+  any method that changes state.
+
+### Added
+- **Progress tags.** A streaming instruction whose payload has
+  `"progressTags": true` tags each progress message `<instruction tag>/<n>`,
+  counting from 1. Without the field the agent behaves as before. No cluster
+  agent instruction streams progress yet; a new one registers in
+  `instructions.StreamingMap`.
+
 ## v1.2.2
 
 A restart of the agent no longer kills running builds, and a restart no longer leaves a build row open for ever.

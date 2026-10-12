@@ -45,6 +45,7 @@ func StreamConnected() bool {
 
 type streamManager struct {
 	client          l2sec.NodewardClient
+	conn            *grpc.ClientConn
 	clusterAgentTLS *TLSData
 	serverHost      string
 	k8s             *K8sClient
@@ -109,11 +110,15 @@ func bootstrap() *streamManager {
 
 	// Step 4: initial connection. Nodeward may still be warming up or DNS may
 	// not resolve yet; both are retryable.
-	client := retryStep("connect to Nodeward", func() (l2sec.NodewardClient, error) {
+	type connected struct {
+		client l2sec.NodewardClient
+		conn   *grpc.ClientConn
+	}
+	first := retryStep("connect to Nodeward", func() (connected, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrapConnectTimeout)
 		defer cancel()
-		c, _, err := ConnectToServer(clusterAgentTLS, runosConfig.Server, ctx)
-		return c, err
+		c, conn, err := ConnectToServer(clusterAgentTLS, runosConfig.Server, ctx)
+		return connected{client: c, conn: conn}, err
 	})
 
 	if usedNodeAgentCredentials {
@@ -126,7 +131,8 @@ func bootstrap() *streamManager {
 	}
 
 	return &streamManager{
-		client:          client,
+		client:          first.client,
+		conn:            first.conn,
 		clusterAgentTLS: clusterAgentTLS,
 		serverHost:      runosConfig.Server,
 		k8s:             k8s,
@@ -229,7 +235,7 @@ func retryStep[T any](name string, op func() (T, error)) T {
 		if !isRetryable(err) {
 			log.Fatalf("bootstrap: %s failed unrecoverably: %v", name, err)
 		}
-		delay := nextBackoff(attempt)
+		delay := fullJitter(nextBackoff(attempt), nil)
 		log.Printf("THROTTLED bootstrap: %s not ready (attempt %d): %v; retrying in %s",
 			name, attempt, err, delay)
 		time.Sleep(delay)
@@ -251,9 +257,10 @@ func retryStepVoid(name string, op func() error) {
 // blip. Disconnection is surfaced via the health endpoint (StreamConnected),
 // not by crashing.
 func (sm *streamManager) runWithReconnect() {
-	reconnectAttempts := 0
+	bo := newReconnectBackoff(nil)
 
 	for {
+		started := time.Now()
 		err := sm.establishAndMaintainStream()
 
 		if err == nil {
@@ -261,25 +268,29 @@ func (sm *streamManager) runWithReconnect() {
 			return
 		}
 
-		reconnectAttempts++
-
-		// Capped exponential backoff, no attempt ceiling.
-		delay := nextBackoff(reconnectAttempts)
-		log.Printf("THROTTLED stream disconnected: %v. Reconnecting in %s (attempt %d)", err, delay, reconnectAttempts)
+		// Full jitter, no attempt ceiling. The schedule starts again only
+		// after the stream stayed up a while (FPL315).
+		bo.connectionEnded(time.Since(started))
+		delay := bo.next()
+		log.Printf("THROTTLED stream disconnected: %v. Reconnecting in %s (attempt %d)", err, delay, bo.attempt)
 		time.Sleep(delay)
 
 		// Try to reconnect. A fresh per-attempt timeout, never a shared budget.
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrapConnectTimeout)
-		client, _, connErr := ConnectToServer(sm.clusterAgentTLS, sm.serverHost, ctx)
+		client, conn, connErr := ConnectToServer(sm.clusterAgentTLS, sm.serverHost, ctx)
 		cancel()
 
 		if connErr != nil {
-			log.Printf("Reconnection attempt %d failed: %v", reconnectAttempts, connErr)
+			log.Printf("Reconnection attempt %d failed: %v", bo.attempt, connErr)
 			continue
 		}
 
+		// Close the replaced connection so reconnects do not leak them.
+		if sm.conn != nil {
+			_ = sm.conn.Close()
+		}
 		sm.client = client
-		reconnectAttempts = 0 // Reset on successful connection
+		sm.conn = conn
 		log.Println("Successfully reconnected to server")
 	}
 }
@@ -466,6 +477,9 @@ func handleInstruction(instruction *l2sec.ToClusterAgent) {
 	}
 
 	handler, exists := instructions.Map[instruction.Type]
+	if !exists {
+		handler, exists = streamingHandler(instruction)
+	}
 	if !exists {
 		respondWithErr(fmt.Sprintf("No handler found for message type: %s", instruction.Type), tagID)
 		return

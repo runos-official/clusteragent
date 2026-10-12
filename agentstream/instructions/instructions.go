@@ -30,3 +30,13 @@ var Map = map[string]func(string) (string, string, error){
 	"CLEANUP_ONESHOT_JOB":     CleanupOneShotJob,
 	"RUN_READONLY_KUBECTL":    RunReadonlyKubectl,
 }
+
+// ProgressFunc streams one progress or log message for the running
+// instruction. The agent tags it for that instruction (see progressTagger in
+// the agentstream package).
+type ProgressFunc func(msgType, jsonB64 string) error
+
+// StreamingMap routes instruction types whose handlers stream progress before
+// the final reply. No cluster agent instruction streams progress today; a new
+// long instruction registers here instead of in Map.
+var StreamingMap = map[string]func(msgJsonB64 string, progress ProgressFunc) (string, string, error){}

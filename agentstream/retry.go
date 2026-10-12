@@ -3,6 +3,7 @@ package agentstream
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"net"
 	"strings"
 	"time"
@@ -131,8 +132,8 @@ func isRetryable(err error) bool {
 // exponential backoff: base * 2^(n-1), clamped to bootstrapMaxDelay. The
 // schedule is monotonic non-decreasing and never exceeds the cap. attempt <= 0
 // is treated as the first attempt (returns base). No jitter: the schedule must
-// be deterministic so the regression test can pin it exactly; jitter belongs in
-// the live gRPC dialer (ConnectToServer), not here.
+// be deterministic so the regression test can pin it exactly. Callers draw the
+// actual wait with fullJitter, using this value as the cap.
 func nextBackoff(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
@@ -151,4 +152,48 @@ func nextBackoff(attempt int) time.Duration {
 		delay = bootstrapMaxDelay
 	}
 	return delay
+}
+
+// stableConnection is how long a stream must stay up before the reconnect
+// schedule starts again from its first step.
+const stableConnection = 60 * time.Second
+
+// fullJitter returns a wait drawn uniformly from [0, limit]. A nodeward or
+// nodehub restart drops every agent at once; full jitter spreads their
+// reconnects over the whole window instead of one second. randInt63n draws
+// from [0, n); nil means math/rand/v2.
+func fullJitter(limit time.Duration, randInt63n func(int64) int64) time.Duration {
+	if limit <= 0 {
+		return 0
+	}
+	if randInt63n == nil {
+		randInt63n = rand.Int64N
+	}
+	return time.Duration(randInt63n(int64(limit) + 1))
+}
+
+// reconnectBackoff is the wait schedule between reconnects of the control
+// stream: full jitter under the nextBackoff cap (1 s, doubling to 30 s). The
+// schedule starts again only after a connection stayed up stableConnection,
+// so a link that drops right after each connect keeps backing off.
+type reconnectBackoff struct {
+	attempt    int
+	randInt63n func(int64) int64
+}
+
+func newReconnectBackoff(randInt63n func(int64) int64) *reconnectBackoff {
+	return &reconnectBackoff{randInt63n: randInt63n}
+}
+
+// next returns the wait before the next reconnect attempt.
+func (b *reconnectBackoff) next() time.Duration {
+	b.attempt++
+	return fullJitter(nextBackoff(b.attempt), b.randInt63n)
+}
+
+// connectionEnded records how long the last connection stayed up.
+func (b *reconnectBackoff) connectionEnded(upFor time.Duration) {
+	if upFor >= stableConnection {
+		b.attempt = 0
+	}
 }
