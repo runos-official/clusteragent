@@ -17,6 +17,17 @@ The agent is ready to run behind the nodehub agent gateway (FPL315). Every chang
   server leaf that has `ClientAuth` or any extension under `1.3.6.1.4.1.99999`.
   Nodeward's server certificate has neither, so it still passes. The agent logs
   one `ERROR refusing server certificate` line per refused handshake.
+- **The agent makes its own private key (CSR issuance).** On first start and on
+  each renewal, the agent makes an ECDSA P-256 key in the pod and sends only a
+  certificate signing request, with a proof signed by the key of the leaf it
+  connects with. A nodeward with CSR support answers with the certificate only,
+  so the cluster agent key never leaves the cluster. The agent checks the
+  certificate (its own key, client auth, not expired, signed by the CA) before
+  it replaces the old credentials. An older nodeward ignores the new fields and
+  answers with a key as before; the agent then stores that answer as today and
+  logs `nodeward returned a legacy key; CSR not supported` once. An error never
+  causes this fallback. A clock skew refusal is retried once with the server
+  time. The key is stored as PKCS#8 in `cluster-agent-tls`.
 
 ### Changed
 - **Reconnects are spread out.** After the control stream drops, the agent

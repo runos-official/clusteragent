@@ -10,8 +10,6 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
-	"github.com/runos-official/clusteragent/agentstream/l2sec"
 )
 
 const (
@@ -132,15 +130,11 @@ func (sm *streamManager) renewCert() error {
 	defer conn.Close()
 
 	log.Println("Cert monitor: requesting new certificate from Nodeward...")
-	res, err := client.RegenerateCertificate(ctx, &l2sec.RegenerateCertificateRequest{})
+	// A fresh key stays in this pod; only its CSR goes to nodeward. The
+	// current key signs the proof. Old credentials stay until this succeeds.
+	newTLS, err := requestRenewedCertificate(ctx, client, sm.clusterAgentTLS)
 	if err != nil {
 		return fmt.Errorf("RegenerateCertificate RPC failed: %w", err)
-	}
-
-	newTLS := &TLSData{
-		TLSCert: []byte(res.PublicKey),
-		TLSKey:  []byte(res.PrivateKey),
-		CACert:  []byte(res.CaCert),
 	}
 
 	// Update the Kubernetes secret

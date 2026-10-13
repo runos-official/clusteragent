@@ -644,16 +644,14 @@ func generateNewClusterAgentTLSCredentials(nodeAgentTLS *TLSData, serverHost str
 
 	log.Println("Successfully connected to server with node agent TLS credentials")
 
-	res, err := client.GetClusterAgentCredentials(credCtx, &l2sec.GetClusterAgentCredentialsRequest{})
+	// The cluster agent makes its own key here and sends a CSR. The proof is
+	// signed with the node agent key it connected with.
+	tlsData, err := requestClusterAgentCredentials(credCtx, client, nodeAgentTLS)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get cluster agent credentials: %w", err)
 	}
 
 	log.Println("Successfully received cluster agent TLS credentials")
 
-	return &TLSData{
-		TLSCert: []byte(res.PublicKey),
-		TLSKey:  []byte(res.PrivateKey),
-		CACert:  []byte(res.CaCert),
-	}, nil
+	return tlsData, nil
 }
