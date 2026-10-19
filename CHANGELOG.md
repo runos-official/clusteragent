@@ -7,9 +7,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
-## v1.2.3-rc.1
+## v1.2.3
 
-This hidden release candidate hardens gateway connections and certificate issuance. It remains compatible with older control-plane servers.
+This release hardens gateway connections and certificate issuance. The same build shipped earlier as the hidden release candidate v1.2.3-rc.1. It remains compatible with older control-plane servers.
 
 ### Security
 - **The agent refuses a server certificate that could be an agent certificate
