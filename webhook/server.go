@@ -5,8 +5,6 @@ import (
 	"log"
 	"net/http"
 	"time"
-
-	"github.com/runos-official/clusteragent/agentstream"
 )
 
 // bindRetryDelay is how long Start/StartUploadServer wait before re-attempting
@@ -23,10 +21,7 @@ const bindRetryDelay = 5 * time.Second
 // liveness-server failure is more defensible than on the upload server, but we
 // still prefer log + continue: the gRPC link is the agent's reason to exist.)
 func Start() {
-	mux := http.NewServeMux()
-
-	// Register handlers
-	mux.HandleFunc("/health", HandleHealth)
+	mux := webhookMux()
 
 	for {
 		server := &http.Server{
@@ -46,15 +41,17 @@ func Start() {
 	}
 }
 
-// HandleHealth handles health check requests. It is a liveness probe: it always
-// returns 200 OK so a momentarily-disconnected (but alive and reconnecting)
-// agent is never killed. The control-stream state is surfaced in the response
-// body for observability only, it does not affect the status code.
+// webhookMux routes the in-cluster listener on :8080.
+func webhookMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", HandleHealth)
+	return mux
+}
+
+// HandleHealth answers a liveness check: 200 and "OK" while the process serves.
+// It says nothing about the control link: any pod can call it, so the link
+// state stays out of the body (FCR 1630). Nothing in the platform reads more.
 func HandleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	if agentstream.StreamConnected() {
-		fmt.Fprintln(w, "OK connected")
-		return
-	}
-	fmt.Fprintln(w, "OK disconnected")
+	fmt.Fprintln(w, "OK")
 }

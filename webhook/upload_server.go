@@ -15,12 +15,7 @@ import (
 // listener could not bind. Instead we log the error and retry the bind, leaving
 // the rest of the agent serving.
 func StartUploadServer() {
-	mux := http.NewServeMux()
-
-	// Register handlers
-	mux.HandleFunc("/cli-deploy/", HandleCLIDeployUpload)
-	mux.HandleFunc("/cli-pull/", HandleCLIPullDownload)
-	mux.HandleFunc("/health", HandleHealth)
+	mux := uploadMux()
 
 	for {
 		server := &http.Server{
@@ -39,4 +34,13 @@ func StartUploadServer() {
 		log.Printf("Upload server (:8081) stopped: %v; retrying bind in %s", err, bindRetryDelay)
 		time.Sleep(bindRetryDelay)
 	}
+}
+
+// uploadMux routes the upload listener on :8081. It has no /health: the public
+// ingress publishes this listener, and no probe reads it (FCR 1630).
+func uploadMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cli-deploy/", HandleCLIDeployUpload)
+	mux.HandleFunc("/cli-pull/", HandleCLIPullDownload)
+	return mux
 }
