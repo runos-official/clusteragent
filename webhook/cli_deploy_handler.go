@@ -24,15 +24,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-const (
-	MaxUploadSize = 100 * 1024 * 1024 // 100MB max tarball size
-	MaxFileSize   = 500 * 1024 * 1024 // 500MB max per extracted file
-)
+// MaxUploadSize caps the request body: the gzipped tarball as sent.
+const MaxUploadSize = 100 * 1024 * 1024 // 100MB max tarball size
 
 // Decompression-bomb caps. These are package-level vars (not consts) only so
 // tests can lower them to exercise the guards without materialising gigabytes;
 // production never mutates them.
 var (
+	// MaxFileSize caps one extracted file. A larger entry refuses the whole
+	// tarball (FCR 1631); it is never cut short and written.
+	MaxFileSize int64 = 500 * 1024 * 1024 // 500MB max per extracted file
 	// MaxTotalExtractedBytes caps the TOTAL decompressed bytes written across
 	// all entries. The per-file MaxFileSize alone doesn't bound the aggregate:
 	// a gzip bomb of many sub-MaxFileSize entries (or one entry repeated) could
@@ -136,6 +137,13 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	if !hasUploadID || uploadID == "" {
 		uploadID = uuid.New().String()
 		log.Printf("Upload token had no pre-assigned uploadId; minted %s (legacy conductor path)", uploadID)
+	}
+
+	// Refuse a tarball over the extraction limits now, with the reason, instead
+	// of answering 202 and failing the build later (FCR 1631).
+	if err := checkTarballLimits(tarballData); err != nil {
+		failUpload(w, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
+		return
 	}
 
 	// Load BuildKit config (Harbor credentials) used by both flows.
@@ -615,7 +623,7 @@ func extractTarball(data []byte, destDir string) error {
 	tarReader := tar.NewReader(gzipReader)
 
 	// Decompression-bomb defenses accumulated across the whole archive: the
-	// per-file MaxFileSize LimitReader (below) bounds any single entry, but not
+	// per-file MaxFileSize check (below) bounds any single entry, but not
 	// the aggregate. Track total decompressed bytes and the entry count and
 	// abort if either cap is exceeded.
 	var totalBytes int64
@@ -654,6 +662,11 @@ func extractTarball(data []byte, destDir string) error {
 				return fmt.Errorf("failed to create directory: %w", err)
 			}
 		case tar.TypeReg:
+			// Refuse an entry over the per-file cap before anything is written:
+			// cutting it at the cap would hand the build a broken file (FCR 1631).
+			if header.Size > MaxFileSize {
+				return &entryTooLargeError{name: header.Name, size: header.Size}
+			}
 			// Ensure parent directory exists
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 				return fmt.Errorf("failed to create parent directory: %w", err)
@@ -664,7 +677,8 @@ func extractTarball(data []byte, destDir string) error {
 				return fmt.Errorf("failed to create file: %w", err)
 			}
 
-			// Limit per-file size to prevent a single huge decompressed entry.
+			// The tar reader never yields more than header.Size bytes, so the
+			// check above bounds the entry; the limit stays as a second guard.
 			limited := io.LimitReader(tarReader, MaxFileSize)
 			written, err := io.Copy(outFile, limited)
 			if err != nil {
