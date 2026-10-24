@@ -7,6 +7,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.2.4-rc.2
+
+This hidden release candidate moves the build to a supported Go release.
+
+### Security
+- **The agent builds with Go 1.26.10 instead of Go 1.25.5 (FCR 1654).** The
+  1.2.4-rc.1 image carried a binary built with go1.25.5, a line without
+  security fixes. go.mod gains a toolchain line and the build image moves to
+  golang:1.26.10-alpine3.23, pinned by digest. 1.26.10 carries the
+  standard-library fixes, including the HTTP/2 SETTINGS denial of service
+  (CVE-2026-78669). govulncheck: 31 standard-library findings before, none
+  after. The module findings that remain are tracked separately.
+
 ## v1.2.4-rc.1
 
 This hidden release candidate closes three findings from a security pass. It needs no control-plane change.

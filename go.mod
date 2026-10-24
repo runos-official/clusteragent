@@ -2,6 +2,8 @@ module github.com/runos-official/clusteragent
 
 go 1.25.0
 
+toolchain go1.26.10
+
 require (
 	github.com/cert-manager/cert-manager v1.15.1
 	github.com/glebarez/sqlite v1.11.0
