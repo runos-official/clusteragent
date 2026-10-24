@@ -7,6 +7,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.2.4-rc.3
+
+This hidden release candidate moves dependencies with known, reachable vulnerabilities to fixed releases (FCR 1671).
+
+### Security
+- **Vulnerable modules move to fixed releases.** golang.org/x/net v0.38.0 to
+  v0.60.0, google.golang.org/grpc v1.66.3 to v1.83.2, the OpenTelemetry SDK and
+  OTLP trace exporters v1.26.0 to v1.45.0, oras-go v2.6.0 to v2.6.2, pgx v5.6.0
+  to v5.9.2, moby/spdystream v0.2.0 to v0.5.1, gorilla/websocket v1.5.1 to
+  v1.5.3 and golang.org/x/text to v0.42.0. grpc 1.83 needs Go 1.26 language
+  mode, so go.mod declares go 1.26.0. govulncheck: 23 findings before, none
+  after, in source and in the built binary.
+
 ## v1.2.4-rc.2
 
 This hidden release candidate moves the build to a supported Go release.
