@@ -2,7 +2,7 @@
 # can't silently change what we build/ship. To refresh after a deliberate base
 # bump, resolve the new multi-arch index digest with:
 #   docker buildx imagetools inspect golang:1.25-alpine3.21   # copy the Digest
-#   docker buildx imagetools inspect alpine:3.18
+#   docker buildx imagetools inspect alpine:3.22
 # The build stage runs natively on the BUILD platform (no QEMU) and
 # cross-compiles to the TARGET platform with Go's own toolchain. The agent is
 # now CGO-free (pure-Go GORM + Postgres + glebarez SQLite drivers), so no C
@@ -31,7 +31,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o runos \
     -trimpath \
     -ldflags "-w -X github.com/runos-official/clusteragent/version.Version=${VERSION}" .
 
-FROM alpine:3.18@sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f
+# Runtime base: a supported Alpine line. 3.18 is end of life and its brotli-libs
+# (1.0.9, pulled in by curl and git) has a known flaw; git asks servers for br,
+# so a clone from a server the user picks decodes brotli (FCR 1653).
+FROM alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
 
 ARG TARGETARCH
 
