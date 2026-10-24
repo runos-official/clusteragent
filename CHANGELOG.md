@@ -7,6 +7,31 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.2.4-rc.1
+
+This hidden release candidate closes three findings from a security pass. It needs no control-plane change.
+
+### Security
+- **The runtime image moves from Alpine 3.18, which is end of life, to Alpine
+  3.22, pinned by digest (FCR 1653).** curl and git pull in brotli-libs: 3.18
+  ships 1.0.9, which has a known flaw, and 3.22 ships 1.1.1-r0. git asks
+  servers for brotli (`Accept-Encoding: deflate, gzip, br`, measured in the
+  1.2.3 image), so a clone from a server the user picks decodes brotli. The
+  new image reports brotli-libs 1.1.1-r0, curl 8.14.1 and git 2.49.1.
+- **`/health` no longer tells callers whether the control link is up (FCR
+  1630).** It answers `OK` and nothing else. The upload listener, which the
+  public ingress publishes, no longer serves `/health` at all and answers
+  404. No probe or platform component reads either endpoint: the kubelet
+  probes use `/healthz` on the HTTPS port.
+
+### Fixed
+- **A tarball with a file over the 500 MiB per-file limit is refused (FCR
+  1631).** Before, the entry was cut at the limit and written, extraction
+  reported success, and the build failed later for an unrelated reason. Now
+  the upload answers 413 with the entry name, its size and the limit, the
+  build record carries the same message, and no file is written. Extraction
+  refuses such an entry the same way.
+
 ## v1.2.3
 
 This release hardens gateway connections and certificate issuance. The same build shipped earlier as the hidden release candidate v1.2.3-rc.1. It remains compatible with older control-plane servers.
