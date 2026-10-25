@@ -7,6 +7,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.2.4
+
+This is a security release. It closes three findings from a security pass, moves the build to a supported Go release and moves dependencies with known, reachable vulnerabilities to fixed releases. It needs no control-plane change. The same build shipped earlier as the hidden release candidate v1.2.4-rc.3.
+
+### Security
+- **The runtime image moves from Alpine 3.18, which is end of life, to Alpine 3.22, pinned by digest (FCR 1653).** The image now carries brotli-libs 1.1.1-r0, curl 8.14.1 and git 2.49.1.
+- **`/health` answers `OK` and nothing else (FCR 1630).** It no longer tells callers whether the control link is up. The upload listener, which the public ingress publishes, does not serve `/health` and answers 404. The kubelet probes use `/healthz` on the HTTPS port and are not affected.
+- **The agent builds with Go 1.26.10 instead of Go 1.25.5 (FCR 1654).** Go 1.26.10 carries the standard-library fixes, including the HTTP/2 SETTINGS denial of service (CVE-2026-78669).
+- **Vulnerable modules move to fixed releases (FCR 1671).** golang.org/x/net to v0.60.0, google.golang.org/grpc to v1.83.2, the OpenTelemetry SDK and OTLP trace exporters to v1.45.0, oras-go to v2.6.2, pgx to v5.9.2, moby/spdystream to v0.5.1, gorilla/websocket to v1.5.3 and golang.org/x/text to v0.42.0. go.mod declares go 1.26.0. govulncheck reports no findings in source or in the built binary.
+
+### Fixed
+- **A tarball with a file over the 500 MiB per-file limit is refused (FCR 1631).** The upload answers 413 with the entry name, its size and the limit, the build record carries the same message, and no file is written.
+
 ## v1.2.4-rc.3
 
 This hidden release candidate moves dependencies with known, reachable vulnerabilities to fixed releases (FCR 1671).
