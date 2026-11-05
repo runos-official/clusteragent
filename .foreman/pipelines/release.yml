@@ -32,6 +32,36 @@ advertises:
   env: ${{ target.env }}
 
 steps:
+  - name: Final comes from the validated candidate
+    description: A final version (no -rc) must be cut from the exact commit that shipped as a release candidate and is recorded as shipped. If the integration branch has moved on since, the final would carry code no candidate ever validated, and the record would claim it. A candidate passes straight through. This step reads the record from the target, so the same file serves dev and prod.
+    run: |
+      version="${{ version }}"
+      case "$version" in
+        *-*) echo "$version is a release candidate: nothing to check"; exit 0 ;;
+      esac
+      branch="${{ target.branch }}"
+      record="${{ target.deployed_branch }}"
+      git fetch --quiet --tags origin
+      tip="$(git ls-remote origin "refs/heads/$branch" | cut -f1)"
+      recorded="$(git ls-remote origin "refs/heads/$record" | cut -f1)"
+      test -n "$tip" || { echo "cannot read $branch on origin"; exit 1; }
+      test "$recorded" = "$tip" || {
+        echo "$record on origin is at ${recorded:-nothing}, but $branch is at $tip."
+        echo "$version must be cut from the commit a release candidate shipped. Cut a new candidate from $branch, validate it, then promote that."
+        exit 1
+      }
+      found=""
+      for tag in $(git tag --list "${version}-rc.*"); do
+        if [ "$(git rev-parse "$tag^{commit}")" = "$tip" ]; then found="$tag"; fi
+      done
+      test -n "$found" || {
+        echo "no release candidate tag ${version}-rc.N points at $tip, the tip of $branch."
+        echo "Cut a new candidate from $branch, validate it, then promote that."
+        exit 1
+      }
+      echo "$version will be cut from $tip, the commit $found shipped and $record records"
+    timeout: 120
+
   - name: Gate chain
     description: "scripts/release.sh --check: preflight, sensitivity scan, leak gate, scannability gate and the build/vet/test suite. Every gate, no side effects, and it cannot be skipped."
     run: scripts/release.sh "${{ version }}" --check
