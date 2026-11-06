@@ -7,6 +7,18 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.2.5
+
+No change to the agent's behaviour. This release carries the release tooling into the published history, so the prod record (main) matches dev. The same commit shipped as the hidden release candidate v1.2.5-rc.1.
+
+### Changed
+- A final is cut only from the commit that shipped as the validated release candidate, and it fast-forwards main, the prod record. The retired deployed/prod record is gone.
+- A pre-push hook stops a push that adds an internal identifier or a credential.
+
+## v1.2.5-rc.1
+
+This hidden release candidate carries release tooling only: the final must come from this candidate's commit, main is the prod record, and a pre-push hook stops a push that adds an internal identifier or a credential. The agent's behaviour does not change.
+
 ## v1.2.4
 
 This is a security release. It closes three findings from a security pass, moves the build to a supported Go release and moves dependencies with known, reachable vulnerabilities to fixed releases. It needs no control-plane change. The same build shipped earlier as the hidden release candidate v1.2.4-rc.3.
