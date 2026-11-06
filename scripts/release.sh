@@ -16,16 +16,22 @@
 #                    un-baselined internal identifiers, cannot be skipped), then
 #                    go build ./... (CGO off, proves the static/cross build),
 #                    go vet ./..., go test -race ./... (CGO on; race needs cgo).
-#   3. Deploy      - tag the dev commit and push the tag + dev. main is NOT
-#                    touched (the human merges main after personal verification).
+#   3. Deploy      - tag the dev commit and push the tag + dev. The record
+#                    branches are not touched until step 6.
 #   4. CI watch    - wait for the Release workflow run for this tag to succeed.
 #   5. Attest      - verify the published image's build-provenance attestation is
 #                    bound to release.yml @ this repo.
-#   6. Record      - only after a successful deploy, fast-forward the `deployed`
-#                    branch to the shipped commit and push it.
+#   6. Record      - only after a successful deploy, through
+#                    scripts/record-release.sh: a candidate fast-forwards the
+#                    `deployed` branch to the shipped commit. A FINAL
+#                    fast-forwards `deployed` and then `main`, the prod record, to
+#                    the commit its tag names. Fast-forward only: a diverged
+#                    branch is refused and nothing is forced.
 #
-# Branch model: dev = local development (the tagged commit); deployed = what has
-# shipped (advanced on success); main = human-controlled, never touched here.
+# Branch model: dev = local development (the tagged commit); deployed = the last
+# commit that was tagged, candidate or final (advanced on success); main = the
+# prod record, moved only by a final, to the final's commit. A final also needs
+# main to be an ancestor of dev, which the preflight checks before any tag exists.
 #
 # The release publishes the artifact (image + manifest); it does NOT roll any
 # live cluster. Rollout is gated downstream by what conductor advertises.
@@ -35,6 +41,7 @@ set -euo pipefail
 # ---- constants -------------------------------------------------------------
 INTEGRATION_BRANCH="dev"
 DEPLOYED_BRANCH="deployed"
+PROD_BRANCH="main"
 RELEASE_WORKFLOW="release.yml"
 IMAGE_NAME="ghcr.io/runos-official/clusteragent"
 CI_POLL_SECONDS=10
@@ -101,6 +108,16 @@ if git rev-parse -q --verify "refs/heads/$DEPLOYED_BRANCH" >/dev/null; then
   fi
   git merge-base --is-ancestor "$DEPLOYED_BRANCH" "$INTEGRATION_BRANCH" || \
     die "$DEPLOYED_BRANCH cannot fast-forward to $INTEGRATION_BRANCH (histories diverged); reconcile manually"
+fi
+
+# A final fast-forwards main, so main must already be an ancestor of dev. Refusing
+# here, before the tag, leaves no tag and no image behind when main has diverged.
+if [[ "$VERSION" != *-* ]]; then
+  git fetch --quiet origin "+refs/heads/$PROD_BRANCH:refs/remotes/origin/$PROD_BRANCH" || \
+    die "cannot fetch $PROD_BRANCH from origin; a final fast-forwards it"
+  git merge-base --is-ancestor "origin/$PROD_BRANCH" "$INTEGRATION_BRANCH" || \
+    die "origin/$PROD_BRANCH is not an ancestor of $INTEGRATION_BRANCH, so $VERSION could not fast-forward it. Merge $PROD_BRANCH into $INTEGRATION_BRANCH first."
+  ok "$PROD_BRANCH is an ancestor of $INTEGRATION_BRANCH: $VERSION can fast-forward it"
 fi
 
 # Base for the deploy payload = last shipped point.
@@ -221,14 +238,14 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
 fi
 
 # =============================================================================
-# 3. Deploy: tag the dev commit and push (main is NOT touched)
+# 3. Deploy: tag the dev commit and push (the record moves in step 6)
 # =============================================================================
 step "Deploy: tag $VERSION on $INTEGRATION_BRANCH"
 RELEASE_SHA="$(git rev-parse --short HEAD)"
 git tag "$VERSION"
 git push --quiet origin "$INTEGRATION_BRANCH"
 git push --quiet origin "$VERSION"
-ok "tagged $VERSION at $RELEASE_SHA, pushed $INTEGRATION_BRANCH + tag (main untouched)"
+ok "tagged $VERSION at $RELEASE_SHA, pushed $INTEGRATION_BRANCH + tag (the record moves in step 6)"
 
 # =============================================================================
 # 4. Watch the Release workflow run for this tag
@@ -259,12 +276,17 @@ else
 fi
 
 # =============================================================================
-# 6. Record: fast-forward `deployed` to the shipped commit
+# 6. Record: fast-forward `deployed`, and for a final `main`, to the shipped commit
 # =============================================================================
-step "Recording deploy on $DEPLOYED_BRANCH"
-git branch -f "$DEPLOYED_BRANCH" "$INTEGRATION_BRANCH"
-git push --quiet origin "$DEPLOYED_BRANCH"
+if [[ "$VERSION" == *-* ]]; then
+  RELEASE_ENV="dev";  RECORD_BRANCH="$DEPLOYED_BRANCH"
+else
+  RELEASE_ENV="prod"; RECORD_BRANCH="$PROD_BRANCH"
+fi
+step "Recording the release ($RELEASE_ENV record: $RECORD_BRANCH)"
+"$REPO_ROOT/scripts/record-release.sh" advance "$VERSION" "$RELEASE_ENV" "$INTEGRATION_BRANCH" "$RECORD_BRANCH" || \
+  die "the release is published but the record did not move; fix the branch named above and run: scripts/record-release.sh advance $VERSION $RELEASE_ENV $INTEGRATION_BRANCH $RECORD_BRANCH"
 git checkout --quiet "$ORIGINAL_BRANCH"
-ok "deployed -> $RELEASE_SHA"
+ok "recorded $VERSION at $RELEASE_SHA"
 
 printf "${GREEN}Released %s.${NC} Image: %s:%s\n" "$VERSION" "$IMAGE_NAME" "${VERSION#v}"

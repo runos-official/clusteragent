@@ -135,3 +135,12 @@ you release.
    matching section).
 2. Run `make release RELEASE_VERSION=vX.Y.Z` (add `CHECK=1` for a no-side-effect
    dry run that stops before any tag/push).
+
+Two branches record what shipped, and the script moves them only after the
+release is verified, by fast-forward only. `deployed` holds the last commit that
+was tagged, a candidate or a final. `main` is the prod record: a final
+fast-forwards it to the commit its tag names, and a candidate never moves it. A
+final is refused before the tag when `main` is not an ancestor of `dev`.
+[`scripts/record-release.sh`](scripts/record-release.sh) holds the rule and
+`scripts/record-release-test.sh` tests it against a local bare repository (the
+`releasecheck` Go tests run it).
