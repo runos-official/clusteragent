@@ -35,6 +35,7 @@ steps:
     description: "scripts/release.sh --check: preflight, sensitivity scan, leak gate, scannability gate and the build/vet/test suite. Every gate, no side effects, and it cannot be skipped."
     run: scripts/release.sh "${{ version }}" --check
     timeout: 1800
+    slow: true
 
   - name: Tag and push
     description: Tags the integration branch and pushes both. main is never touched here; the human merges it after their own verification.
