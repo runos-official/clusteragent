@@ -39,12 +39,15 @@ func TestUploadToken_RawTokenNeverStored(t *testing.T) {
 	}
 	// No stored string field may equal the raw token.
 	for name, val := range map[string]string{
-		"token_hash":    r.TokenHash,
-		"deploy_config": r.DeployConfig,
-		"dockerfile":    r.Dockerfile,
-		"build_args":    r.BuildArgs,
-		"build_target":  r.BuildTarget,
-		"purpose":       r.Purpose,
+		"token_hash":                   r.TokenHash,
+		"deploy_config":                r.DeployConfig,
+		"dockerfile":                   r.Dockerfile,
+		"build_args":                   r.BuildArgs,
+		"build_target":                 r.BuildTarget,
+		"purpose":                      r.Purpose,
+		"authorization_classification": r.AuthorizationClassification,
+		"authorization_version":        r.AuthorizationBindingVersion,
+		"authorization_binding":        r.AuthorizationBinding,
 	} {
 		if val == raw {
 			t.Fatalf("raw token leaked into column %q", name)

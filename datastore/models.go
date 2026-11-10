@@ -68,16 +68,19 @@ func (BuildKitJobArgModel) TableName() string { return tablePrefix + "buildkit_j
 // (sha256 hex of the raw token), which carries the UNIQUE + index. Callers
 // pass the raw token at create/lookup time; the query layer hashes it.
 type UploadTokenModel struct {
-	ID           uint      `gorm:"primaryKey;autoIncrement"`
-	TokenHash    string    `gorm:"column:token_hash;uniqueIndex:idx_upload_tokens_token_hash;not null"`
-	DeployConfig string    `gorm:"column:deploy_config;not null"`
-	Dockerfile   string    `gorm:"column:dockerfile;not null;default:''"`
-	BuildArgs    string    `gorm:"column:build_args;not null;default:'[]'"`
-	BuildTarget  string    `gorm:"column:build_target;not null;default:''"`
-	ExpiresAt    time.Time `gorm:"column:expires_at;index:idx_upload_tokens_expires_at;not null"`
-	Used         bool      `gorm:"column:used;not null;default:false"`
-	CreatedAt    time.Time `gorm:"column:created_at;default:CURRENT_TIMESTAMP"`
-	Purpose      string    `gorm:"column:purpose;not null;default:'upload'"`
+	ID                          uint      `gorm:"primaryKey;autoIncrement"`
+	TokenHash                   string    `gorm:"column:token_hash;uniqueIndex:idx_upload_tokens_token_hash;not null"`
+	DeployConfig                string    `gorm:"column:deploy_config;not null"`
+	Dockerfile                  string    `gorm:"column:dockerfile;not null;default:''"`
+	BuildArgs                   string    `gorm:"column:build_args;not null;default:'[]'"`
+	BuildTarget                 string    `gorm:"column:build_target;not null;default:''"`
+	ExpiresAt                   time.Time `gorm:"column:expires_at;index:idx_upload_tokens_expires_at;not null"`
+	Used                        bool      `gorm:"column:used;not null;default:false"`
+	CreatedAt                   time.Time `gorm:"column:created_at;default:CURRENT_TIMESTAMP"`
+	Purpose                     string    `gorm:"column:purpose;not null;default:'upload'"`
+	AuthorizationClassification string    `gorm:"column:authorization_classification;not null;default:'legacy'"`
+	AuthorizationBindingVersion string    `gorm:"column:authorization_binding_version;not null;default:''"`
+	AuthorizationBinding        string    `gorm:"column:authorization_binding;type:text;not null;default:''"`
 }
 
 func (UploadTokenModel) TableName() string { return tablePrefix + "upload_tokens" }

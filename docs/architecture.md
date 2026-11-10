@@ -25,7 +25,7 @@ stream.
                                                              ├─ certcache     ──► Traefik cert Secret
                                                              ├─ dns01         ──► cert-manager DNS01 webhook
                                                              ├─ webhook        (health + presigned uploads)
-                                                             └─ datastore      (local SQLite: jobs, logs, tokens)
+                                                             └─ datastore      (shared PostgreSQL: jobs, logs, tokens)
 ```
 
 ## How a build works
@@ -37,6 +37,24 @@ created, used for exactly one build, and deleted, which removes the
 shared-daemon wedge class entirely. App images go to the `runos-apps` Harbor
 project; CLI deploy archives are stored as single-layer OCI artifacts under
 `runos-archives`.
+
+## Upload token authorization
+
+The datastore hashes each upload token and stores its expiry, purpose, and
+single-use state. The datastore never stores the raw upload token.
+
+Each token has an explicit `legacy` or `scoped` authorization classification.
+Existing rows migrate to `legacy`. Pull and app-less image-build tokens also
+remain `legacy` because the scoped upload contract does not cover them.
+
+A `scoped` CLI upload stores the complete immutable
+`runos.upload-authority-binding.v1` payload. The payload binds one verified
+credential reference to the account, cluster, existing app, upload identity,
+`apps.deploy` action, scope, decision, and expiry. Reads reject missing,
+malformed, mismatched, unsupported, or secret-shaped binding data.
+
+Token consumption changes only the existing single-use state. Later deployment
+stages use separate job authority and do not modify the upload binding.
 
 ## Package map
 
@@ -51,7 +69,7 @@ project; CLI deploy archives are stored as single-layer OCI artifacts under
 | `certcache` | Mirrors the cluster-domain certificate into the Traefik Secret. |
 | `dns01` | cert-manager ACME DNS01 solver webhook. |
 | `webhook` | Local HTTP server: health probe, presigned tarball uploads, CLI deploy/pull, OSID generation. |
-| `datastore` | Local SQLite: build jobs/logs/args, one-shot job audit, upload tokens, schema cache. |
+| `datastore` | Shared PostgreSQL storage for build jobs, logs, arguments, one-shot job audit, upload tokens, and schema cache. |
 | `commons` | Dependency-free helpers (JSON+base64 message codec). |
 | `version` | Build version, injected at release time via `-ldflags`. |
 
