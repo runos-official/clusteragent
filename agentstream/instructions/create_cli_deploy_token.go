@@ -38,6 +38,11 @@ type CreateCLIDeployTokenRequest struct {
 	// ignored otherwise.
 	Repo string   `json:"repo,omitempty"`
 	Tags []string `json:"tags,omitempty"`
+
+	// AuthorizationClassification selects explicit legacy or scoped storage.
+	// Omission without a binding preserves the historical legacy request.
+	AuthorizationClassification string                            `json:"authorizationClassification,omitempty"`
+	AuthorizationBinding        *datastore.UploadAuthorityBinding `json:"authorizationBinding,omitempty"`
 }
 
 // CreateCLIDeployTokenResponse holds the response after creating a token
@@ -53,6 +58,12 @@ const (
 	defaultExpirySeconds = 300 // 5 minutes
 	maxExpirySeconds     = 600 // 10 minutes
 	tokenBytes           = 32  // 256-bit token
+)
+
+var (
+	createUploadToken       = datastore.CreateUploadToken
+	createScopedUploadToken = datastore.CreateScopedUploadToken
+	createBuildImageToken   = datastore.CreateBuildImageToken
 )
 
 // CreateCLIDeployToken handles the CREATE_CLI_DEPLOY_TOKEN instruction
@@ -86,6 +97,13 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 		return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
 	}
 
+	authorization, err := requestAuthorizationClassification(req)
+	if err != nil {
+		response := CreateCLIDeployTokenResponse{Success: false, Message: err.Error()}
+		jsonResponse, _ := commons.JsonB64Encode(response)
+		return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
+	}
+
 	// Set expiry time
 	expirySeconds := req.ExpirySeconds
 	if expirySeconds <= 0 {
@@ -94,7 +112,29 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 	if expirySeconds > maxExpirySeconds {
 		expirySeconds = maxExpirySeconds
 	}
-	expiresAt := time.Now().Add(time.Duration(expirySeconds) * time.Second)
+	expiresAt := time.Now().UTC().Truncate(time.Second).Add(time.Duration(expirySeconds) * time.Second)
+	if authorization == datastore.AuthorizationScoped {
+		// The immutable binding fixes expiry before transport to the agent.
+		bindingExpiry, expiryErr := time.Parse(time.RFC3339, req.AuthorizationBinding.ExpiresAt)
+		bindingCreated, createdErr := time.Parse(time.RFC3339, req.AuthorizationBinding.CreatedAt)
+		if expiryErr != nil || createdErr != nil || !bindingExpiry.After(time.Now()) ||
+			req.ExpirySeconds < 0 || req.ExpirySeconds > int(time.Hour/time.Second) || (req.ExpirySeconds > 0 &&
+			bindingExpiry.Sub(bindingCreated) != time.Duration(req.ExpirySeconds)*time.Second) {
+			response := CreateCLIDeployTokenResponse{Success: false, Message: "Invalid authorization binding expiry"}
+			jsonResponse, _ := commons.JsonB64Encode(response)
+			return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
+		}
+		expiresAt = bindingExpiry
+		if err := datastore.ValidateUploadAuthorityBinding(*req.AuthorizationBinding, datastore.UploadAuthorityTarget{
+			AppID:    req.OSID,
+			UploadID: req.CliUploadID,
+			Purpose:  datastore.PurposeUpload,
+		}, expiresAt); err != nil {
+			response := CreateCLIDeployTokenResponse{Success: false, Message: "Invalid authorization binding"}
+			jsonResponse, _ := commons.JsonB64Encode(response)
+			return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
+		}
+	}
 
 	// Generate cryptographically secure token
 	tokenBuf := make([]byte, tokenBytes)
@@ -120,9 +160,11 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 		if uploadID == "" {
 			uploadID = token[:16] // fall back to a stable id derived from the token
 		}
-		storeErr = datastore.CreateBuildImageToken(token, uploadID, req.Repo, req.Tags, req.Dockerfile, req.BuildArgs, expiresAt)
+		storeErr = createBuildImageToken(token, uploadID, req.Repo, req.Tags, req.Dockerfile, req.BuildArgs, expiresAt)
+	} else if authorization == datastore.AuthorizationScoped {
+		storeErr = createScopedUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt, *req.AuthorizationBinding)
 	} else {
-		storeErr = datastore.CreateUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt)
+		storeErr = createUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt)
 	}
 	if storeErr != nil {
 		log.Printf("Error storing token: %v", storeErr)
@@ -143,7 +185,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 	response := CreateCLIDeployTokenResponse{
 		Success:   true,
 		Token:     token,
-		ExpiresAt: expiresAt.Format(time.RFC3339),
+		ExpiresAt: expiresAt.Format(time.RFC3339Nano),
 		UploadURL: fmt.Sprintf("/cli-deploy/%s", token),
 		Message:   "CLI deploy token created successfully",
 	}
@@ -155,4 +197,31 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 	}
 
 	return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
+}
+
+func requestAuthorizationClassification(req CreateCLIDeployTokenRequest) (string, error) {
+	classification := req.AuthorizationClassification
+	if classification == "" && req.AuthorizationBinding == nil {
+		classification = datastore.AuthorizationLegacy
+	}
+	switch classification {
+	case datastore.AuthorizationLegacy:
+		if req.AuthorizationBinding != nil {
+			return "", fmt.Errorf("legacy authorization cannot include a scoped binding")
+		}
+		return classification, nil
+	case datastore.AuthorizationScoped:
+		if req.Purpose != "" && req.Purpose != datastore.PurposeUpload {
+			return "", fmt.Errorf("scoped upload authorization requires an empty purpose or upload")
+		}
+		if req.AuthorizationBinding == nil {
+			return "", fmt.Errorf("scoped authorization requires a binding")
+		}
+		if req.CliUploadID == "" {
+			return "", fmt.Errorf("scoped authorization requires cliUploadId")
+		}
+		return classification, nil
+	default:
+		return "", fmt.Errorf("unknown authorization classification")
+	}
 }

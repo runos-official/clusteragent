@@ -59,16 +59,18 @@ type BuildTargetSpec struct {
 // BuildTarget is the explicit Harbor target (repo + tag list) for
 // PurposeBuildImage tokens; nil for app-deploy / pull tokens (obj-47).
 type UploadToken struct {
-	ID           int64            `json:"id"`
-	Token        string           `json:"token"`
-	DeployConfig string           `json:"deploy_config"`
-	Dockerfile   string           `json:"dockerfile"`
-	BuildArgs    []BuildArg       `json:"build_args"`
-	ExpiresAt    time.Time        `json:"expires_at"`
-	Used         bool             `json:"used"`
-	CreatedAt    time.Time        `json:"created_at"`
-	Purpose      string           `json:"purpose"`
-	BuildTarget  *BuildTargetSpec `json:"build_target,omitempty"`
+	ID                          int64                   `json:"id"`
+	Token                       string                  `json:"token"`
+	DeployConfig                string                  `json:"deploy_config"`
+	Dockerfile                  string                  `json:"dockerfile"`
+	BuildArgs                   []BuildArg              `json:"build_args"`
+	ExpiresAt                   time.Time               `json:"expires_at"`
+	Used                        bool                    `json:"used"`
+	CreatedAt                   time.Time               `json:"created_at"`
+	Purpose                     string                  `json:"purpose"`
+	BuildTarget                 *BuildTargetSpec        `json:"build_target,omitempty"`
+	AuthorizationClassification string                  `json:"authorizationClassification"`
+	AuthorizationBinding        *UploadAuthorityBinding `json:"authorizationBinding,omitempty"`
 }
 
 // CreateUploadToken creates a new single-use token for uploading code for an OSID.
@@ -94,12 +96,48 @@ func CreateUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []
 		return err
 	}
 	row := UploadTokenModel{
-		TokenHash:    hashToken(token),
-		DeployConfig: deployConfig,
-		Dockerfile:   dockerfile,
-		BuildArgs:    buildArgsJSON,
-		ExpiresAt:    expiresAt,
-		Purpose:      PurposeUpload,
+		TokenHash:                   hashToken(token),
+		DeployConfig:                deployConfig,
+		Dockerfile:                  dockerfile,
+		BuildArgs:                   buildArgsJSON,
+		ExpiresAt:                   expiresAt,
+		Purpose:                     PurposeUpload,
+		AuthorizationClassification: AuthorizationLegacy,
+	}
+	return gdb.Create(&row).Error
+}
+
+// CreateScopedUploadToken stores one immutable scoped authorization binding.
+func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []BuildArg, expiresAt time.Time, binding UploadAuthorityBinding) error {
+	if err := ValidateUploadAuthorityBinding(binding, UploadAuthorityTarget{
+		AppID:    osid,
+		UploadID: cliUploadID,
+		Purpose:  PurposeUpload,
+	}, expiresAt); err != nil {
+		return err
+	}
+	gdb, err := activeDB()
+	if err != nil {
+		return err
+	}
+	buildArgsJSON, err := encodeBuildArgs(buildArgs)
+	if err != nil {
+		return err
+	}
+	bindingJSON, err := json.Marshal(binding)
+	if err != nil {
+		return fmt.Errorf("marshal authorization binding: %w", err)
+	}
+	row := UploadTokenModel{
+		TokenHash:                   hashToken(token),
+		DeployConfig:                osid + ":" + cliUploadID,
+		Dockerfile:                  dockerfile,
+		BuildArgs:                   buildArgsJSON,
+		ExpiresAt:                   expiresAt,
+		Purpose:                     PurposeUpload,
+		AuthorizationClassification: AuthorizationScoped,
+		AuthorizationBindingVersion: binding.Version,
+		AuthorizationBinding:        string(bindingJSON),
 	}
 	return gdb.Create(&row).Error
 }
@@ -134,13 +172,14 @@ func CreateBuildImageToken(token, uploadID, repo string, tags []string, dockerfi
 	}
 
 	row := UploadTokenModel{
-		TokenHash:    hashToken(token),
-		DeployConfig: deployConfig,
-		Dockerfile:   dockerfile,
-		BuildArgs:    buildArgsJSON,
-		BuildTarget:  string(targetJSON),
-		ExpiresAt:    expiresAt,
-		Purpose:      PurposeBuildImage,
+		TokenHash:                   hashToken(token),
+		DeployConfig:                deployConfig,
+		Dockerfile:                  dockerfile,
+		BuildArgs:                   buildArgsJSON,
+		BuildTarget:                 string(targetJSON),
+		ExpiresAt:                   expiresAt,
+		Purpose:                     PurposeBuildImage,
+		AuthorizationClassification: AuthorizationLegacy,
 	}
 	return gdb.Create(&row).Error
 }
@@ -153,10 +192,11 @@ func CreatePullToken(token, osid, cliUploadID string, expiresAt time.Time) error
 		return err
 	}
 	row := UploadTokenModel{
-		TokenHash:    hashToken(token),
-		DeployConfig: osid + ":" + cliUploadID,
-		ExpiresAt:    expiresAt,
-		Purpose:      PurposePull,
+		TokenHash:                   hashToken(token),
+		DeployConfig:                osid + ":" + cliUploadID,
+		ExpiresAt:                   expiresAt,
+		Purpose:                     PurposePull,
+		AuthorizationClassification: AuthorizationLegacy,
 	}
 	return gdb.Create(&row).Error
 }
@@ -226,14 +266,18 @@ func getTokenByPurposes(token string, purposes ...string) (*UploadToken, error) 
 	}
 
 	t := UploadToken{
-		ID:           int64(m.ID),
-		Token:        token, // echo the raw token back; never read from the DB
-		DeployConfig: m.DeployConfig,
-		Dockerfile:   m.Dockerfile,
-		ExpiresAt:    m.ExpiresAt,
-		Used:         m.Used,
-		CreatedAt:    m.CreatedAt,
-		Purpose:      m.Purpose,
+		ID:                          int64(m.ID),
+		Token:                       token, // echo the raw token back; never read from the DB
+		DeployConfig:                m.DeployConfig,
+		Dockerfile:                  m.Dockerfile,
+		ExpiresAt:                   m.ExpiresAt,
+		Used:                        m.Used,
+		CreatedAt:                   m.CreatedAt,
+		Purpose:                     m.Purpose,
+		AuthorizationClassification: m.AuthorizationClassification,
+	}
+	if err := loadAuthorizationBinding(m, &t); err != nil {
+		return nil, err
 	}
 	// Empty/legacy rows store '[]' (column default); only unmarshal when
 	// there's something to parse so a blank value can't error the lookup.
@@ -252,6 +296,42 @@ func getTokenByPurposes(token string, purposes ...string) (*UploadToken, error) 
 		t.BuildTarget = &spec
 	}
 	return &t, nil
+}
+
+func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error {
+	switch model.AuthorizationClassification {
+	case AuthorizationLegacy:
+		if model.AuthorizationBindingVersion != "" || strings.TrimSpace(model.AuthorizationBinding) != "" {
+			return fmt.Errorf("legacy token contains scoped authorization binding data")
+		}
+		return nil
+	case AuthorizationScoped:
+		if model.AuthorizationBindingVersion != UploadAuthorityBindingVersion {
+			return fmt.Errorf("unsupported stored authorization binding version %q", model.AuthorizationBindingVersion)
+		}
+		if strings.TrimSpace(model.AuthorizationBinding) == "" {
+			return fmt.Errorf("scoped token has no authorization binding")
+		}
+		binding, err := decodeUploadAuthorityBinding(model.AuthorizationBinding)
+		if err != nil {
+			return err
+		}
+		appID, uploadID, ok := strings.Cut(model.DeployConfig, ":")
+		if !ok || appID == "" || uploadID == "" {
+			return fmt.Errorf("scoped token has malformed deploy_config")
+		}
+		if err := ValidateUploadAuthorityBinding(binding, UploadAuthorityTarget{
+			AppID:    appID,
+			UploadID: uploadID,
+			Purpose:  model.Purpose,
+		}, model.ExpiresAt); err != nil {
+			return err
+		}
+		token.AuthorizationBinding = &binding
+		return nil
+	default:
+		return fmt.Errorf("unknown authorization classification %q", model.AuthorizationClassification)
+	}
 }
 
 // MarkUploadTokenUsed atomically marks a token (any purpose) as used, looked up
