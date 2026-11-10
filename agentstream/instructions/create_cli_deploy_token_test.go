@@ -138,3 +138,65 @@ func TestCreateCLIDeployToken_RejectsAmbiguousAuthorization(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateCLIDeployToken_ScopedPurposeAndExpiry(t *testing.T) {
+	originalScoped := createScopedUploadToken
+	t.Cleanup(func() { createScopedUploadToken = originalScoped })
+	tests := []struct {
+		name          string
+		purpose       string
+		expirySeconds int
+		delay         time.Duration
+		wantSuccess   bool
+	}{
+		{name: "default purpose", wantSuccess: true},
+		{name: "fractional expiry", delay: time.Millisecond, wantSuccess: true},
+		{name: "upload purpose", purpose: datastore.PurposeUpload, expirySeconds: 300, wantSuccess: true},
+		{name: "pull purpose", purpose: datastore.PurposePull},
+		{name: "unknown purpose", purpose: "other"},
+		{name: "shorter request expiry", expirySeconds: 60},
+		{name: "longer request expiry", expirySeconds: 600},
+		{name: "negative request expiry", expirySeconds: -1},
+		{name: "excessive request expiry", expirySeconds: 3601},
+		{name: "delayed request", expirySeconds: 300, delay: time.Minute, wantSuccess: true},
+		{name: "expired binding", delay: 6 * time.Minute},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			binding := instructionBinding()
+			createdAt := time.Now().UTC().Truncate(time.Second).Add(-tc.delay)
+			binding.CreatedAt = createdAt.Format(time.RFC3339Nano)
+			binding.ExpiresAt = createdAt.Add(5 * time.Minute).Format(time.RFC3339Nano)
+			calls := 0
+			createScopedUploadToken = func(_ string, _ string, _ string, _ string, _ []datastore.BuildArg, expiry time.Time, got datastore.UploadAuthorityBinding) error {
+				calls++
+				if expiry.Format(time.RFC3339Nano) != binding.ExpiresAt || got != binding {
+					t.Errorf("storage changed binding or expiry: expiry=%s want=%s", expiry, binding.ExpiresAt)
+				}
+				return nil
+			}
+			payload, err := commons.JsonB64Encode(CreateCLIDeployTokenRequest{
+				OSID: binding.AppID, CliUploadID: binding.UploadID, Purpose: tc.purpose,
+				ExpirySeconds: tc.expirySeconds, AuthorizationClassification: datastore.AuthorizationScoped,
+				AuthorizationBinding: &binding,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, response, err := CreateCLIDeployToken(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded CreateCLIDeployTokenResponse
+			if err := commons.JsonB64Decode(response, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Success != tc.wantSuccess || (calls == 1) != tc.wantSuccess {
+				t.Fatalf("success=%v calls=%d wantSuccess=%v message=%q", decoded.Success, calls, tc.wantSuccess, decoded.Message)
+			}
+			if tc.wantSuccess && decoded.ExpiresAt != binding.ExpiresAt {
+				t.Fatalf("response expiry=%s want=%s", decoded.ExpiresAt, binding.ExpiresAt)
+			}
+		})
+	}
+}

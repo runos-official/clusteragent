@@ -114,6 +114,17 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 	}
 	expiresAt := time.Now().UTC().Truncate(time.Second).Add(time.Duration(expirySeconds) * time.Second)
 	if authorization == datastore.AuthorizationScoped {
+		// The immutable binding fixes expiry before transport to the agent.
+		bindingExpiry, expiryErr := time.Parse(time.RFC3339, req.AuthorizationBinding.ExpiresAt)
+		bindingCreated, createdErr := time.Parse(time.RFC3339, req.AuthorizationBinding.CreatedAt)
+		if expiryErr != nil || createdErr != nil || !bindingExpiry.After(time.Now()) ||
+			req.ExpirySeconds < 0 || req.ExpirySeconds > int(time.Hour/time.Second) || (req.ExpirySeconds > 0 &&
+			bindingExpiry.Sub(bindingCreated) != time.Duration(req.ExpirySeconds)*time.Second) {
+			response := CreateCLIDeployTokenResponse{Success: false, Message: "Invalid authorization binding expiry"}
+			jsonResponse, _ := commons.JsonB64Encode(response)
+			return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
+		}
+		expiresAt = bindingExpiry
 		if err := datastore.ValidateUploadAuthorityBinding(*req.AuthorizationBinding, datastore.UploadAuthorityTarget{
 			AppID:    req.OSID,
 			UploadID: req.CliUploadID,
@@ -174,7 +185,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 	response := CreateCLIDeployTokenResponse{
 		Success:   true,
 		Token:     token,
-		ExpiresAt: expiresAt.Format(time.RFC3339),
+		ExpiresAt: expiresAt.Format(time.RFC3339Nano),
 		UploadURL: fmt.Sprintf("/cli-deploy/%s", token),
 		Message:   "CLI deploy token created successfully",
 	}
@@ -200,8 +211,8 @@ func requestAuthorizationClassification(req CreateCLIDeployTokenRequest) (string
 		}
 		return classification, nil
 	case datastore.AuthorizationScoped:
-		if req.Purpose == datastore.PurposeBuildImage {
-			return "", fmt.Errorf("build_image does not support scoped upload authorization")
+		if req.Purpose != "" && req.Purpose != datastore.PurposeUpload {
+			return "", fmt.Errorf("scoped upload authorization requires an empty purpose or upload")
 		}
 		if req.AuthorizationBinding == nil {
 			return "", fmt.Errorf("scoped authorization requires a binding")

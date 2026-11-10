@@ -116,6 +116,7 @@ func TestUploadAuthorityBinding_ValidationMatrix(t *testing.T) {
 		{name: "action mismatch", mutate: func(b *UploadAuthorityBinding) { b.Action = "apps.logs.read" }, want: "action"},
 		{name: "purpose mismatch", target: UploadAuthorityTarget{Purpose: PurposePull}, want: "purpose"},
 		{name: "token expiry after binding", expires: now.Add(6 * time.Minute), want: "expiry"},
+		{name: "token expiry before binding", expires: now.Add(4 * time.Minute), want: "expiry"},
 		{name: "account key bearer", mutate: func(b *UploadAuthorityBinding) { b.Credential.CredentialID = accountSecret }, want: "credentialId"},
 		{name: "personal token bearer", mutate: func(b *UploadAuthorityBinding) { b.Credential.CredentialID = personalSecret }, want: "credentialId"},
 		{name: "legacy key bearer", mutate: func(b *UploadAuthorityBinding) { b.Credential.CredentialID = legacySecret }, want: "credentialId"},

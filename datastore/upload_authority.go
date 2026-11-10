@@ -183,8 +183,8 @@ func ValidateUploadAuthorityBinding(binding UploadAuthorityBinding, target Uploa
 	if expiresAt.After(createdAt.Add(time.Hour)) {
 		return fmt.Errorf("authorization binding expiry exceeds one hour")
 	}
-	if tokenExpiresAt.IsZero() || tokenExpiresAt.After(expiresAt) {
-		return fmt.Errorf("token expiry exceeds authorization binding expiry")
+	if tokenExpiresAt.IsZero() || !tokenExpiresAt.Equal(expiresAt) {
+		return fmt.Errorf("token expiry must equal authorization binding expiry")
 	}
 	if err := binding.MatchTarget(target); err != nil {
 		return err
