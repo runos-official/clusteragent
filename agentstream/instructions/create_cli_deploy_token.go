@@ -38,6 +38,15 @@ type CreateCLIDeployTokenRequest struct {
 	// ignored otherwise.
 	Repo string   `json:"repo,omitempty"`
 	Tags []string `json:"tags,omitempty"`
+	// HarborOsid is the Harbor service identity Conductor verified and
+	// locked before minting a build_image token (story 390 criterion 5,
+	// src/util/harborBuildImage/prepareHarborBuildImage.ts). Only meaningful
+	// for Purpose=="build_image". Omitted by a caller that predates this
+	// field (or by any non-build_image request); a plain json.Unmarshal
+	// silently ignores an unrecognised field, so an older agent decoding a
+	// newer Conductor's request tolerates it being absent from its own
+	// struct, and a newer agent decoding an older request simply sees "".
+	HarborOsid string `json:"harborOsid,omitempty"`
 
 	// AuthorizationClassification selects explicit legacy or scoped storage.
 	// Omission without a binding preserves the historical legacy request.
@@ -160,7 +169,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 		if uploadID == "" {
 			uploadID = token[:16] // fall back to a stable id derived from the token
 		}
-		storeErr = createBuildImageToken(token, uploadID, req.Repo, req.Tags, req.Dockerfile, req.BuildArgs, expiresAt)
+		storeErr = createBuildImageToken(token, uploadID, req.Repo, req.Tags, req.HarborOsid, req.Dockerfile, req.BuildArgs, expiresAt)
 	} else if authorization == datastore.AuthorizationScoped {
 		storeErr = createScopedUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt, *req.AuthorizationBinding)
 	} else {

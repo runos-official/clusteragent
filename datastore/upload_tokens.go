@@ -28,6 +28,12 @@ const (
 type BuildTargetSpec struct {
 	Repo string   `json:"repo"`
 	Tags []string `json:"tags"`
+	// HarborOsid is the Harbor service identity Conductor verified and
+	// locked before minting this token (story 390's criterion 5; FCR 2487).
+	// Empty for tokens minted before this field existed, or for any
+	// caller that still omits it: the upload path then keeps today's
+	// behavior (no Harbor-identity comparison), per criterion 6(d).
+	HarborOsid string `json:"harborOsid,omitempty"`
 }
 
 // UploadToken represents a single-use upload or pull token record.
@@ -146,16 +152,20 @@ func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildA
 // build-and-push (obj-47). uploadID is the conductor-assigned upload
 // identity that doubles as the BuildKit jobID. repo + tags are the explicit
 // Harbor target under the fixed `runos-apps` project; the same built image is
-// pushed to every tag. dockerfile is the path inside the tarball (relative to
-// the context root, empty => "Dockerfile"). buildArgs are the effective args
+// pushed to every tag. harborOsid is the Harbor service identity Conductor
+// verified and locked before minting the token (story 390 criterion 5); empty
+// for a legacy caller that does not send it (criterion 6(d) explicit legacy
+// branch). dockerfile is the path inside the tarball (relative to the
+// context root, empty => "Dockerfile"). buildArgs are the effective args
 // resolved by conductor.
 //
 // deploy_config is stored as "<repo>:<uploadID>" so the shared upload handler's
 // existing `osid:uploadID` split yields a synthetic, app-less build identity
-// (osid = repo). The tag list lives in the build_target JSON column.
+// (osid = repo). The tag list and Harbor identity live in the build_target
+// JSON column.
 //
 // The raw token is hashed (sha256 hex) before storage; it is never persisted.
-func CreateBuildImageToken(token, uploadID, repo string, tags []string, dockerfile string, buildArgs []BuildArg, expiresAt time.Time) error {
+func CreateBuildImageToken(token, uploadID, repo string, tags []string, harborOsid, dockerfile string, buildArgs []BuildArg, expiresAt time.Time) error {
 	gdb, err := activeDB()
 	if err != nil {
 		return err
@@ -166,7 +176,7 @@ func CreateBuildImageToken(token, uploadID, repo string, tags []string, dockerfi
 	if err != nil {
 		return err
 	}
-	targetJSON, err := json.Marshal(BuildTargetSpec{Repo: repo, Tags: tags})
+	targetJSON, err := json.Marshal(BuildTargetSpec{Repo: repo, Tags: tags, HarborOsid: harborOsid})
 	if err != nil {
 		return fmt.Errorf("marshal build target: %w", err)
 	}

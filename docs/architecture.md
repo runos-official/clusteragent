@@ -56,6 +56,57 @@ malformed, mismatched, unsupported, or secret-shaped binding data.
 Token consumption changes only the existing single-use state. Later deployment
 stages use separate job authority and do not modify the upload binding.
 
+### Recheck before archive persistence
+
+A `scoped` upload token is not enough by itself to persist an app's source
+archive. Before the agent pushes anything to Harbor, it asks the control
+plane for one fresh, current, correlated permit over the authenticated mTLS
+stream (`agentstream.RequestStageRecheck`, the published
+`runos.deployment-stage-request.v1` / `runos.deployment-stage-response.v1`
+contract). The request carries the stored binding's `bindingId`/`uploadId`
+and the `archive_persist` stage; it carries no bearer credential and no raw
+upload token. Only an exact `permit` response - matching authority, stage,
+and request correlation, within its own short issue/expiry window - lets the
+upload continue. A `deny`, `needs`, `unavailable`, unknown outcome, or any
+transport/validation failure (malformed reply, wrong binding, stale or
+replayed proof, disconnect, timeout, recheck outage) refuses the upload with
+a generic response that reveals nothing about the account, cluster, app,
+binding, or credential involved.
+
+An explicit `legacy` token never calls the recheck: it keeps its historical
+authorization semantics. There is no fallback in either direction - a scoped
+token that gets no permit does not retry as legacy, and a legacy token is
+never promoted to a scoped check. A stored binding missing on a `scoped`
+classification is treated as invalid, never as legacy.
+
+**Decision boundary.** The recheck call is the last point that can still
+refuse before anything changes. **Claim boundary.** The token's atomic
+single-use claim (`MarkUploadTokenUsed`, an `UPDATE ... WHERE used = false`)
+is the concurrency boundary and runs immediately before the first external
+mutation (the archive push, or the build start for a build-image token): of
+any number of requests that reach it for the same token, at most one
+succeeds. Every available non-mutating check - token state, tarball
+extraction limits, the BuildKit/Harbor configuration read, and the recheck
+itself - runs before that claim, so a later failure never burns a token that
+was in fact valid. Once a permit is granted and a request wins the claim,
+the archive persist and build start that follow are not retried or rolled
+back by this layer; a later deployment stage rechecks authority again before
+its own mutation.
+
+### Build-image registry identity
+
+A `build_image` token can carry `harborOsid`: the Harbor service identity the
+control plane verified and locked before minting the token. The agent
+persists it on the token row alongside the target repo and tags. At upload
+time, before any build starts and before any push, the agent compares that
+persisted identity against the Harbor the shared BuildKit configuration
+names at that exact moment (the same configuration read the push itself
+uses, never a second one). A mismatch, or a configuration that names no
+Harbor, refuses the upload with a named reason and starts no build and
+pushes nothing. A `build_image` request that predates this field (empty
+persisted identity) is an explicit legacy branch: it skips the comparison
+and keeps the historical behavior unconditionally.
+
 ## Package map
 
 | Package | Role |

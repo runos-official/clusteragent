@@ -243,6 +243,14 @@ type BuildKitConfig struct {
 	ClusterDomain  string
 	HarborUsername string
 	HarborPassword string
+	// HarborOsid is the Harbor service's osid, read from the buildkit
+	// Secret's harbor-osid key (story 390, src/util/builds/ensureBuildConfig.ts
+	// in Conductor). Conductor locks this identity before minting a
+	// build_image token and sends it back as harborOsid on the token; the
+	// upload path compares the two so a Harbor retarget between mint and
+	// upload cannot silently redirect the push (FCR 2487, finding 1029/1030).
+	// Empty when the Secret predates that key or names no Harbor.
+	HarborOsid string
 }
 
 // GetBuildKitConfig retrieves configuration from buildkit ConfigMap and Secret
@@ -265,6 +273,7 @@ func (c *K8sClient) GetBuildKitConfig(ctx context.Context) (*BuildKitConfig, err
 		ClusterDomain:  cm.Data["cluster-domain"],
 		HarborUsername: string(secret.Data["harbor-username"]),
 		HarborPassword: string(secret.Data["harbor-password"]),
+		HarborOsid:     string(secret.Data["harbor-osid"]),
 	}
 
 	return config, nil

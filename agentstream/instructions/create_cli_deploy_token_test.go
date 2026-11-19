@@ -139,6 +139,67 @@ func TestCreateCLIDeployToken_RejectsAmbiguousAuthorization(t *testing.T) {
 	}
 }
 
+// TestCreateCLIDeployToken_BuildImagePersistsHarborOsid pins story 338
+// criterion 6(a): a build_image request that names harborOsid stores it on
+// the token row so the upload path can compare it later. A request that
+// omits the field (legacy caller) persists an empty identity, which the
+// upload path treats as the explicit legacy branch (criterion 6(d)).
+func TestCreateCLIDeployToken_BuildImagePersistsHarborOsid(t *testing.T) {
+	original := createBuildImageToken
+	t.Cleanup(func() { createBuildImageToken = original })
+
+	var gotHarborOsid string
+	var called bool
+	createBuildImageToken = func(_ string, _ string, _ string, _ []string, harborOsid, _ string, _ []datastore.BuildArg, _ time.Time) error {
+		called = true
+		gotHarborOsid = harborOsid
+		return nil
+	}
+
+	req := CreateCLIDeployTokenRequest{
+		Purpose:    datastore.PurposeBuildImage,
+		Repo:       "fixture-repo",
+		Tags:       []string{"latest"},
+		HarborOsid: "harbor-locked-1",
+	}
+	payload, err := commons.JsonB64Encode(req)
+	if err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	_, response, err := CreateCLIDeployToken(payload)
+	if err != nil {
+		t.Fatalf("CreateCLIDeployToken: %v", err)
+	}
+	var decoded CreateCLIDeployTokenResponse
+	if err := commons.JsonB64Decode(response, &decoded); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !decoded.Success {
+		t.Fatalf("request refused: %s", decoded.Message)
+	}
+	if !called {
+		t.Fatal("createBuildImageToken was not called")
+	}
+	if gotHarborOsid != "harbor-locked-1" {
+		t.Fatalf("harborOsid passed to storage = %q, want harbor-locked-1", gotHarborOsid)
+	}
+
+	// A request with no harborOsid (legacy caller, or any caller that
+	// predates this field) must store an empty identity, not fail and not
+	// invent one.
+	legacyReq := CreateCLIDeployTokenRequest{Purpose: datastore.PurposeBuildImage, Repo: "fixture-repo", Tags: []string{"latest"}}
+	payload, err = commons.JsonB64Encode(legacyReq)
+	if err != nil {
+		t.Fatalf("encode legacy request: %v", err)
+	}
+	if _, _, err := CreateCLIDeployToken(payload); err != nil {
+		t.Fatalf("CreateCLIDeployToken(legacy): %v", err)
+	}
+	if gotHarborOsid != "" {
+		t.Fatalf("legacy request harborOsid = %q, want empty", gotHarborOsid)
+	}
+}
+
 func TestCreateCLIDeployToken_ScopedPurposeAndExpiry(t *testing.T) {
 	originalScoped := createScopedUploadToken
 	t.Cleanup(func() { createScopedUploadToken = originalScoped })

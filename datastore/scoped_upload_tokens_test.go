@@ -307,7 +307,7 @@ func TestUploadToken_PurposeIsolationWithExplicitLegacy(t *testing.T) {
 	if err := CreatePullToken("pull-token", "appaa", "upload-b", expires); err != nil {
 		t.Fatalf("create pull token: %v", err)
 	}
-	if err := CreateBuildImageToken("build-token", "upload-c", "fixture-repo", []string{"latest"}, "", nil, expires); err != nil {
+	if err := CreateBuildImageToken("build-token", "upload-c", "fixture-repo", []string{"latest"}, "", "", nil, expires); err != nil {
 		t.Fatalf("create build token: %v", err)
 	}
 
