@@ -362,17 +362,36 @@ func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error 
 // captured before the statement is sent, so a delay between that capture
 // and the UPDATE actually executing (lock wait, a slow write, a stalled
 // connection) can still let the row commit with used=true after the token's
-// real expiry. CURRENT_TIMESTAMP is a bare SQL token, not a bound
-// parameter, so the comparison is evaluated by the database AT the moment
-// this statement executes, closing that gap for real rather than narrowing
-// it. Supported identically by PostgreSQL (production) and SQLite (tests).
+// real expiry. The comparison must instead be evaluated by the database AT
+// the moment this statement executes.
+//
+// Review finding 1168 (repeat of 1128): CURRENT_TIMESTAMP is NOT that
+// moment on PostgreSQL. PostgreSQL documents CURRENT_TIMESTAMP (and NOW())
+// as fixed at TRANSACTION START, not at statement execution
+// (postgresql.org/docs/15/functions-datetime.html#FUNCTIONS-DATETIME-CURRENT).
+// A wait after the transaction starts and before this UPDATE actually takes
+// effect (lock contention, a slow write) can leave CURRENT_TIMESTAMP before
+// the real deadline even though wall-clock time has already passed it.
+// clock_timestamp() is PostgreSQL's true wall-clock function: it returns
+// the actual current time and is re-evaluated on every call, which is what
+// this comparison needs.
+//
+// Review finding 1203: SQLite has no clock_timestamp(), and mixing its
+// CURRENT_TIMESTAMP (bare UTC text) with a stored time.Time that carries a
+// non-UTC local offset (what a caller's un-normalized time.Now() produces)
+// compares as TEXT and is skewed by the host's UTC offset - measured in
+// this repository to fail in both directions off UTC. julianday() parses
+// either an offset-qualified or a bare timestamp into a real, comparable
+// instant, so wrapping both sides in julianday() compares actual instants
+// regardless of either side's textual timezone. SQLite is test-only here;
+// production always runs PostgreSQL (datastore/database.go).
 func MarkUploadTokenUsed(token string) error {
 	gdb, err := activeDB()
 	if err != nil {
 		return err
 	}
 	res := gdb.Model(&UploadTokenModel{}).
-		Where("token_hash = ? AND used = ? AND expires_at > CURRENT_TIMESTAMP", hashToken(token), false).
+		Where("token_hash = ? AND used = ? AND "+expiryStillValidClause(gdb), hashToken(token), false).
 		Update("used", true)
 	if res.Error != nil {
 		return res.Error
@@ -381,6 +400,18 @@ func MarkUploadTokenUsed(token string) error {
 		return fmt.Errorf("token not found, already used, or expired")
 	}
 	return nil
+}
+
+// expiryStillValidClause returns the dialect-specific SQL fragment that
+// compares expires_at against the database's real current instant,
+// evaluated at the moment the containing statement executes (review
+// findings 1168 and 1203). gdb.Name() reports the active dialect
+// ("postgres" in production, "sqlite" in tests).
+func expiryStillValidClause(gdb *gorm.DB) string {
+	if gdb.Name() == "postgres" {
+		return "expires_at > clock_timestamp()"
+	}
+	return "julianday(expires_at) > julianday('now')"
 }
 
 // DeleteExpiredUploadTokens removes tokens (any purpose) that have expired.

@@ -164,9 +164,12 @@ func TestVerifyBuildImageHarborIdentity(t *testing.T) {
 func TestPermitStillValid(t *testing.T) {
 	prevClock := permitClock
 	t.Cleanup(func() { permitClock = prevClock })
+	prevGen := currentStreamGeneration
+	t.Cleanup(func() { currentStreamGeneration = prevGen })
+	currentStreamGeneration = func() uint64 { return 7 }
 
 	deadline := time.Date(2026, 1, 1, 0, 0, 5, 0, time.UTC)
-	resp := &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, ExpiresAt: deadline}
+	resp := &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, ExpiresAt: deadline, StreamGeneration: 7}
 
 	permitClock = func() time.Time { return deadline.Add(-1 * time.Millisecond) }
 	if refusal := permitStillValid(resp); refusal != nil {
@@ -177,6 +180,37 @@ func TestPermitStillValid(t *testing.T) {
 	refusal := permitStillValid(resp)
 	if refusal == nil {
 		t.Fatal("expected a refusal once the permit's own deadline has passed")
+	}
+	if refusal.status != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", refusal.status)
+	}
+}
+
+// TestPermitStillValid_RefusesOnStreamGenerationMismatch pins review
+// finding 1169: a permit received on one stream generation must not
+// authorize anything once the control stream has disconnected, reconnected,
+// or both - even while the permit's own expiry is still in the future, and
+// even if a replacement connection is live again by the time this runs.
+func TestPermitStillValid_RefusesOnStreamGenerationMismatch(t *testing.T) {
+	prevClock := permitClock
+	t.Cleanup(func() { permitClock = prevClock })
+	permitClock = func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) }
+
+	prevGen := currentStreamGeneration
+	t.Cleanup(func() { currentStreamGeneration = prevGen })
+
+	deadline := time.Date(2026, 1, 1, 0, 0, 5, 0, time.UTC)
+	resp := &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, ExpiresAt: deadline, StreamGeneration: 3}
+
+	currentStreamGeneration = func() uint64 { return 3 }
+	if refusal := permitStillValid(resp); refusal != nil {
+		t.Fatalf("same generation must pass, got status=%d reason=%q", refusal.status, refusal.reason)
+	}
+
+	currentStreamGeneration = func() uint64 { return 4 } // disconnected and/or reconnected since
+	refusal := permitStillValid(resp)
+	if refusal == nil {
+		t.Fatal("expected a refusal once the stream generation has changed")
 	}
 	if refusal.status != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", refusal.status)

@@ -81,17 +81,34 @@ classification is treated as invalid, never as legacy.
 
 **Decision boundary.** The recheck call is the last point that can still
 refuse before anything changes. **Claim boundary.** The token's atomic
-single-use claim (`MarkUploadTokenUsed`, an `UPDATE ... WHERE used = false`)
-is the concurrency boundary and runs immediately before the first external
+single-use claim (`MarkUploadTokenUsed`, an `UPDATE ... WHERE used = false
+AND expires_at > <the database's real current instant>`) is the
+concurrency boundary and runs immediately before the first external
 mutation (the archive push, or the build start for a build-image token): of
 any number of requests that reach it for the same token, at most one
-succeeds. Every available non-mutating check - token state, tarball
-extraction limits, the BuildKit/Harbor configuration read, and the recheck
-itself - runs before that claim, so a later failure never burns a token that
-was in fact valid. Once a permit is granted and a request wins the claim,
-the archive persist and build start that follow are not retried or rolled
-back by this layer; a later deployment stage rechecks authority again before
-its own mutation.
+succeeds. The expiry side of that `WHERE` clause is evaluated by the
+database engine itself, by dialect: PostgreSQL's `CURRENT_TIMESTAMP` is
+fixed at transaction start, not at the moment this statement actually
+takes effect, so a wait for the row's lock can let a claim through after
+the real deadline; `clock_timestamp()` is PostgreSQL's true wall-clock
+function and is what the claim compares against instead. Every available
+non-mutating check - token state, tarball extraction limits, the
+BuildKit/Harbor configuration read, and the recheck itself - runs before
+that claim, so a later failure never burns a token that was in fact valid.
+
+A granted permit is re-checked again, not just once: immediately before
+the claim, and again immediately before the archive push, against both
+its own expiry (equality counts as expired) and the control stream's
+current generation. The stream generation increments on every connect,
+disconnect, and reconnect; a validated recheck response carries the
+generation that was current when it arrived, so a disconnect and
+reconnect between receiving the permit and acting on it is detected even
+though the permit's payload carries no connection identity of its own and
+a replacement connection may already be live again by the time the check
+runs. Once a permit is granted and a request wins the claim, the archive
+persist and build start that follow are not retried or rolled back by this
+layer; a later deployment stage rechecks authority again before its own
+mutation.
 
 ### Build-image registry identity
 

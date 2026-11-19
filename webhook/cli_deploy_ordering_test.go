@@ -312,6 +312,88 @@ func TestHandleCLIDeployUpload_PermitExpiresDuringClaimRefusesBeforePersistence(
 	}
 }
 
+// TestHandleCLIDeployUpload_StreamReconnectsDuringClaimRefusesBeforePersistence
+// pins review finding 1169: a permit received on one control-stream
+// connection must not authorize persistence once that connection has
+// disconnected and a replacement has connected, even though the permit's
+// own expiry is still in the future. The permit payload carries no
+// connection identity by itself; permitStillValid compares the stream
+// generation captured when the permit arrived against the current one.
+func TestHandleCLIDeployUpload_StreamReconnectsDuringClaimRefusesBeforePersistence(t *testing.T) {
+	deadline := time.Now().Add(1 * time.Hour) // plenty of time left on the permit itself
+	h := &uploadHarness{
+		t:              t,
+		token:          scopedUploadToken(),
+		buildkitConfig: &agentstream.BuildKitConfig{},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: deadline, StreamGeneration: 1},
+	}
+	h.install()
+
+	prevGen := currentStreamGeneration
+	t.Cleanup(func() { currentStreamGeneration = prevGen })
+	var reconnected bool
+	currentStreamGeneration = func() uint64 {
+		if reconnected {
+			return 2 // the original connection closed; a replacement is now live
+		}
+		return 1 // matches the permit's StreamGeneration, for the pre-claim check
+	}
+
+	prevClaim := claimUploadToken
+	t.Cleanup(func() { claimUploadToken = prevClaim })
+	claimUploadToken = func(token string) error {
+		reconnected = true // simulate a disconnect and reconnect during the claim round trip
+		h.mu.Lock()
+		h.claimed = append(h.claimed, token)
+		h.mu.Unlock()
+		return nil
+	}
+
+	w := doUpload(t, validTarGz(t))
+	if w.Code == http.StatusAccepted {
+		t.Fatalf("expected a refusal once the stream has reconnected before persistence, got 202")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.claimed) != 1 {
+		t.Errorf("claimed = %v, want exactly one claim (the token itself was still valid)", h.claimed)
+	}
+	if h.pushed {
+		t.Error("archive must not be pushed once the stream reconnected before persistence")
+	}
+	if h.cliStarted {
+		t.Error("build must not start once the stream reconnected before persistence")
+	}
+}
+
+// TestHandleCLIDeployUpload_SameStreamGenerationProceeds proves the
+// legitimate case for review finding 1169: when the control stream never
+// disconnects, the generation never changes, and the upload proceeds
+// exactly as it would have before this check existed.
+func TestHandleCLIDeployUpload_SameStreamGenerationProceeds(t *testing.T) {
+	h := &uploadHarness{
+		t:              t,
+		token:          scopedUploadToken(),
+		buildkitConfig: &agentstream.BuildKitConfig{},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), StreamGeneration: 42},
+	}
+	h.install()
+
+	prevGen := currentStreamGeneration
+	t.Cleanup(func() { currentStreamGeneration = prevGen })
+	currentStreamGeneration = func() uint64 { return 42 }
+
+	w := doUpload(t, validTarGz(t))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body %q)", w.Code, w.Body.String())
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.claimed) != 1 || !h.pushed || !h.cliStarted {
+		t.Fatalf("expected the same-generation upload to proceed: claimed=%v pushed=%v cliStarted=%v", h.claimed, h.pushed, h.cliStarted)
+	}
+}
+
 // TestHandleCLIDeployUpload_ScopedDenyRefusesWithoutAnyEffect pins AC4: a
 // denial must stop before persistence, with no claim, no push, no build.
 func TestHandleCLIDeployUpload_ScopedDenyRefusesWithoutAnyEffect(t *testing.T) {

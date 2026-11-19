@@ -64,6 +64,27 @@ func wrapResponse(jsonB64, tag string) *l2sec.ToClusterAgent {
 	return &l2sec.ToClusterAgent{Type: recheckResponseType, JsonB64: jsonB64, Tag: tag}
 }
 
+// TestRequestStageRecheck_CapturesCurrentStreamGeneration pins review
+// finding 1169: a validated response must carry the stream generation that
+// was current when it was received, so a caller can later detect a
+// disconnect/reconnect that happened since. The generation must reflect
+// whatever establishAndMaintainStream's real connect/disconnect
+// transitions have produced, not a value requestStageRecheckWith invents.
+func TestRequestStageRecheck_CapturesCurrentStreamGeneration(t *testing.T) {
+	authority := UploadAuthority(testBindingID, testUploadID)
+	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))
+	send, _ := fakeRequestResponse(t, wrapResponse(b64, "whatever"), nil)
+
+	wantGen := CurrentStreamGeneration()
+	resp, err := requestStageRecheckWith(context.Background(), send, authority, StageArchivePersist, testRetryID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StreamGeneration != wantGen {
+		t.Fatalf("StreamGeneration = %d, want the generation current at the time: %d", resp.StreamGeneration, wantGen)
+	}
+}
+
 func TestRequestStageRecheck_SendsExactEnvelope(t *testing.T) {
 	authority := UploadAuthority(testBindingID, testUploadID)
 	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))

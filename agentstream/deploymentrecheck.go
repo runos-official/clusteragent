@@ -254,6 +254,16 @@ type StageResponse struct {
 	PolicyVersion int64
 	IssuedAt      time.Time
 	ExpiresAt     time.Time
+
+	// StreamGeneration is CurrentStreamGeneration() captured at the moment
+	// this response was validated (review finding 1169). The request and
+	// this reply are correlated by tag on whichever stream was current at
+	// send time; a disconnect and reconnect between then and when a caller
+	// acts on the permit would otherwise be invisible, because the
+	// response payload itself carries no connection identity. A caller
+	// that compares this value against a fresh CurrentStreamGeneration()
+	// before acting on the permit detects that gap.
+	StreamGeneration uint64
 }
 
 // RequestStageRecheck sends one bounded, correlated recheck request over the
@@ -307,7 +317,17 @@ func requestStageRecheckWith(
 		return nil, fmt.Errorf("deployment stage recheck unavailable: %w", err)
 	}
 
-	return decodeStageResponse(reply, authority, stage, retryID)
+	resp, err := decodeStageResponse(reply, authority, stage, retryID)
+	if err != nil {
+		return nil, err
+	}
+	// Review finding 1169: capture the generation active right now, as this
+	// validated response is handed back. A caller that compares this
+	// against CurrentStreamGeneration() again before acting on the permit
+	// detects a disconnect/reconnect that happened in between, which the
+	// response payload itself has no way to carry.
+	resp.StreamGeneration = CurrentStreamGeneration()
+	return resp, nil
 }
 
 // decodeStageResponse validates the transport envelope, then the decoded

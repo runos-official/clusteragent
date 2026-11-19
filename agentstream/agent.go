@@ -34,6 +34,16 @@ var (
 	// body without failing the liveness probe (see webhook.HandleHealth): a
 	// disconnected agent is still alive and retrying, so it must not be killed.
 	streamConnected atomic.Bool
+
+	// streamGeneration increments on every control-stream transition:
+	// connect, disconnect, and reconnect (review finding 1169). globalStream
+	// is replaced wholesale on each transition and briefly set to nil on a
+	// disconnect, so it cannot itself serve as a stable identity to compare
+	// across time; the generation counter can. A caller that captured a
+	// generation value when it received a response can compare it later: a
+	// different value proves the stream has disconnected, reconnected, or
+	// both since, even if a replacement connection is live again by then.
+	streamGeneration atomic.Uint64
 )
 
 // StreamConnected reports whether the agent currently holds a live gRPC stream
@@ -41,6 +51,16 @@ var (
 // connection state without affecting liveness.
 func StreamConnected() bool {
 	return streamConnected.Load()
+}
+
+// CurrentStreamGeneration returns the control stream's current generation.
+// Compare a value captured earlier (for example, when a response was
+// received on the stream) against a later call's result: a difference
+// means the stream has disconnected, reconnected, or both in between
+// (review finding 1169), so anything that response authorized must be
+// treated as no longer bound to a live, unbroken connection.
+func CurrentStreamGeneration() uint64 {
+	return streamGeneration.Load()
 }
 
 type streamManager struct {
@@ -359,6 +379,7 @@ func (sm *streamManager) establishAndMaintainStream() error {
 	globalStream = stream
 	globalStreamMu.Unlock()
 	streamConnected.Store(true)
+	streamGeneration.Add(1)
 
 	// Run onConnect callback once
 	if onConnectCallback != nil {
@@ -385,6 +406,7 @@ func (sm *streamManager) establishAndMaintainStream() error {
 	// buffered errChan.
 	cancelStream()
 	streamConnected.Store(false)
+	streamGeneration.Add(1)
 	globalStreamMu.Lock()
 	globalStream = nil
 	globalStreamMu.Unlock()

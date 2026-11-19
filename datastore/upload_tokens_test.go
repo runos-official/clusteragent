@@ -137,6 +137,52 @@ func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically(t *testing.T) {
 	}
 }
 
+// TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically_AcrossTimezones pins
+// review finding 1203: the fix for finding 1128 must give the correct
+// answer regardless of the process's local timezone, not only on a UTC
+// host. Measured in this repository: the prior fix (a bare
+// "expires_at > CURRENT_TIMESTAMP" comparison on SQLite) refused a LIVE
+// token under America/New_York and admitted an EXPIRED token under
+// Europe/Berlin, because GORM stores a local-offset time.Time as text
+// while SQLite's CURRENT_TIMESTAMP is bare UTC text. This test sets
+// time.Local directly (not the TZ environment variable), so it proves the
+// property regardless of the environment it runs in, in both directions
+// (UTC+1 and UTC-5, plus the widest real offsets, UTC+14 and UTC-11).
+func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically_AcrossTimezones(t *testing.T) {
+	zones := []string{"Europe/Berlin", "America/New_York", "Pacific/Kiritimati", "Pacific/Niue"}
+	for _, zoneName := range zones {
+		t.Run(zoneName, func(t *testing.T) {
+			loc, err := time.LoadLocation(zoneName)
+			if err != nil {
+				t.Fatalf("time.LoadLocation(%q): %v", zoneName, err)
+			}
+			prevLocal := time.Local
+			time.Local = loc
+			t.Cleanup(func() { time.Local = prevLocal })
+
+			setupTestDB(t)
+
+			expiredRaw := "expired-token-" + zoneName
+			past := time.Now().Add(-1 * time.Minute)
+			if err := CreatePullToken(expiredRaw, "osid-1", "upload-exp", past); err != nil {
+				t.Fatalf("create expired token: %v", err)
+			}
+			if err := MarkUploadTokenUsed(expiredRaw); err == nil {
+				t.Fatalf("[%s] expected MarkUploadTokenUsed to refuse an already-expired token", zoneName)
+			}
+
+			liveRaw := "live-token-" + zoneName
+			future := time.Now().Add(5 * time.Minute)
+			if err := CreatePullToken(liveRaw, "osid-1", "upload-live", future); err != nil {
+				t.Fatalf("create live token: %v", err)
+			}
+			if err := MarkUploadTokenUsed(liveRaw); err != nil {
+				t.Fatalf("[%s] a non-expired token must still claim: %v", zoneName, err)
+			}
+		})
+	}
+}
+
 // TestUploadToken_DeleteExpired pins that expired tokens are swept and live ones
 // are retained.
 func TestUploadToken_DeleteExpired(t *testing.T) {
