@@ -309,6 +309,17 @@ func requestStageRecheckWith(
 	reqCtx, cancel := context.WithTimeout(ctx, recheckTimeout)
 	defer cancel()
 
+	// Review finding 1245 (repeat of 1169): sample the generation BEFORE the
+	// send, not after the reply is decoded. agent.go's reply delivery writes
+	// into a buffered, capacity-one tag channel and returns; a buffered
+	// value stays readable even after establishAndMaintainStream closes that
+	// channel on disconnect, so a reply legitimately sent on generation N
+	// can still be read successfully after the stream has already moved to
+	// generation N+1. Reading the generation only after that point would
+	// record N+1 - the POST-disconnect value - erasing the only signal that
+	// a disconnect happened at all.
+	genAtSend := CurrentStreamGeneration()
+
 	reply, err := send(reqCtx, &l2sec.FromClusterAgent{
 		Type:    recheckRequestType,
 		JsonB64: base64.StdEncoding.EncodeToString(payload),
@@ -321,12 +332,15 @@ func requestStageRecheckWith(
 	if err != nil {
 		return nil, err
 	}
-	// Review finding 1169: capture the generation active right now, as this
-	// validated response is handed back. A caller that compares this
-	// against CurrentStreamGeneration() again before acting on the permit
-	// detects a disconnect/reconnect that happened in between, which the
-	// response payload itself has no way to carry.
-	resp.StreamGeneration = CurrentStreamGeneration()
+	// If the generation moved at all between send and here, the reply may
+	// have been read from a buffer across a disconnect (or a reconnect)
+	// that happened while it was in flight: refuse rather than stamp a
+	// generation that can no longer prove which connection the decision was
+	// actually made for.
+	if CurrentStreamGeneration() != genAtSend {
+		return nil, fmt.Errorf("deployment stage recheck: control stream disconnected or reconnected while the reply was in flight")
+	}
+	resp.StreamGeneration = genAtSend
 	return resp, nil
 }
 

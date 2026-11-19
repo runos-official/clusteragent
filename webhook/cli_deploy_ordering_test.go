@@ -57,13 +57,14 @@ type uploadHarness struct {
 	recheckErr     error
 	pushErr        error
 
-	mu                 sync.Mutex
-	claimed            []string
-	claimErr           error
-	pushed             bool
-	cliStarted         bool
-	buildImgRun        bool
-	failedUploadJobIDs []string
+	mu                    sync.Mutex
+	claimed               []string
+	claimedPermitDeadline []*time.Time
+	claimErr              error
+	pushed                bool
+	cliStarted            bool
+	buildImgRun           bool
+	failedUploadJobIDs    []string
 }
 
 func (h *uploadHarness) install() {
@@ -99,13 +100,14 @@ func (h *uploadHarness) install() {
 		}
 		return h.token, nil
 	}
-	claimUploadToken = func(token string) error {
+	claimUploadToken = func(token string, permitDeadline *time.Time) error {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.claimErr != nil {
 			return h.claimErr
 		}
 		h.claimed = append(h.claimed, token)
+		h.claimedPermitDeadline = append(h.claimedPermitDeadline, permitDeadline)
 		return nil
 	}
 	readBuildKitConfig = func(context.Context) (*agentstream.BuildKitConfig, error) {
@@ -284,7 +286,7 @@ func TestHandleCLIDeployUpload_PermitExpiresDuringClaimRefusesBeforePersistence(
 
 	prevClaim := claimUploadToken
 	t.Cleanup(func() { claimUploadToken = prevClaim })
-	claimUploadToken = func(token string) error {
+	claimUploadToken = func(token string, _ *time.Time) error {
 		clockAdvanced = true // simulate the permit's deadline passing during the claim round trip
 		h.mu.Lock()
 		h.claimed = append(h.claimed, token)
@@ -341,7 +343,7 @@ func TestHandleCLIDeployUpload_StreamReconnectsDuringClaimRefusesBeforePersisten
 
 	prevClaim := claimUploadToken
 	t.Cleanup(func() { claimUploadToken = prevClaim })
-	claimUploadToken = func(token string) error {
+	claimUploadToken = func(token string, _ *time.Time) error {
 		reconnected = true // simulate a disconnect and reconnect during the claim round trip
 		h.mu.Lock()
 		h.claimed = append(h.claimed, token)
@@ -677,7 +679,7 @@ func TestHandleCLIDeployUpload_ConcurrentClaimRaceOnlyOnePersists(t *testing.T) 
 
 	var claimAttempts int
 	var mu sync.Mutex
-	claimUploadToken = func(string) error {
+	claimUploadToken = func(string, *time.Time) error {
 		mu.Lock()
 		defer mu.Unlock()
 		claimAttempts++

@@ -47,7 +47,7 @@ func HandleCLIPullDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := datastore.MarkUploadTokenUsed(token); err != nil {
+	if err := datastore.MarkUploadTokenUsed(token, nil); err != nil {
 		log.Printf("Failed to mark pull token as used: %v", err)
 		http.Error(w, "Token validation failed", http.StatusInternalServerError)
 		return

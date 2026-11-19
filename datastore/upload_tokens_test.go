@@ -84,10 +84,10 @@ func TestUploadToken_MarkUsedByRawToken(t *testing.T) {
 		t.Fatalf("CreatePullToken: %v", err)
 	}
 
-	if err := MarkUploadTokenUsed(raw); err != nil {
+	if err := MarkUploadTokenUsed(raw, nil); err != nil {
 		t.Fatalf("first MarkUploadTokenUsed: %v", err)
 	}
-	if err := MarkUploadTokenUsed(raw); err == nil {
+	if err := MarkUploadTokenUsed(raw, nil); err == nil {
 		t.Fatalf("second MarkUploadTokenUsed should fail (already used)")
 	}
 
@@ -116,7 +116,7 @@ func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically(t *testing.T) {
 	if err := CreatePullToken(expiredRaw, "osid-1", "upload-exp", past); err != nil {
 		t.Fatalf("create expired token: %v", err)
 	}
-	if err := MarkUploadTokenUsed(expiredRaw); err == nil {
+	if err := MarkUploadTokenUsed(expiredRaw, nil); err == nil {
 		t.Fatal("expected MarkUploadTokenUsed to refuse an already-expired token")
 	}
 	tok, err := GetPullToken(expiredRaw)
@@ -132,7 +132,7 @@ func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically(t *testing.T) {
 	if err := CreatePullToken(liveRaw, "osid-1", "upload-live", future); err != nil {
 		t.Fatalf("create live token: %v", err)
 	}
-	if err := MarkUploadTokenUsed(liveRaw); err != nil {
+	if err := MarkUploadTokenUsed(liveRaw, nil); err != nil {
 		t.Fatalf("a non-expired token must still claim: %v", err)
 	}
 }
@@ -167,7 +167,7 @@ func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically_AcrossTimezones(t *te
 			if err := CreatePullToken(expiredRaw, "osid-1", "upload-exp", past); err != nil {
 				t.Fatalf("create expired token: %v", err)
 			}
-			if err := MarkUploadTokenUsed(expiredRaw); err == nil {
+			if err := MarkUploadTokenUsed(expiredRaw, nil); err == nil {
 				t.Fatalf("[%s] expected MarkUploadTokenUsed to refuse an already-expired token", zoneName)
 			}
 
@@ -176,7 +176,7 @@ func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically_AcrossTimezones(t *te
 			if err := CreatePullToken(liveRaw, "osid-1", "upload-live", future); err != nil {
 				t.Fatalf("create live token: %v", err)
 			}
-			if err := MarkUploadTokenUsed(liveRaw); err != nil {
+			if err := MarkUploadTokenUsed(liveRaw, nil); err != nil {
 				t.Fatalf("[%s] a non-expired token must still claim: %v", zoneName, err)
 			}
 		})

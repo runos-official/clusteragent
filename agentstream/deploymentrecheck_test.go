@@ -85,6 +85,39 @@ func TestRequestStageRecheck_CapturesCurrentStreamGeneration(t *testing.T) {
 	}
 }
 
+// TestRequestStageRecheck_RefusesWhenGenerationMovesDuringSend pins review
+// finding 1245 (repeat of 1169): the prior fix sampled the generation AFTER
+// decoding the reply, which can already be the post-disconnect value if the
+// reply sat in agent.go's buffered, capacity-one tag channel across a
+// disconnect and reconnect - a close on a buffered channel does not discard
+// a value already written to it, so the read still succeeds. This models
+// that: the stream "disconnects" (the generation moves) while the reply is
+// in flight, inside the injected send, before requestStageRecheckWith ever
+// looks at the generation. The call must refuse, not return a permit
+// stamped with the generation it moved to.
+func TestRequestStageRecheck_RefusesWhenGenerationMovesDuringSend(t *testing.T) {
+	authority := UploadAuthority(testBindingID, testUploadID)
+	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))
+	reply := wrapResponse(b64, "whatever")
+
+	send := func(_ context.Context, _ *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
+		streamGeneration.Add(1)
+		return reply, nil
+	}
+
+	genBefore := CurrentStreamGeneration()
+	resp, err := requestStageRecheckWith(context.Background(), send, authority, StageArchivePersist, testRetryID)
+	if err == nil {
+		t.Fatalf("expected a refusal when the generation moved during the send, got permit %+v", resp)
+	}
+	if resp != nil {
+		t.Errorf("expected no response alongside the refusal")
+	}
+	if CurrentStreamGeneration() == genBefore {
+		t.Fatalf("test bug: the generation did not actually move")
+	}
+}
+
 func TestRequestStageRecheck_SendsExactEnvelope(t *testing.T) {
 	authority := UploadAuthority(testBindingID, testUploadID)
 	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))

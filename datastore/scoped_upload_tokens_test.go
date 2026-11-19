@@ -80,7 +80,7 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 			t.Fatalf("stored column %s contains a raw token or credential secret", name)
 		}
 	}
-	if err := MarkUploadTokenUsed(raw); err != nil {
+	if err := MarkUploadTokenUsed(raw, nil); err != nil {
 		t.Fatalf("MarkUploadTokenUsed: %v", err)
 	}
 	var after UploadTokenModel
@@ -345,7 +345,7 @@ func TestUploadToken_ConcurrentSingleUse(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results <- MarkUploadTokenUsed(raw)
+			results <- MarkUploadTokenUsed(raw, nil)
 		}()
 	}
 	wg.Wait()

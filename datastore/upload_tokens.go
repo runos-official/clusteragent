@@ -344,74 +344,148 @@ func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error 
 	}
 }
 
+// errTokenUnusable is returned by MarkUploadTokenUsed whenever the token
+// cannot be claimed, for any reason (not found, already used, token
+// expired, or permit expired): the caller-visible message deliberately
+// does not distinguish these, matching the generic refusal the HTTP layer
+// already builds around this call.
+var errTokenUnusable = fmt.Errorf("token not found, already used, or expired")
+
 // MarkUploadTokenUsed atomically marks a token (any purpose) as used, looked up
 // by the hash of the presented raw token. Returns error if the token doesn't
-// exist, is already used, or has expired.
+// exist, is already used, has expired, or - when the caller supplies one -
+// if permitDeadline has passed. permitDeadline is nil for every claim caller
+// with no separate, shorter-lived permit to enforce (the build-image upload,
+// the pull download, and an explicit legacy app upload); the scoped app
+// upload caller passes its fresh recheck permit's own ExpiresAt. There are
+// exactly three production claim callers (review finding 1239's derived
+// list, pinned by TestMarkUploadTokenUsedClaimCallSites_MatchExpectedShape):
+// webhook/cli_deploy_handler.go's claimUploadToken for the build-image
+// purpose (no permit), the same claimUploadToken for the scoped/legacy app
+// upload purpose (a permit only for the scoped classification), and
+// webhook/cli_pull_handler.go's direct call (no permit).
 //
-// The expiry check runs in the SAME atomic UPDATE as the used-state check
+// The expiry check runs in the SAME atomic claim as the used-state check
 // (review finding 1076): an earlier, separate expiry check (the kind the
 // upload handler does before reading the body) only proves the token was
 // valid AT THAT MOMENT. Body reads, tarball validation, the BuildKit
 // configuration read, and - for a scoped token - a network round trip to
-// Conductor/Roid can all take long enough for the token to expire before
-// the claim actually runs. Folding "AND expires_at > ..." into this single
-// UPDATE closes that window for every purpose and every classification,
-// legacy included, with no second query and no extra round trip.
+// Conductor/Roid can all take long enough for the token (or, for a scoped
+// upload, the fresh permit) to expire before the claim actually runs.
+// Folding both deadlines into this one claim closes that window for every
+// purpose and every classification, legacy included, with no second query
+// and no extra round trip.
 //
-// Review finding 1128 (repeat of 1076): a bound Go time.Now() parameter is
-// captured before the statement is sent, so a delay between that capture
-// and the UPDATE actually executing (lock wait, a slow write, a stalled
-// connection) can still let the row commit with used=true after the token's
-// real expiry. The comparison must instead be evaluated by the database AT
-// the moment this statement executes.
+// Review finding 1128 (repeat of 1076): a bound Go time.Now() parameter
+// captured before the statement is sent lets a delay between that capture
+// and the claim actually executing (lock wait, a slow write, a stalled
+// connection) commit the claim after the real deadline. The comparison must
+// instead be evaluated by the database AT the moment the claim executes.
 //
-// Review finding 1168 (repeat of 1128): CURRENT_TIMESTAMP is NOT that
-// moment on PostgreSQL. PostgreSQL documents CURRENT_TIMESTAMP (and NOW())
-// as fixed at TRANSACTION START, not at statement execution
-// (postgresql.org/docs/15/functions-datetime.html#FUNCTIONS-DATETIME-CURRENT).
-// A wait after the transaction starts and before this UPDATE actually takes
-// effect (lock contention, a slow write) can leave CURRENT_TIMESTAMP before
-// the real deadline even though wall-clock time has already passed it.
-// clock_timestamp() is PostgreSQL's true wall-clock function: it returns
-// the actual current time and is re-evaluated on every call, which is what
-// this comparison needs.
+// Review finding 1168 (repeat of 1128) and its repeats 1239/1244: on
+// PostgreSQL, folding clock_timestamp() into a single UPDATE's own WHERE
+// clause is still not "at the moment the claim executes". A plain UPDATE's
+// quals can be evaluated during the initial table scan, BEFORE the
+// statement blocks waiting for a conflicting row lock; if that lock is
+// released without the row's content actually changing (a lock held and
+// released, not a competing UPDATE - review finding 1239's "row locks that
+// leave the token row unchanged"), the executor has nothing to re-evaluate
+// once the wait ends and proceeds with the qual result computed BEFORE the
+// wait: a stale "not yet expired" clock_timestamp() value, even though real
+// wall-clock time has since passed the deadline. The fix separates locking
+// from evaluating: acquire the row lock in its own statement first
+// (SELECT ... FOR UPDATE, which blocks until the lock is granted and only
+// then returns the row), then read the database's wall clock in a second
+// statement, so both happen strictly after the wait - all inside one
+// transaction, so nothing else can touch the row in between. Finding 1244's
+// permit deadline is folded into that same post-lock comparison.
 //
-// Review finding 1203: SQLite has no clock_timestamp(), and mixing its
-// CURRENT_TIMESTAMP (bare UTC text) with a stored time.Time that carries a
-// non-UTC local offset (what a caller's un-normalized time.Now() produces)
-// compares as TEXT and is skewed by the host's UTC offset - measured in
-// this repository to fail in both directions off UTC. julianday() parses
-// either an offset-qualified or a bare timestamp into a real, comparable
-// instant, so wrapping both sides in julianday() compares actual instants
-// regardless of either side's textual timezone. SQLite is test-only here;
-// production always runs PostgreSQL (datastore/database.go).
-func MarkUploadTokenUsed(token string) error {
+// SQLite has no row-level locking: a write blocks at the whole-database
+// level before it can even begin, so there is no pre-wait qual to go stale,
+// and it keeps the simpler single-statement form. Review finding 1203:
+// SQLite has no clock_timestamp(), and mixing its CURRENT_TIMESTAMP (bare
+// UTC text) with a stored time.Time that carries a non-UTC local offset
+// (what a caller's un-normalized time.Now() produces) compares as TEXT and
+// is skewed by the host's UTC offset - measured in this repository to fail
+// in both directions off UTC. julianday() parses either an offset-qualified
+// or a bare timestamp into a real, comparable instant, so wrapping both
+// sides in julianday() compares actual instants regardless of either
+// side's textual timezone. SQLite is test-only here; production always
+// runs PostgreSQL (datastore/database.go).
+func MarkUploadTokenUsed(token string, permitDeadline *time.Time) error {
 	gdb, err := activeDB()
 	if err != nil {
 		return err
 	}
-	res := gdb.Model(&UploadTokenModel{}).
-		Where("token_hash = ? AND used = ? AND "+expiryStillValidClause(gdb), hashToken(token), false).
-		Update("used", true)
-	if res.Error != nil {
-		return res.Error
+	if gdb.Name() == "postgres" {
+		return markUploadTokenUsedPostgres(gdb, token, permitDeadline)
 	}
-	if res.RowsAffected == 0 {
-		return fmt.Errorf("token not found, already used, or expired")
+	return markUploadTokenUsedSQLite(gdb, token, permitDeadline)
+}
+
+// markUploadTokenUsedPostgres implements the lock-then-evaluate claim
+// described above. table is read once per call rather than cached,
+// matching UploadTokenModel's own TableName() (always the fixed
+// cluster_agent_upload_tokens, never request-dependent).
+func markUploadTokenUsedPostgres(gdb *gorm.DB, token string, permitDeadline *time.Time) error {
+	hashed := hashToken(token)
+	table := (UploadTokenModel{}).TableName()
+	txErr := gdb.Transaction(func(tx *gorm.DB) error {
+		var row struct {
+			ID        uint
+			Used      bool
+			ExpiresAt time.Time
+		}
+		// Blocks here until any existing lock on this row is released -
+		// whether or not the holder actually changed the row - and only
+		// returns the row once the lock is granted: the read below is
+		// strictly after that wait, not before it.
+		if err := tx.Raw(
+			"SELECT id, used, expires_at FROM "+table+" WHERE token_hash = ? FOR UPDATE",
+			hashed,
+		).Scan(&row).Error; err != nil {
+			return err
+		}
+		if row.ID == 0 {
+			return errTokenUnusable
+		}
+		var now time.Time
+		if err := tx.Raw("SELECT clock_timestamp()").Scan(&now).Error; err != nil {
+			return err
+		}
+		if row.Used || !now.Before(row.ExpiresAt) {
+			return errTokenUnusable
+		}
+		if permitDeadline != nil && !now.Before(*permitDeadline) {
+			return errTokenUnusable
+		}
+		return tx.Exec("UPDATE "+table+" SET used = true WHERE id = ?", row.ID).Error
+	})
+	if txErr != nil {
+		return errTokenUnusable
 	}
 	return nil
 }
 
-// expiryStillValidClause returns the dialect-specific SQL fragment that
-// compares expires_at against the database's real current instant,
-// evaluated at the moment the containing statement executes (review
-// findings 1168 and 1203). gdb.Name() reports the active dialect
-// ("postgres" in production, "sqlite" in tests).
-func expiryStillValidClause(gdb *gorm.DB) string {
-	if gdb.Name() == "postgres" {
-		return "expires_at > clock_timestamp()"
+// markUploadTokenUsedSQLite implements the claim with one statement:
+// SQLite's single-writer semantics mean a concurrent write blocks before it
+// can even start, so there is no pre-wait qual evaluation to go stale here
+// (see the function doc above).
+func markUploadTokenUsedSQLite(gdb *gorm.DB, token string, permitDeadline *time.Time) error {
+	clause := "token_hash = ? AND used = ? AND julianday(expires_at) > julianday('now')"
+	args := []any{hashToken(token), false}
+	if permitDeadline != nil {
+		clause += " AND julianday(?) > julianday('now')"
+		args = append(args, *permitDeadline)
 	}
-	return "julianday(expires_at) > julianday('now')"
+	res := gdb.Model(&UploadTokenModel{}).Where(clause, args...).Update("used", true)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errTokenUnusable
+	}
+	return nil
 }
 
 // DeleteExpiredUploadTokens removes tokens (any purpose) that have expired.

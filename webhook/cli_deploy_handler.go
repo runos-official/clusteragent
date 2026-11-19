@@ -67,6 +67,12 @@ var (
 	// used = false, so of any number of requests that reach this call for
 	// the same token, at most one succeeds. It must be the last call before
 	// an external mutation (archive persist or build start) on every path.
+	// permitDeadline is nil for the build-image and legacy app-upload
+	// paths; the scoped app-upload path passes its fresh recheck permit's
+	// own ExpiresAt, so the claim itself enforces that deadline too
+	// (review findings 1239/1244: the claim must not consume the token
+	// after the permit that authorized it has expired, even if the token's
+	// own, longer-lived expiry has not).
 	claimUploadToken = datastore.MarkUploadTokenUsed
 
 	// readBuildKitConfig loads the BuildKit/Harbor configuration. A single
@@ -247,8 +253,9 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Every available check has run: claim the token now, immediately
-		// before the first external effect (the build start).
-		if err := claimUploadToken(token); err != nil {
+		// before the first external effect (the build start). No permit
+		// deadline applies to a build-image token.
+		if err := claimUploadToken(token, nil); err != nil {
 			log.Printf("Token claim failed (concurrent consumption or already used): %v", err)
 			http.Error(w, "Token already used", http.StatusUnauthorized)
 			return
@@ -302,8 +309,17 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// scoped token: claim the token now, immediately before the first
 	// external mutation (the archive persist below). This is the
 	// concurrency boundary - of any number of requests that reach here for
-	// the same token, at most one claim succeeds.
-	if err := claimUploadToken(token); err != nil {
+	// the same token, at most one claim succeeds. For a scoped token the
+	// claim also enforces the permit's own deadline (review findings
+	// 1239/1244), evaluated by the database after the claim's row lock is
+	// held, not just by permitStillValid's Go-side checks on either side
+	// of this call; a legacy token carries no permit, so nil applies only
+	// the token's own expiry.
+	var permitDeadline *time.Time
+	if permit != nil {
+		permitDeadline = &permit.ExpiresAt
+	}
+	if err := claimUploadToken(token, permitDeadline); err != nil {
 		log.Printf("Token claim failed (concurrent consumption or already used): %v", err)
 		http.Error(w, "Token already used", http.StatusUnauthorized)
 		return
