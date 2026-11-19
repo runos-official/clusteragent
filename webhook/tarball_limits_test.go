@@ -80,3 +80,78 @@ func TestCheckTarballLimits(t *testing.T) {
 		t.Fatal("a body that is not a gzipped tarball must be refused")
 	}
 }
+
+// lowerTotalCap sets MaxTotalExtractedBytes to n for one test.
+func lowerTotalCap(t *testing.T, n int64) {
+	t.Helper()
+	orig := MaxTotalExtractedBytes
+	MaxTotalExtractedBytes = n
+	t.Cleanup(func() { MaxTotalExtractedBytes = orig })
+}
+
+// TestCheckTarballLimits_AggregateSize pins review finding 1078: the
+// preflight must also refuse on the TOTAL declared decompressed size, not
+// just each individual file, so the same decompression-bomb case
+// extractTarball catches during the (post-claim) asynchronous build is
+// instead caught here, before any claim or persistence. Each file here is
+// comfortably under the per-file cap; only the sum trips the guard.
+func TestCheckTarballLimits_AggregateSize(t *testing.T) {
+	lowerTotalCap(t, 15)
+
+	ok := buildTarGz(t, []tarEntry{
+		{name: "a.txt", typeflag: tar.TypeReg, body: "aaaaaaa"}, // 7
+		{name: "b.txt", typeflag: tar.TypeReg, body: "bbbbbbb"}, // 7, total 14 <= 15
+	})
+	if err := checkTarballLimits(ok); err != nil {
+		t.Fatalf("a tarball within the aggregate cap must pass: %v", err)
+	}
+
+	over := buildTarGz(t, []tarEntry{
+		{name: "a.txt", typeflag: tar.TypeReg, body: "aaaaaaa"},  // 7
+		{name: "b.txt", typeflag: tar.TypeReg, body: "bbbbbbbb"}, // 8, total 15... still boundary
+		{name: "c.txt", typeflag: tar.TypeReg, body: "c"},        // +1, total 16 > 15
+	})
+	err := checkTarballLimits(over)
+	if err == nil || !strings.Contains(err.Error(), "decompression bomb") {
+		t.Fatalf("err = %v, want a decompression-bomb refusal once the aggregate cap is exceeded", err)
+	}
+}
+
+// TestValidateDockerfileTarget pins review finding 1078: a configured
+// (non-default) Dockerfile target is validated against the tarball's own
+// entries before claim, the same traversal and existence rules
+// splitTarballDockerfile applies later against the extracted disk tree.
+func TestValidateDockerfileTarget(t *testing.T) {
+	data := buildTarGz(t, []tarEntry{
+		{name: "apps/api/Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+		{name: "not-a-file", typeflag: tar.TypeDir},
+	})
+
+	cases := []struct {
+		name          string
+		dockerfile    string
+		wantErrSubstr string
+	}{
+		{name: "empty input is BuildKit's default, not validated here", dockerfile: ""},
+		{name: "whitespace-only input is also the default", dockerfile: "   "},
+		{name: "present entry is accepted", dockerfile: "apps/api/Dockerfile"},
+		{name: "absolute path rejected", dockerfile: "/etc/passwd", wantErrSubstr: "must be relative"},
+		{name: "path escaping the tarball root rejected", dockerfile: "../../etc/passwd", wantErrSubstr: "escapes tarball root"},
+		{name: "missing entry rejected", dockerfile: "apps/api/Dockerfile.missing", wantErrSubstr: "not found inside tarball"},
+		{name: "directory at the configured path rejected", dockerfile: "not-a-file", wantErrSubstr: "not a regular file"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDockerfileTarget(data, tc.dockerfile)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Fatalf("err = %v, want it to contain %q", err, tc.wantErrSubstr)
+			}
+		})
+	}
+}

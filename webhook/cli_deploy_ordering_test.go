@@ -57,12 +57,13 @@ type uploadHarness struct {
 	recheckErr     error
 	pushErr        error
 
-	mu          sync.Mutex
-	claimed     []string
-	claimErr    error
-	pushed      bool
-	cliStarted  bool
-	buildImgRun bool
+	mu                 sync.Mutex
+	claimed            []string
+	claimErr           error
+	pushed             bool
+	cliStarted         bool
+	buildImgRun        bool
+	failedUploadJobIDs []string
 }
 
 func (h *uploadHarness) install() {
@@ -71,11 +72,23 @@ func (h *uploadHarness) install() {
 	prevLoad, prevClaim, prevConfig, prevRecheck, prevPush := loadUploadableToken, claimUploadToken, readBuildKitConfig, requestStageRecheck, pushArchive
 	prevCLI, prevBuildImg := startCLIDeploymentAsync, startBuildImageDeploymentAsync
 	prevBegin := beginWork
+	prevRecordFailed := recordFailedUpload
 	h.t.Cleanup(func() {
 		loadUploadableToken, claimUploadToken, readBuildKitConfig, requestStageRecheck, pushArchive = prevLoad, prevClaim, prevConfig, prevRecheck, prevPush
 		startCLIDeploymentAsync, startBuildImageDeploymentAsync = prevCLI, prevBuildImg
 		beginWork = prevBegin
+		recordFailedUpload = prevRecordFailed
 	})
+
+	// Review findings 1075/1086: a pre-claim refusal must never reserve the
+	// token's (fixed, retryable) uploadID as a build-job row. Track every
+	// call so tests can assert zero calls on a refusal.
+	recordFailedUpload = func(jobID, _, _ string) error {
+		h.mu.Lock()
+		h.failedUploadJobIDs = append(h.failedUploadJobIDs, jobID)
+		h.mu.Unlock()
+		return nil
+	}
 
 	beginWork = func() (func(), error) { return func() {}, nil }
 
@@ -139,6 +152,9 @@ func (h *uploadHarness) assertNoEffects(t *testing.T) {
 	if h.buildImgRun {
 		t.Error("build-image build was started on a refused request")
 	}
+	if len(h.failedUploadJobIDs) != 0 {
+		t.Errorf("a pre-claim refusal must not reserve a build-job row under the token's uploadID, got %v", h.failedUploadJobIDs)
+	}
 }
 
 func doUpload(t *testing.T, body []byte) *httptest.ResponseRecorder {
@@ -189,7 +205,7 @@ func TestHandleCLIDeployUpload_ScopedPermitClaimsAndProceeds(t *testing.T) {
 		t:              t,
 		token:          scopedUploadToken(),
 		buildkitConfig: &agentstream.BuildKitConfig{},
-		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok"},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)},
 	}
 	h.install()
 
@@ -343,6 +359,94 @@ func TestHandleCLIDeployUpload_ConfigReadFailureDoesNotClaimToken(t *testing.T) 
 	h.assertNoEffects(t)
 }
 
+// TestHandleCLIDeployUpload_InvalidDockerfileTargetDoesNotClaimToken pins
+// review finding 1078: a configured Dockerfile target that does not exist
+// in the tarball must refuse before claim, archive persist, or build
+// start - not only later, inside the asynchronous build.
+func TestHandleCLIDeployUpload_InvalidDockerfileTargetDoesNotClaimToken(t *testing.T) {
+	tok := legacyUploadToken()
+	tok.Dockerfile = "apps/api/Dockerfile" // validTarGz(t) only has a root "Dockerfile"
+	h := &uploadHarness{
+		t:              t,
+		token:          tok,
+		buildkitConfig: &agentstream.BuildKitConfig{},
+	}
+	h.install()
+
+	w := doUpload(t, validTarGz(t))
+	if w.Code == http.StatusAccepted {
+		t.Fatalf("expected a refusal, got 202")
+	}
+	h.assertNoEffects(t)
+}
+
+// TestHandleCLIDeployUpload_ConfiguredDockerfileTargetProceeds proves a
+// legitimate, present Dockerfile target still passes the new preflight
+// check (rework guidance: every new guard needs a legitimate-request test).
+func TestHandleCLIDeployUpload_ConfiguredDockerfileTargetProceeds(t *testing.T) {
+	tok := legacyUploadToken()
+	tok.Dockerfile = "Dockerfile" // matches validTarGz(t)'s root entry
+	h := &uploadHarness{
+		t:              t,
+		token:          tok,
+		buildkitConfig: &agentstream.BuildKitConfig{},
+	}
+	h.install()
+
+	w := doUpload(t, validTarGz(t))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body %q)", w.Code, w.Body.String())
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.claimed) != 1 || !h.pushed || !h.cliStarted {
+		t.Fatalf("expected the upload to proceed: claimed=%v pushed=%v cliStarted=%v", h.claimed, h.pushed, h.cliStarted)
+	}
+}
+
+// TestHandleCLIDeployUpload_RefusalThenRetryWithSameTokenSucceeds is the
+// direct regression for review findings 1075/1086: before the fix, a
+// pre-claim refusal (here, a transient config-read error) called failUpload,
+// which reserved a build-job row under the token's fixed uploadID via a
+// unique index. The token was never claimed, so a legitimate second request
+// with the SAME token must still succeed end to end - claim, push, and
+// build - which it cannot do if the first refusal already poisoned that
+// uploadID's job row.
+func TestHandleCLIDeployUpload_RefusalThenRetryWithSameTokenSucceeds(t *testing.T) {
+	h := &uploadHarness{
+		t:              t,
+		token:          legacyUploadToken(),
+		buildkitConfig: &agentstream.BuildKitConfig{},
+		configErr:      context.DeadlineExceeded,
+	}
+	h.install()
+
+	// First attempt: transient config-read failure, refused before claim.
+	w1 := doUpload(t, validTarGz(t))
+	if w1.Code == http.StatusAccepted {
+		t.Fatalf("expected the first attempt to be refused, got 202")
+	}
+	h.assertNoEffects(t)
+
+	// Second attempt, same token: the transient failure is gone now.
+	h.configErr = nil
+	w2 := doUpload(t, validTarGz(t))
+	if w2.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 on the retry (body %q)", w2.Code, w2.Body.String())
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.claimed) != 1 {
+		t.Errorf("claimed = %v, want exactly one claim on the retry", h.claimed)
+	}
+	if !h.pushed || !h.cliStarted {
+		t.Error("expected the retry to push the archive and start the build")
+	}
+	if len(h.failedUploadJobIDs) != 0 {
+		t.Errorf("the refused first attempt must not have reserved a build-job row, got %v", h.failedUploadJobIDs)
+	}
+}
+
 // TestHandleCLIDeployUpload_ConcurrentClaimRaceOnlyOnePersists pins AC5:
 // "Concurrent consumption cannot bypass single-use binding." Both requests
 // pass every check and receive a permit; only the first claim may succeed,
@@ -352,7 +456,7 @@ func TestHandleCLIDeployUpload_ConcurrentClaimRaceOnlyOnePersists(t *testing.T) 
 		t:              t,
 		token:          scopedUploadToken(),
 		buildkitConfig: &agentstream.BuildKitConfig{},
-		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok"},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)},
 	}
 	h.install()
 

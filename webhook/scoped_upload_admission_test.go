@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/runos-official/clusteragent/agentstream"
 	"github.com/runos-official/clusteragent/datastore"
@@ -29,9 +30,12 @@ func TestAdmitScopedUpload_MissingBindingFailsClosed(t *testing.T) {
 	}
 	t.Cleanup(func() { requestStageRecheck = prev })
 
-	refusal := admitScopedUpload(context.Background(), nil)
+	resp, refusal := admitScopedUpload(context.Background(), nil)
 	if refusal == nil {
 		t.Fatal("expected a refusal for a missing binding")
+	}
+	if resp != nil {
+		t.Error("expected no permit response alongside a refusal")
 	}
 	if refusal.status != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", refusal.status)
@@ -59,8 +63,12 @@ func TestAdmitScopedUpload_Permit(t *testing.T) {
 	t.Cleanup(func() { requestStageRecheck = prev })
 
 	binding := testBinding()
-	if refusal := admitScopedUpload(context.Background(), binding); refusal != nil {
+	resp, refusal := admitScopedUpload(context.Background(), binding)
+	if refusal != nil {
 		t.Fatalf("expected permit (nil refusal), got status=%d reason=%q", refusal.status, refusal.reason)
+	}
+	if resp == nil {
+		t.Fatal("expected the permit response to be returned alongside a nil refusal")
 	}
 	want := agentstream.UploadAuthority(binding.BindingID, binding.UploadID)
 	if gotAuthority != want {
@@ -96,9 +104,12 @@ func TestAdmitScopedUpload_RefusesEveryNonPermitOutcome(t *testing.T) {
 			requestStageRecheck = func(context.Context, agentstream.RecheckAuthority, agentstream.RecheckStage, string) (*agentstream.StageResponse, error) {
 				return c.resp, c.err
 			}
-			refusal := admitScopedUpload(context.Background(), testBinding())
+			permit, refusal := admitScopedUpload(context.Background(), testBinding())
 			if refusal == nil {
 				t.Fatal("expected a refusal")
+			}
+			if permit != nil {
+				t.Error("expected no permit response alongside a refusal")
 			}
 			if refusal.status != c.wantStatus {
 				t.Errorf("status = %d, want %d", refusal.status, c.wantStatus)
@@ -141,5 +152,33 @@ func TestVerifyBuildImageHarborIdentity(t *testing.T) {
 				t.Fatalf("expected no refusal, got status=%d reason=%q", refusal.status, refusal.reason)
 			}
 		})
+	}
+}
+
+// TestPermitStillValid pins review finding 1076's "carry the proof deadline
+// to the archive boundary": the permit's own ExpiresAt must be re-checked
+// right before the claim, not discarded once admission succeeds. A permit
+// still inside its window continues; one whose deadline has passed by the
+// time the claim boundary is reached refuses, even though admission already
+// returned a permit earlier.
+func TestPermitStillValid(t *testing.T) {
+	prevClock := permitClock
+	t.Cleanup(func() { permitClock = prevClock })
+
+	deadline := time.Date(2026, 1, 1, 0, 0, 5, 0, time.UTC)
+	resp := &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, ExpiresAt: deadline}
+
+	permitClock = func() time.Time { return deadline.Add(-1 * time.Millisecond) }
+	if refusal := permitStillValid(resp); refusal != nil {
+		t.Fatalf("a permit still inside its window must pass, got status=%d reason=%q", refusal.status, refusal.reason)
+	}
+
+	permitClock = func() time.Time { return deadline.Add(1 * time.Millisecond) }
+	refusal := permitStillValid(resp)
+	if refusal == nil {
+		t.Fatal("expected a refusal once the permit's own deadline has passed")
+	}
+	if refusal.status != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", refusal.status)
 	}
 }

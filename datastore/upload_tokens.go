@@ -346,20 +346,30 @@ func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error 
 
 // MarkUploadTokenUsed atomically marks a token (any purpose) as used, looked up
 // by the hash of the presented raw token. Returns error if the token doesn't
-// exist or is already used.
+// exist, is already used, or has expired.
+//
+// The expiry check runs in the SAME atomic UPDATE as the used-state check
+// (review finding 1076): an earlier, separate expiry check (the kind the
+// upload handler does before reading the body) only proves the token was
+// valid AT THAT MOMENT. Body reads, tarball validation, the BuildKit
+// configuration read, and - for a scoped token - a network round trip to
+// Conductor/Roid can all take long enough for the token to expire before
+// the claim actually runs. Folding "AND expires_at > now" into this single
+// UPDATE closes that window for every purpose and every classification,
+// legacy included, with no second query and no extra round trip.
 func MarkUploadTokenUsed(token string) error {
 	gdb, err := activeDB()
 	if err != nil {
 		return err
 	}
 	res := gdb.Model(&UploadTokenModel{}).
-		Where("token_hash = ? AND used = ?", hashToken(token), false).
+		Where("token_hash = ? AND used = ? AND expires_at > ?", hashToken(token), false, time.Now()).
 		Update("used", true)
 	if res.Error != nil {
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
-		return fmt.Errorf("token not found or already used")
+		return fmt.Errorf("token not found, already used, or expired")
 	}
 	return nil
 }

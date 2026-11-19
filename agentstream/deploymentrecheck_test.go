@@ -329,6 +329,95 @@ func TestRequestStageRecheck_RejectsLifetimeOverFiveSeconds(t *testing.T) {
 	}
 }
 
+// TestRequestStageRecheck_ClockSkewNeverExtendsLifetimeOrExpiry pins review
+// finding 1076: handbook 963 caps proof lifetime at exactly five seconds and
+// says clock skew never extends authority expiry. The skew allowance applies
+// only to judging issuedAt against the local clock. A lifetime or a
+// staleness just inside the old (buggy) skew-extended ceiling must now
+// refuse.
+func TestRequestStageRecheck_ClockSkewNeverExtendsLifetimeOrExpiry(t *testing.T) {
+	authority := UploadAuthority(testBindingID, testUploadID)
+
+	t.Run("lifetime 500ms over 5s refuses even though it was under the old 6s ceiling", func(t *testing.T) {
+		now := time.Now().UTC()
+		payload := map[string]any{
+			"version": stageResponseVersion, "authority": authority, "stage": StageArchivePersist,
+			"retryId": testRetryID, "requestId": testRequestID, "outcome": "permit", "code": "ok",
+			"decisionId": "d1", "policyVersion": 1,
+			"issuedAt":  now.Format(time.RFC3339Nano),
+			"expiresAt": now.Add(5500 * time.Millisecond).Format(time.RFC3339Nano),
+		}
+		raw, _ := json.Marshal(payload)
+		b64 := base64.StdEncoding.EncodeToString(raw)
+		send, _ := fakeRequestResponse(t, &l2sec.ToClusterAgent{Type: recheckResponseType, JsonB64: b64}, nil)
+
+		_, err := requestStageRecheckWith(context.Background(), send, authority, StageArchivePersist, testRetryID)
+		if err == nil {
+			t.Fatal("expected refusal: lifetime exceeds the exact five-second ceiling")
+		}
+	})
+
+	t.Run("expired 500ms ago refuses even though it was inside the old 1s skew grace", func(t *testing.T) {
+		now := time.Now().UTC()
+		payload := map[string]any{
+			"version": stageResponseVersion, "authority": authority, "stage": StageArchivePersist,
+			"retryId": testRetryID, "requestId": testRequestID, "outcome": "permit", "code": "ok",
+			"decisionId": "d1", "policyVersion": 1,
+			"issuedAt":  now.Add(-4500 * time.Millisecond).Format(time.RFC3339Nano),
+			"expiresAt": now.Add(-500 * time.Millisecond).Format(time.RFC3339Nano),
+		}
+		raw, _ := json.Marshal(payload)
+		b64 := base64.StdEncoding.EncodeToString(raw)
+		send, _ := fakeRequestResponse(t, &l2sec.ToClusterAgent{Type: recheckResponseType, JsonB64: b64}, nil)
+
+		_, err := requestStageRecheckWith(context.Background(), send, authority, StageArchivePersist, testRetryID)
+		if err == nil {
+			t.Fatal("expected refusal: already expired, clock skew must not extend expiry")
+		}
+	})
+
+	t.Run("issuedAt far in the future refuses", func(t *testing.T) {
+		now := time.Now().UTC()
+		payload := map[string]any{
+			"version": stageResponseVersion, "authority": authority, "stage": StageArchivePersist,
+			"retryId": testRetryID, "requestId": testRequestID, "outcome": "permit", "code": "ok",
+			"decisionId": "d1", "policyVersion": 1,
+			"issuedAt":  now.Add(10 * time.Second).Format(time.RFC3339Nano),
+			"expiresAt": now.Add(14 * time.Second).Format(time.RFC3339Nano),
+		}
+		raw, _ := json.Marshal(payload)
+		b64 := base64.StdEncoding.EncodeToString(raw)
+		send, _ := fakeRequestResponse(t, &l2sec.ToClusterAgent{Type: recheckResponseType, JsonB64: b64}, nil)
+
+		_, err := requestStageRecheckWith(context.Background(), send, authority, StageArchivePersist, testRetryID)
+		if err == nil {
+			t.Fatal("expected refusal: issuedAt in the future beyond the allowed clock skew")
+		}
+	})
+
+	t.Run("a legitimate response at the exact boundary still succeeds", func(t *testing.T) {
+		now := time.Now().UTC()
+		payload := map[string]any{
+			"version": stageResponseVersion, "authority": authority, "stage": StageArchivePersist,
+			"retryId": testRetryID, "requestId": testRequestID, "outcome": "permit", "code": "ok",
+			"decisionId": "d1", "policyVersion": 1,
+			"issuedAt":  now.Format(time.RFC3339Nano),
+			"expiresAt": now.Add(5 * time.Second).Format(time.RFC3339Nano), // exactly the 5s ceiling
+		}
+		raw, _ := json.Marshal(payload)
+		b64 := base64.StdEncoding.EncodeToString(raw)
+		send, _ := fakeRequestResponse(t, &l2sec.ToClusterAgent{Type: recheckResponseType, JsonB64: b64}, nil)
+
+		resp, err := requestStageRecheckWith(context.Background(), send, authority, StageArchivePersist, testRetryID)
+		if err != nil {
+			t.Fatalf("a legitimate, in-window permit must still succeed: %v", err)
+		}
+		if resp.Outcome != OutcomePermit {
+			t.Fatalf("outcome = %q, want permit", resp.Outcome)
+		}
+	})
+}
+
 func TestRequestStageRecheck_TransportFailureIsUnavailable(t *testing.T) {
 	authority := UploadAuthority(testBindingID, testUploadID)
 	send, _ := fakeRequestResponse(t, nil, errors.New("boom"))

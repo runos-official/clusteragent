@@ -347,14 +347,26 @@ func decodeStageResponse(reply *l2sec.ToClusterAgent, wantAuthority RecheckAutho
 		return nil, fmt.Errorf("deployment stage recheck: invalid response requestId")
 	}
 
+	// Handbook 963: "Proof lifetime cannot exceed five seconds. Allow
+	// one-second clock skew for proof validation. Clock skew never extends
+	// authority expiry." Review finding 1076: the published ceiling is
+	// exactly recheckProofLifetime, and expiry is a hard deadline that skew
+	// must never push back - skew is allowed only when judging issuedAt
+	// against the local clock, never added to the lifetime cap or to
+	// expiresAt. The prior version added recheckClockSkew to both,
+	// accepting a proof that was already stale by up to one second and a
+	// lifetime one second over the published cap.
 	now := time.Now()
 	if !decoded.ExpiresAt.After(decoded.IssuedAt) {
 		return nil, fmt.Errorf("deployment stage recheck: response expiresAt must follow issuedAt")
 	}
-	if decoded.ExpiresAt.Sub(decoded.IssuedAt) > recheckProofLifetime+recheckClockSkew {
-		return nil, fmt.Errorf("deployment stage recheck: response lifetime exceeds the published ceiling")
+	if decoded.ExpiresAt.Sub(decoded.IssuedAt) > recheckProofLifetime {
+		return nil, fmt.Errorf("deployment stage recheck: response lifetime exceeds the published five-second ceiling")
 	}
-	if now.After(decoded.ExpiresAt.Add(recheckClockSkew)) {
+	if decoded.IssuedAt.After(now.Add(recheckClockSkew)) {
+		return nil, fmt.Errorf("deployment stage recheck: response issuedAt is in the future beyond the allowed clock skew")
+	}
+	if now.After(decoded.ExpiresAt) {
 		return nil, fmt.Errorf("deployment stage recheck: response is stale or already expired")
 	}
 

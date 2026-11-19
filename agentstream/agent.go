@@ -471,6 +471,15 @@ func SendToServer(msg *l2sec.FromClusterAgent) error {
 	return sendOnStream(stream, msg)
 }
 
+// sendMu serializes every Send call on the stream. gRPC does not allow
+// concurrent Send calls on the same ClientStream; the heartbeat ticker and
+// any instruction reply or outbound request (including a deployment stage
+// recheck) otherwise race here with no ordering guarantee (review finding
+// 1077). The agent has exactly one active bidi stream at a time - a
+// reconnect replaces globalStream wholesale - so one mutex for the whole
+// package is the stream's own serialization point.
+var sendMu sync.Mutex
+
 // sendOnStream sends msg on one given stream.
 func sendOnStream(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent], msg *l2sec.FromClusterAgent) error {
 	if stream == nil {
@@ -481,7 +490,9 @@ func sendOnStream(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.
 		msg.Tag = uuid.New().String()
 	}
 
+	sendMu.Lock()
 	err := stream.Send(msg)
+	sendMu.Unlock()
 	if err != nil {
 		log.Printf("Error sending message to server: %v", err)
 		return err
@@ -610,8 +621,25 @@ func sendAndWait(ctx context.Context, send func(*l2sec.FromClusterAgent) error, 
 	pendingResponses.Store(tagID.String(), responseChan)
 	defer pendingResponses.Delete(tagID.String())
 
-	if err := send(msg); err != nil {
-		return nil, fmt.Errorf("failed to send message: %w", err)
+	// Review finding 1077: send used to run synchronously and unbounded by
+	// ctx. gRPC flow control can stall stream.Send past any caller deadline
+	// (RequestStageRecheck's five-second ceiling included), so a stalled
+	// sender used to block the whole call well past its own timeout. Run it
+	// in a goroutine and race it against ctx here too, not only in the
+	// reply wait below, so a bounded deadline is actually bounded. If ctx
+	// wins, the deferred pendingResponses.Delete above still runs and the
+	// send goroutine, if it later succeeds, writes into sendDone with
+	// nobody left to read it - a harmless buffered write, not a leak.
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- send(msg) }()
+
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			return nil, fmt.Errorf("failed to send message: %w", err)
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
 	select {

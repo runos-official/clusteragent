@@ -24,9 +24,13 @@ const (
 	NodeAgentTLSSecret    = "node-agent-tls"
 )
 
-// K8sClient provides a wrapper for Kubernetes client operations
+// K8sClient provides a wrapper for Kubernetes client operations. The field
+// is the kubernetes.Interface a real *kubernetes.Clientset satisfies, not
+// the concrete type, so tests can substitute client-go's fake Clientset
+// (review finding 1074's regression needs this to exercise a torn
+// ConfigMap/Secret read without a live cluster).
 type K8sClient struct {
-	clientset *kubernetes.Clientset
+	clientset kubernetes.Interface
 }
 
 // NewK8sClient creates a new Kubernetes client using in-cluster config
@@ -253,33 +257,58 @@ type BuildKitConfig struct {
 	HarborOsid string
 }
 
-// GetBuildKitConfig retrieves configuration from buildkit ConfigMap and Secret
+// GetBuildKitConfig retrieves configuration from the buildkit ConfigMap and
+// Secret.
+//
+// Conductor writes them as two separate, non-atomic Kubernetes API calls
+// (ensureBuildConfig.ts: ensureConfigMap, then ensureSecret) whenever it
+// provisions or repairs the build config, including a Harbor retarget. A
+// single pass of two independent Get calls can therefore observe a torn
+// pairing mid-write: the endpoint (ConfigMap's harbor-url/harbor-core-url)
+// already naming the replacement Harbor while the identity and credentials
+// (Secret's harbor-osid/harbor-username/harbor-password) still name the
+// original one, or vice versa (review finding 1074). Reading twice and
+// requiring every field to agree detects that in-flight write and refuses
+// rather than silently trusting an inconsistent pairing - the Harbor
+// identity comparison at upload (criterion 6(b)) is only as trustworthy as
+// the single coherent configuration revision it is compared against.
 func (c *K8sClient) GetBuildKitConfig(ctx context.Context) (*BuildKitConfig, error) {
-	// Get ConfigMap
+	first, err := c.readBuildKitConfigOnce(ctx)
+	if err != nil {
+		return nil, err
+	}
+	second, err := c.readBuildKitConfigOnce(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if *first != *second {
+		return nil, fmt.Errorf("buildkit configuration changed between reads; refusing an inconsistent ConfigMap/Secret pairing")
+	}
+	return second, nil
+}
+
+func (c *K8sClient) readBuildKitConfigOnce(ctx context.Context) (*BuildKitConfig, error) {
 	cm, err := c.clientset.CoreV1().ConfigMaps(Namespace).Get(ctx, "buildkit", metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ConfigMap buildkit: %w", err)
 	}
 
-	// Get Secret
 	secret, err := c.clientset.CoreV1().Secrets(Namespace).Get(ctx, "buildkit", metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Secret buildkit: %w", err)
 	}
 
-	config := &BuildKitConfig{
+	return &BuildKitConfig{
 		HarborURL:      cm.Data["harbor-url"],
 		HarborCoreURL:  cm.Data["harbor-core-url"],
 		ClusterDomain:  cm.Data["cluster-domain"],
 		HarborUsername: string(secret.Data["harbor-username"]),
 		HarborPassword: string(secret.Data["harbor-password"]),
 		HarborOsid:     string(secret.Data["harbor-osid"]),
-	}
-
-	return config, nil
+	}, nil
 }
 
 // GetClientset returns the underlying Kubernetes clientset
-func (c *K8sClient) GetClientset() *kubernetes.Clientset {
+func (c *K8sClient) GetClientset() kubernetes.Interface {
 	return c.clientset
 }

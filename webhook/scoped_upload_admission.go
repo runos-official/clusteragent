@@ -4,11 +4,19 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/runos-official/clusteragent/agentstream"
 	"github.com/runos-official/clusteragent/datastore"
 )
+
+// permitClock is the injected clock admitScopedUpload and its caller use to
+// judge a permit's own expiry. A package var so tests can simulate time
+// passing between the permit being granted and the claim boundary without
+// a real sleep (plan: "Inject the clock and recheck client for
+// deterministic tests").
+var permitClock = time.Now
 
 // requestStageRecheck is the injected fresh-decision client (story 338): one
 // bounded, correlated request per call over the authenticated control
@@ -46,39 +54,55 @@ func unavailableUpload(reason string) *uploadRefusal {
 // admitScopedUpload performs the scoped admission sequence's authoritative
 // step: ask Conductor/Roid for a current, correlated archive-persist
 // decision bound to the stored binding, and accept only an exact current
-// permit. It never claims the token and never persists anything; the caller
-// does that only when this returns nil. Every other outcome - deny, needs,
-// unavailable, or a transport/validation error (malformed reply, wrong
-// binding, stale or replayed proof, disconnect, timeout) - refuses, fails
-// closed, and carries no detail the caller could use to enumerate another
-// account, cluster, app, binding, or credential.
-func admitScopedUpload(ctx context.Context, binding *datastore.UploadAuthorityBinding) *uploadRefusal {
+// permit. It never claims the token and never persists anything; the
+// returned response's ExpiresAt is the permit's own deadline, which the
+// caller must still hold at the claim boundary (review finding 1076: a
+// permit's five-second deadline is real and must be enforced again right
+// before the first mutation, not discarded once admission succeeds).
+// Every other outcome - deny, needs, unavailable, or a transport/validation
+// error (malformed reply, wrong binding, stale or replayed proof,
+// disconnect, timeout) - refuses, fails closed, and carries no detail the
+// caller could use to enumerate another account, cluster, app, binding, or
+// credential.
+func admitScopedUpload(ctx context.Context, binding *datastore.UploadAuthorityBinding) (*agentstream.StageResponse, *uploadRefusal) {
 	if binding == nil {
 		// A scoped classification with no stored binding is a storage
 		// invariant violation, not a legacy token (plan "Legacy behavior":
 		// "A missing binding on a scoped classification is invalid, not
 		// legacy"). Fail closed rather than falling back to legacy
 		// authorization.
-		return unavailableUpload("scoped token has no stored authorization binding")
+		return nil, unavailableUpload("scoped token has no stored authorization binding")
 	}
 
 	retryID := uuid.New().String()
 	authority := agentstream.UploadAuthority(binding.BindingID, binding.UploadID)
 	resp, err := requestStageRecheck(ctx, authority, agentstream.StageArchivePersist, retryID)
 	if err != nil {
-		return unavailableUpload(fmt.Sprintf("deployment stage recheck unavailable: %v", err))
+		return nil, unavailableUpload(fmt.Sprintf("deployment stage recheck unavailable: %v", err))
 	}
 
 	switch resp.Outcome {
 	case agentstream.OutcomePermit:
-		return nil
+		return resp, nil
 	case agentstream.OutcomeDeny, agentstream.OutcomeNeeds:
-		return forbiddenUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
+		return nil, forbiddenUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
 	default:
 		// agentstream already rejects any outcome value it doesn't know, so
 		// the only value left here is OutcomeUnavailable.
-		return unavailableUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
+		return nil, unavailableUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
 	}
+}
+
+// permitStillValid re-checks a granted permit's own deadline immediately
+// before the claim boundary (review finding 1076: "Carry the proof deadline
+// to the archive boundary"). Time can pass between admitScopedUpload
+// returning and the handler reaching the atomic claim; this closes that gap
+// without a second network round trip.
+func permitStillValid(resp *agentstream.StageResponse) *uploadRefusal {
+	if permitClock().After(resp.ExpiresAt) {
+		return unavailableUpload("permit expired before the claim boundary")
+	}
+	return nil
 }
 
 // verifyBuildImageHarborIdentity implements story 338 criterion 6(b): before

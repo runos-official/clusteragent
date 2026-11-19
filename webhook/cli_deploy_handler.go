@@ -193,9 +193,21 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Refuse a tarball over the extraction limits now, with the reason,
 	// instead of answering 202 and failing the build later (FCR 1631). Still
-	// before any claim: a tarball refusal must not burn the token.
+	// before any claim: a tarball refusal must not burn the token. No
+	// failUpload here (findings 1075/1086): the token is unclaimed, so its
+	// uploadID stays valid for a legitimate retry, and failUpload's build
+	// row would permanently reserve that uploadID's unique job_id.
 	if err := checkTarballLimits(tarballData); err != nil {
-		failUpload(w, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
+		refuseUpload(w, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("%v", err), fmt.Sprintf("Upload refused: %v", err))
+		return
+	}
+
+	// Review finding 1078: the aggregate decompressed-size cap and the
+	// configured Dockerfile target must be checked here too, before claim,
+	// not only during the (post-claim) asynchronous extraction and build.
+	// Scans the same in-memory tarball bytes without extracting to disk.
+	if err := validateDockerfileTarget(tarballData, uploadToken.Dockerfile); err != nil {
+		refuseUpload(w, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("%v", err), fmt.Sprintf("Upload refused: %v", err))
 		return
 	}
 
@@ -205,7 +217,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	buildkitConfig, err := readBuildKitConfig(ctx)
 	if err != nil {
-		failUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("Internal error: load build configuration: %v", err))
+		refuseUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("load build configuration: %v", err), fmt.Sprintf("Internal error: load build configuration: %v", err))
 		return
 	}
 
@@ -227,8 +239,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		// now - the same read the push below will use, not a second one -
 		// before the build starts and before any push.
 		if refusal := verifyBuildImageHarborIdentity(uploadToken.BuildTarget.HarborOsid, buildkitConfig.HarborOsid); refusal != nil {
-			log.Printf("build-image upload refused before token claim (repo=%s, uploadID=%s): %s", repo, uploadID, refusal.reason)
-			failUpload(w, repo, uploadID, refusal.status, refusal.message)
+			refuseUpload(w, repo, uploadID, refusal.status, refusal.reason, refusal.message)
 			return
 		}
 
@@ -253,19 +264,32 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// historical authorization (story 338: no scoped-to-legacy fallback,
 	// and a missing binding on a scoped classification fails closed rather
 	// than falling back to legacy).
+	var permit *agentstream.StageResponse
 	switch uploadToken.AuthorizationClassification {
 	case datastore.AuthorizationScoped:
-		if refusal := admitScopedUpload(ctx, uploadToken.AuthorizationBinding); refusal != nil {
-			log.Printf("Scoped upload refused before token claim (osid=%s, uploadID=%s): %s", osid, uploadID, refusal.reason)
-			failUpload(w, osid, uploadID, refusal.status, refusal.message)
+		var refusal *uploadRefusal
+		permit, refusal = admitScopedUpload(ctx, uploadToken.AuthorizationBinding)
+		if refusal != nil {
+			refuseUpload(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
 			return
 		}
 	case datastore.AuthorizationLegacy:
 		// Explicit legacy compatibility: no recheck, by design.
 	default:
-		log.Printf("Upload refused before token claim (osid=%s, uploadID=%s): unknown authorization classification %q", osid, uploadID, uploadToken.AuthorizationClassification)
-		failUpload(w, osid, uploadID, http.StatusServiceUnavailable, "Upload temporarily unavailable, retry shortly")
+		refuseUpload(w, osid, uploadID, http.StatusServiceUnavailable, fmt.Sprintf("unknown authorization classification %q", uploadToken.AuthorizationClassification), "Upload temporarily unavailable, retry shortly")
 		return
+	}
+
+	// Review finding 1076: a scoped permit's own five-second deadline is
+	// real and must still hold at the claim boundary, not just at the
+	// moment the decision was received. Body reads, tarball validation, and
+	// the configuration read all happened before the recheck, so the only
+	// gap left is this one re-check immediately before the claim.
+	if permit != nil {
+		if refusal := permitStillValid(permit); refusal != nil {
+			refuseUpload(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+			return
+		}
 	}
 
 	// Every available check has run, including the fresh decision for a
@@ -665,7 +689,7 @@ func ProcessBuildAndDeploy(ctx context.Context, k8sClient *agentstream.K8sClient
 }
 
 // patchDeploymentImage updates the deployment's container image with retry logic
-func patchDeploymentImage(ctx context.Context, clientset *kubernetes.Clientset, osid, imageTag string) error {
+func patchDeploymentImage(ctx context.Context, clientset kubernetes.Interface, osid, imageTag string) error {
 	const (
 		maxRetries    = 60
 		retryInterval = 5 * time.Second

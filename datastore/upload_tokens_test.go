@@ -100,6 +100,43 @@ func TestUploadToken_MarkUsedByRawToken(t *testing.T) {
 	}
 }
 
+// TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically pins review finding
+// 1076: the atomic claim itself must enforce expiry, not just an earlier,
+// separate check. A token already past its expires_at must refuse the
+// claim even though it is otherwise unused - closing the window where body
+// reads, tarball validation, a config read, or a scoped recheck round trip
+// consume enough time for the token to expire between an earlier check and
+// the actual claim. A token that is NOT expired must still claim normally
+// (a legitimate request must still pass).
+func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically(t *testing.T) {
+	setupTestDB(t)
+
+	const expiredRaw = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	past := time.Now().Add(-1 * time.Minute)
+	if err := CreatePullToken(expiredRaw, "osid-1", "upload-exp", past); err != nil {
+		t.Fatalf("create expired token: %v", err)
+	}
+	if err := MarkUploadTokenUsed(expiredRaw); err == nil {
+		t.Fatal("expected MarkUploadTokenUsed to refuse an already-expired token")
+	}
+	tok, err := GetPullToken(expiredRaw)
+	if err != nil {
+		t.Fatalf("GetPullToken: %v", err)
+	}
+	if tok.Used {
+		t.Fatal("an expired token must not be left marked used by the refused claim")
+	}
+
+	const liveRaw = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	future := time.Now().Add(5 * time.Minute)
+	if err := CreatePullToken(liveRaw, "osid-1", "upload-live", future); err != nil {
+		t.Fatalf("create live token: %v", err)
+	}
+	if err := MarkUploadTokenUsed(liveRaw); err != nil {
+		t.Fatalf("a non-expired token must still claim: %v", err)
+	}
+}
+
 // TestUploadToken_DeleteExpired pins that expired tokens are swept and live ones
 // are retained.
 func TestUploadToken_DeleteExpired(t *testing.T) {
