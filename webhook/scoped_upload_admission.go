@@ -28,26 +28,40 @@ var requestStageRecheck = agentstream.RequestStageRecheck
 // before the atomic token claim. status and message are what the caller
 // sees; message is deliberately generic (plan "Refusal behavior": never
 // reveal whether another account, cluster, app, binding, or credential
-// exists). reason is the detailed cause, for logs only.
+// exists). reason is the detailed cause, for logs only. terminal says
+// whether retrying with the SAME token could plausibly help (review
+// finding 1133): a denial or a step-up condition will not change on retry,
+// but an outage, a transport error, or a timeout might.
 type uploadRefusal struct {
-	status  int
-	message string
-	reason  string
+	status   int
+	message  string
+	reason   string
+	terminal bool
 }
 
+// forbiddenUpload builds a terminal (403) refusal: an authoritative denial
+// or step-up condition. Retrying the same request will not change this
+// outcome, so the caller's uploadID gets a recorded, pollable reason
+// (review finding 1133).
 func forbiddenUpload(reason string) *uploadRefusal {
 	return &uploadRefusal{
-		status:  http.StatusForbidden,
-		message: "Upload refused",
-		reason:  reason,
+		status:   http.StatusForbidden,
+		message:  "Upload refused",
+		reason:   reason,
+		terminal: true,
 	}
 }
 
+// unavailableUpload builds a retryable (503) refusal: an outage, a
+// transport error, or a timeout. The token stays unclaimed and no build
+// row is recorded, so a legitimate retry with the same token is never
+// blocked by this attempt (review findings 1075/1086).
 func unavailableUpload(reason string) *uploadRefusal {
 	return &uploadRefusal{
-		status:  http.StatusServiceUnavailable,
-		message: "Upload temporarily unavailable, retry shortly",
-		reason:  reason,
+		status:   http.StatusServiceUnavailable,
+		message:  "Upload temporarily unavailable, retry shortly",
+		reason:   reason,
+		terminal: false,
 	}
 }
 
@@ -93,14 +107,17 @@ func admitScopedUpload(ctx context.Context, binding *datastore.UploadAuthorityBi
 	}
 }
 
-// permitStillValid re-checks a granted permit's own deadline immediately
-// before the claim boundary (review finding 1076: "Carry the proof deadline
-// to the archive boundary"). Time can pass between admitScopedUpload
-// returning and the handler reaching the atomic claim; this closes that gap
-// without a second network round trip.
+// permitStillValid re-checks a granted permit's own deadline (review
+// finding 1076/1128: "Carry the proof deadline to the archive boundary" /
+// "Check the permit again at the start of archive persistence"). Time can
+// pass between admitScopedUpload returning and the handler reaching the
+// atomic claim, and again between the claim and the archive push; this
+// closes both gaps without a second network round trip. Equality counts as
+// expired (finding 1128: "Treat equality with expiresAt as expired") - a
+// permit is valid only strictly before its own deadline.
 func permitStillValid(resp *agentstream.StageResponse) *uploadRefusal {
-	if permitClock().After(resp.ExpiresAt) {
-		return unavailableUpload("permit expired before the claim boundary")
+	if !permitClock().Before(resp.ExpiresAt) {
+		return unavailableUpload("permit expired at the claim or persistence boundary")
 	}
 	return nil
 }

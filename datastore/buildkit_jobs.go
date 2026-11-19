@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // BuildKitJob represents a build job record returned to callers. The JSON tags
@@ -46,7 +47,18 @@ func (m BuildKitJobModel) toDTO() BuildKitJob {
 	}
 }
 
-// CreateBuildKitJob creates a new build job record
+// CreateBuildKitJob creates a new build job record, or re-opens an existing
+// one under the same job_id as a fresh pending row (review finding 1133).
+//
+// job_id carries a unique index, and the webhook upload handler now calls
+// this (via recordFailedUpload/failUpload) for a TERMINAL pre-claim refusal
+// - one where the token stays unclaimed and a legitimate retry with the
+// same token (and so the same uploadID/job_id) is expected. A plain INSERT
+// would fail that retry's own CreateBuildKitJob call with a duplicate-key
+// error once a build actually starts. Upserting resets status, clears
+// completed_at, and bumps updated_at, so the retry's row looks exactly like
+// a fresh pending job; created_at is left untouched so the row's original
+// first-seen time survives.
 func CreateBuildKitJob(jobID, osid, repo, branch, commitHash string) error {
 	gdb, err := activeDB()
 	if err != nil {
@@ -60,7 +72,18 @@ func CreateBuildKitJob(jobID, osid, repo, branch, commitHash string) error {
 		CommitHash: commitHash,
 		Status:     JobStatusPending,
 	}
-	return gdb.Create(&job).Error
+	return gdb.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "job_id"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"osid":         osid,
+			"repo":         repo,
+			"branch":       branch,
+			"commit_hash":  commitHash,
+			"status":       JobStatusPending,
+			"completed_at": nil,
+			"updated_at":   gorm.Expr("CURRENT_TIMESTAMP"),
+		}),
+	}).Create(&job).Error
 }
 
 // UpdateBuildKitJobStatus updates the status of a build job

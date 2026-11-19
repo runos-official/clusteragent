@@ -354,16 +354,25 @@ func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error 
 // valid AT THAT MOMENT. Body reads, tarball validation, the BuildKit
 // configuration read, and - for a scoped token - a network round trip to
 // Conductor/Roid can all take long enough for the token to expire before
-// the claim actually runs. Folding "AND expires_at > now" into this single
+// the claim actually runs. Folding "AND expires_at > ..." into this single
 // UPDATE closes that window for every purpose and every classification,
 // legacy included, with no second query and no extra round trip.
+//
+// Review finding 1128 (repeat of 1076): a bound Go time.Now() parameter is
+// captured before the statement is sent, so a delay between that capture
+// and the UPDATE actually executing (lock wait, a slow write, a stalled
+// connection) can still let the row commit with used=true after the token's
+// real expiry. CURRENT_TIMESTAMP is a bare SQL token, not a bound
+// parameter, so the comparison is evaluated by the database AT the moment
+// this statement executes, closing that gap for real rather than narrowing
+// it. Supported identically by PostgreSQL (production) and SQLite (tests).
 func MarkUploadTokenUsed(token string) error {
 	gdb, err := activeDB()
 	if err != nil {
 		return err
 	}
 	res := gdb.Model(&UploadTokenModel{}).
-		Where("token_hash = ? AND used = ? AND expires_at > ?", hashToken(token), false, time.Now()).
+		Where("token_hash = ? AND used = ? AND expires_at > CURRENT_TIMESTAMP", hashToken(token), false).
 		Update("used", true)
 	if res.Error != nil {
 		return res.Error

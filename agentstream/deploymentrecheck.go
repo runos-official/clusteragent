@@ -366,7 +366,9 @@ func decodeStageResponse(reply *l2sec.ToClusterAgent, wantAuthority RecheckAutho
 	if decoded.IssuedAt.After(now.Add(recheckClockSkew)) {
 		return nil, fmt.Errorf("deployment stage recheck: response issuedAt is in the future beyond the allowed clock skew")
 	}
-	if now.After(decoded.ExpiresAt) {
+	// Review finding 1128: "Treat equality with expiresAt as expired." A
+	// proof is fresh only strictly before its own deadline.
+	if !now.Before(decoded.ExpiresAt) {
 		return nil, fmt.Errorf("deployment stage recheck: response is stale or already expired")
 	}
 

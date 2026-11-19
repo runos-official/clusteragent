@@ -193,12 +193,14 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Refuse a tarball over the extraction limits now, with the reason,
 	// instead of answering 202 and failing the build later (FCR 1631). Still
-	// before any claim: a tarball refusal must not burn the token. No
-	// failUpload here (findings 1075/1086): the token is unclaimed, so its
-	// uploadID stays valid for a legitimate retry, and failUpload's build
-	// row would permanently reserve that uploadID's unique job_id.
+	// before any claim: a tarball refusal must not burn the token. This is a
+	// TERMINAL refusal (review finding 1133): the same tarball will fail
+	// the same way on every retry, so Conductor's deploy job needs a
+	// recorded, pollable reason (FCR 744) rather than waiting out its whole
+	// poll budget. failUpload's row is upsert-safe, so a later retry with a
+	// fixed tarball and the SAME token/uploadID still claims and builds.
 	if err := checkTarballLimits(tarballData); err != nil {
-		refuseUpload(w, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("%v", err), fmt.Sprintf("Upload refused: %v", err))
+		failUpload(w, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
 		return
 	}
 
@@ -206,8 +208,9 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// configured Dockerfile target must be checked here too, before claim,
 	// not only during the (post-claim) asynchronous extraction and build.
 	// Scans the same in-memory tarball bytes without extracting to disk.
+	// Also terminal (finding 1133): same reasoning as the tarball check.
 	if err := validateDockerfileTarget(tarballData, uploadToken.Dockerfile); err != nil {
-		refuseUpload(w, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("%v", err), fmt.Sprintf("Upload refused: %v", err))
+		failUpload(w, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err))
 		return
 	}
 
@@ -239,7 +242,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		// now - the same read the push below will use, not a second one -
 		// before the build starts and before any push.
 		if refusal := verifyBuildImageHarborIdentity(uploadToken.BuildTarget.HarborOsid, buildkitConfig.HarborOsid); refusal != nil {
-			refuseUpload(w, repo, uploadID, refusal.status, refusal.reason, refusal.message)
+			reportUploadRefusal(w, repo, uploadID, refusal)
 			return
 		}
 
@@ -270,7 +273,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		var refusal *uploadRefusal
 		permit, refusal = admitScopedUpload(ctx, uploadToken.AuthorizationBinding)
 		if refusal != nil {
-			refuseUpload(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+			reportUploadRefusal(w, osid, uploadID, refusal)
 			return
 		}
 	case datastore.AuthorizationLegacy:
@@ -284,10 +287,13 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// real and must still hold at the claim boundary, not just at the
 	// moment the decision was received. Body reads, tarball validation, and
 	// the configuration read all happened before the recheck, so the only
-	// gap left is this one re-check immediately before the claim.
+	// gap left before the claim is this one re-check. This is still a
+	// PRE-claim refusal (the token stays unclaimed), so it goes through the
+	// terminal/retryable dispatch like any other (finding 1133: unavailable
+	// outcomes are retryable).
 	if permit != nil {
 		if refusal := permitStillValid(permit); refusal != nil {
-			refuseUpload(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+			reportUploadRefusal(w, osid, uploadID, refusal)
 			return
 		}
 	}
@@ -301,6 +307,20 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Token claim failed (concurrent consumption or already used): %v", err)
 		http.Error(w, "Token already used", http.StatusUnauthorized)
 		return
+	}
+
+	// Review finding 1128: "Check the permit again at the start of archive
+	// persistence." The claim itself is a datastore round trip and can take
+	// long enough for even the permit's own short deadline to pass between
+	// the pre-claim check above and this point. The token is ALREADY
+	// claimed by now regardless of this outcome, so - unlike the pre-claim
+	// check - this is unconditionally terminal: no retry with this token
+	// is possible any more, and Conductor's poller needs a recorded reason.
+	if permit != nil {
+		if refusal := permitStillValid(permit); refusal != nil {
+			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+			return
+		}
 	}
 
 	log.Printf("Received CLI deploy upload: %d bytes for osid=%s, uploadID=%s, token=%s...", len(tarballData), osid, uploadID, token[:8])

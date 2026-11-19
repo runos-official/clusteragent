@@ -80,9 +80,10 @@ func (h *uploadHarness) install() {
 		recordFailedUpload = prevRecordFailed
 	})
 
-	// Review findings 1075/1086: a pre-claim refusal must never reserve the
-	// token's (fixed, retryable) uploadID as a build-job row. Track every
-	// call so tests can assert zero calls on a refusal.
+	// Review findings 1075/1086/1133: a RETRYABLE pre-claim refusal must
+	// never reserve the token's (fixed, retryable) uploadID as a
+	// build-job row, but a TERMINAL one must record exactly one. Track
+	// every call so tests can assert either shape.
 	recordFailedUpload = func(jobID, _, _ string) error {
 		h.mu.Lock()
 		h.failedUploadJobIDs = append(h.failedUploadJobIDs, jobID)
@@ -136,7 +137,7 @@ func (h *uploadHarness) install() {
 	}
 }
 
-func (h *uploadHarness) assertNoEffects(t *testing.T) {
+func (h *uploadHarness) assertNoClaimPushOrBuild(t *testing.T) {
 	t.Helper()
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -152,8 +153,32 @@ func (h *uploadHarness) assertNoEffects(t *testing.T) {
 	if h.buildImgRun {
 		t.Error("build-image build was started on a refused request")
 	}
+}
+
+// assertNoEffects is for a RETRYABLE refusal (review findings 1075/1086): no
+// claim/push/build, and no build-job row - a row here would poison a later
+// legitimate retry with the same token/uploadID.
+func (h *uploadHarness) assertNoEffects(t *testing.T) {
+	t.Helper()
+	h.assertNoClaimPushOrBuild(t)
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if len(h.failedUploadJobIDs) != 0 {
-		t.Errorf("a pre-claim refusal must not reserve a build-job row under the token's uploadID, got %v", h.failedUploadJobIDs)
+		t.Errorf("a retryable refusal must not reserve a build-job row under the token's uploadID, got %v", h.failedUploadJobIDs)
+	}
+}
+
+// assertTerminalRefusal is for a TERMINAL refusal (review finding 1133): no
+// claim/push/build, but exactly one recorded build-job row under the
+// token's uploadID, so Conductor's deploy job gets a pollable reason
+// instead of waiting out its whole poll budget (FCR 744).
+func (h *uploadHarness) assertTerminalRefusal(t *testing.T) {
+	t.Helper()
+	h.assertNoClaimPushOrBuild(t)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.failedUploadJobIDs) != 1 {
+		t.Errorf("a terminal refusal must record exactly one build-job row, got %v", h.failedUploadJobIDs)
 	}
 }
 
@@ -226,6 +251,67 @@ func TestHandleCLIDeployUpload_ScopedPermitClaimsAndProceeds(t *testing.T) {
 	}
 }
 
+// TestHandleCLIDeployUpload_PermitExpiresDuringClaimRefusesBeforePersistence
+// pins review finding 1128's "Check the permit again at the start of
+// archive persistence": the permit is valid when checked before the claim,
+// but the claim itself (a datastore round trip) takes long enough for the
+// permit's own short deadline to pass. The token's own expiry is
+// unaffected (it is still claimed, correctly, since the permit's deadline
+// is a separate and much shorter window), but the re-check right before
+// the push must still catch the now-expired permit and refuse: no archive
+// push, no build start. Because the token is already claimed by then, this
+// is unconditionally terminal (one recorded row), unlike the pre-claim
+// permit check.
+func TestHandleCLIDeployUpload_PermitExpiresDuringClaimRefusesBeforePersistence(t *testing.T) {
+	deadline := time.Now().Add(2 * time.Second)
+	h := &uploadHarness{
+		t:              t,
+		token:          scopedUploadToken(),
+		buildkitConfig: &agentstream.BuildKitConfig{},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: deadline},
+	}
+	h.install()
+
+	prevClock := permitClock
+	t.Cleanup(func() { permitClock = prevClock })
+	var clockAdvanced bool
+	permitClock = func() time.Time {
+		if clockAdvanced {
+			return deadline.Add(1 * time.Second) // past the permit's deadline
+		}
+		return deadline.Add(-1 * time.Second) // still valid, for the pre-claim check
+	}
+
+	prevClaim := claimUploadToken
+	t.Cleanup(func() { claimUploadToken = prevClaim })
+	claimUploadToken = func(token string) error {
+		clockAdvanced = true // simulate the permit's deadline passing during the claim round trip
+		h.mu.Lock()
+		h.claimed = append(h.claimed, token)
+		h.mu.Unlock()
+		return nil
+	}
+
+	w := doUpload(t, validTarGz(t))
+	if w.Code == http.StatusAccepted {
+		t.Fatalf("expected a refusal once the permit expires before persistence, got 202")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.claimed) != 1 {
+		t.Errorf("claimed = %v, want exactly one claim (the token itself was still valid)", h.claimed)
+	}
+	if h.pushed {
+		t.Error("archive must not be pushed once the permit expired before persistence")
+	}
+	if h.cliStarted {
+		t.Error("build must not start once the permit expired before persistence")
+	}
+	if len(h.failedUploadJobIDs) != 1 {
+		t.Errorf("expected exactly one recorded row (the token is already claimed, so this is terminal), got %v", h.failedUploadJobIDs)
+	}
+}
+
 // TestHandleCLIDeployUpload_ScopedDenyRefusesWithoutAnyEffect pins AC4: a
 // denial must stop before persistence, with no claim, no push, no build.
 func TestHandleCLIDeployUpload_ScopedDenyRefusesWithoutAnyEffect(t *testing.T) {
@@ -241,7 +327,10 @@ func TestHandleCLIDeployUpload_ScopedDenyRefusesWithoutAnyEffect(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (body %q)", w.Code, w.Body.String())
 	}
-	h.assertNoEffects(t)
+	// A denial is terminal (review finding 1133): retrying the same request
+	// will not change the outcome, so Conductor's deploy job needs a
+	// pollable reason instead of waiting out its whole poll budget.
+	h.assertTerminalRefusal(t)
 }
 
 // TestHandleCLIDeployUpload_ScopedOutageRefusesWithoutAnyEffect pins AC4's
@@ -339,7 +428,9 @@ func TestHandleCLIDeployUpload_TarballLimitFailureDoesNotClaimToken(t *testing.T
 	if w.Code == http.StatusAccepted {
 		t.Fatalf("expected a refusal, got 202")
 	}
-	h.assertNoEffects(t)
+	// Terminal (review finding 1133): the same tarball fails the same way
+	// on every retry, so Conductor's deploy job needs a pollable reason.
+	h.assertTerminalRefusal(t)
 }
 
 // TestHandleCLIDeployUpload_ConfigReadFailureDoesNotClaimToken: the same
@@ -377,7 +468,9 @@ func TestHandleCLIDeployUpload_InvalidDockerfileTargetDoesNotClaimToken(t *testi
 	if w.Code == http.StatusAccepted {
 		t.Fatalf("expected a refusal, got 202")
 	}
-	h.assertNoEffects(t)
+	// Terminal (review finding 1133): the same tarball/Dockerfile pairing
+	// fails the same way on every retry.
+	h.assertTerminalRefusal(t)
 }
 
 // TestHandleCLIDeployUpload_ConfiguredDockerfileTargetProceeds proves a
@@ -444,6 +537,46 @@ func TestHandleCLIDeployUpload_RefusalThenRetryWithSameTokenSucceeds(t *testing.
 	}
 	if len(h.failedUploadJobIDs) != 0 {
 		t.Errorf("the refused first attempt must not have reserved a build-job row, got %v", h.failedUploadJobIDs)
+	}
+}
+
+// TestHandleCLIDeployUpload_TerminalRefusalThenFixedRetrySucceeds pins
+// review finding 1133's own closure test: a TERMINAL refusal (here, a
+// tarball over the per-file cap) records a build-job row under the token's
+// uploadID. A second attempt with the SAME token and uploadID, now with a
+// tarball that passes, must still claim, push, and start its build - the
+// recorded row from the first attempt must not block it. The datastore
+// package's own test proves CreateBuildKitJob's upsert handles the real
+// unique-index collision; this test proves the handler drives that retry
+// correctly end to end.
+func TestHandleCLIDeployUpload_TerminalRefusalThenFixedRetrySucceeds(t *testing.T) {
+	h := &uploadHarness{
+		t:              t,
+		token:          legacyUploadToken(),
+		buildkitConfig: &agentstream.BuildKitConfig{},
+	}
+	h.install()
+
+	origMaxFile := MaxFileSize
+	MaxFileSize = 1
+	w1 := doUpload(t, validTarGz(t))
+	MaxFileSize = origMaxFile
+	if w1.Code == http.StatusAccepted {
+		t.Fatalf("expected the first attempt to be refused, got 202")
+	}
+	h.assertTerminalRefusal(t)
+
+	w2 := doUpload(t, validTarGz(t))
+	if w2.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 on the fixed retry (body %q)", w2.Code, w2.Body.String())
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.claimed) != 1 {
+		t.Errorf("claimed = %v, want exactly one claim on the retry", h.claimed)
+	}
+	if !h.pushed || !h.cliStarted {
+		t.Error("expected the fixed retry to push the archive and start the build")
 	}
 }
 
@@ -516,7 +649,9 @@ func TestHandleCLIDeployUpload_BuildImageHarborMismatchRefusesNoBuildNoPush(t *t
 	if w.Code == http.StatusAccepted {
 		t.Fatalf("expected a refusal, got 202")
 	}
-	h.assertNoEffects(t)
+	// Terminal (review finding 1133): a Harbor mismatch fails the same way
+	// on every retry against this configuration.
+	h.assertTerminalRefusal(t)
 }
 
 // TestHandleCLIDeployUpload_BuildImageHarborConfigMissingRefuses pins
@@ -533,7 +668,9 @@ func TestHandleCLIDeployUpload_BuildImageHarborConfigMissingRefuses(t *testing.T
 	if w.Code == http.StatusAccepted {
 		t.Fatalf("expected a refusal, got 202")
 	}
-	h.assertNoEffects(t)
+	// Terminal (review finding 1133): a missing Harbor identity fails the
+	// same way on every retry against this configuration.
+	h.assertTerminalRefusal(t)
 }
 
 // TestHandleCLIDeployUpload_BuildImageHarborMatchProceeds: the configuration
