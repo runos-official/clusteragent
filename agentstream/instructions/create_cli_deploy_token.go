@@ -53,6 +53,12 @@ type CreateCLIDeployTokenRequest struct {
 	// Omission without a binding preserves the historical legacy request.
 	AuthorizationClassification string                            `json:"authorizationClassification,omitempty"`
 	AuthorizationBinding        *datastore.UploadAuthorityBinding `json:"authorizationBinding,omitempty"`
+	// DurableJobID (story 339) is Conductor's durable job-authority id
+	// (handbook 949 C3's "job: jobId" stage authority) for the deploy this
+	// upload belongs to: a SIBLING of AuthorizationBinding, never stored
+	// inside it (the binding's own jobId must stay null). Required when
+	// AuthorizationClassification is scoped; ignored for a legacy request.
+	DurableJobID string `json:"durableJobId,omitempty"`
 }
 
 // CreateCLIDeployTokenResponse holds the response after creating a token
@@ -192,7 +198,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 		}
 		storeErr = createBuildImageToken(token, uploadID, req.Repo, req.Tags, req.HarborOsid, req.Dockerfile, req.BuildArgs, expiresAt)
 	} else if authorization == datastore.AuthorizationScoped {
-		storeErr = createScopedUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt, *req.AuthorizationBinding)
+		storeErr = createScopedUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt, *req.AuthorizationBinding, req.DurableJobID)
 	} else {
 		storeErr = createUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt)
 	}

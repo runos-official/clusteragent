@@ -110,6 +110,61 @@ persist and build start that follow are not retried or rolled back by this
 layer; a later deployment stage rechecks authority again before its own
 mutation.
 
+### Recheck before queued build/deploy stages
+
+Archive persistence is not the only mutation a CLI or VCS deploy performs.
+After an upload is admitted (or, for VCS, before anything is cloned), the
+agent asks for a fresh, current permit again at every later stage that
+changes something: queue admission (creating the build job row and
+starting the asynchronous work), build start (creating the BuildKit pod and
+pushing the image), and deployment patch (the first Kubernetes deployment
+update). A standalone build (`apps build`, and every app-less `build_image`
+upload) stops after build start and never requests a deployment-patch
+permit.
+
+Every one of these later stages uses a **job** authority
+(`agentstream.JobAuthority`), never the upload binding's `bindingId`/
+`uploadId`: a durable, non-secret job id that the control plane assigns
+before the first stage recheck for that job and that the agent carries
+forward, unchanged, through every later stage for the same job. For a CLI
+deploy the durable job id travels on `CREATE_CLI_DEPLOY_TOKEN`'s
+`durableJobId` field, stored on the token row as a sibling of the upload
+binding (never inside it - the upload binding's own `jobId` stays `null`).
+For a VCS deploy it travels on `VCS_FETCH_SOURCE` and `VCS_BUILD`'s
+`conductorJobId` field, a sibling of the existing `sha`/`jobId` fields,
+never a repurposing of either: `VcsBuildRequest.JobID` keeps its pre-story
+meaning (the commit SHA, used only for the BuildKit row's display id and
+image tag) and is never treated as authority. `VCS_FETCH_SOURCE` binds the
+durable job id (and the scoped/legacy classification) to its workdir cache
+entry; `VCS_BUILD` must present the exact same values again, or it refuses
+without creating a job row - a cache entry from a different job, app, or
+source identity can never satisfy a different request.
+
+A build job row (`cluster_agent_buildkit_jobs`) persists an explicit
+`authorization_classification` (`legacy` by default) and a non-secret
+`authority_job_id`, exactly as the upload-token table persists its own
+binding. Both are set once, at row creation, and are immutable afterwards:
+a status update or the startup/restart cleanup below changes only status,
+timestamps, and the failure log, never this attribution. An existing
+pre-story row migrates to explicit `legacy`.
+
+Queue admission is requested, and must permit, **before** the build job row
+is created at all: a refusal leaves no job row and starts no asynchronous
+work, so a scoped upload's already-pushed archive remains the only
+completed effect for that attempt. A later stage's refusal (build start,
+deployment patch) is unconditionally terminal for that job - the row
+already exists by then - and marks it failed with one generic, non-secret
+reason. Nothing is retried or rolled back once a stage's own mutation has
+begun: a revocation after a build starts does not delete the pod or image
+it already produced, and a revocation after the first Kubernetes update
+attempt does not promise a rollback. The next stage always needs its own
+fresh decision; no permit from an earlier stage, job, or retry authorizes
+a later one. A VCS retry of the same commit always mints a fresh BuildKit
+row id and therefore always requests fresh decisions - there is no cached
+permit to replay. An explicit `legacy` job never calls any of these
+rechecks, at any stage, matching the upload path's own no-fallback rule in
+both directions.
+
 ### Build-image registry identity
 
 A `build_image` token can carry `harborOsid`: the Harbor service identity the

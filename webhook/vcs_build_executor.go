@@ -38,16 +38,18 @@ func RunVcsBuild(input instructions.VcsBuildExecutorInput) {
 	}
 
 	ProcessBuildAndDeploy(ctx, k8sClient, BuildAndDeployInput{
-		Workdir:            input.Workdir,
-		OSID:               input.OSID,
-		JobID:              input.JobID,
-		Tag:                input.SHA,
-		ContextPath:        input.ContextPath,
-		DockerfileDir:      input.DockerfileDir,
-		DockerfileFilename: input.DockerfileFilename,
-		BuildArgs:          input.BuildArgs,
-		BuildOnly:          input.BuildOnly,
-		Repo:               input.Repo,
-		Branch:             input.Branch,
+		Workdir:                     input.Workdir,
+		OSID:                        input.OSID,
+		JobID:                       input.JobID,
+		Tag:                         input.SHA,
+		ContextPath:                 input.ContextPath,
+		DockerfileDir:               input.DockerfileDir,
+		DockerfileFilename:          input.DockerfileFilename,
+		BuildArgs:                   input.BuildArgs,
+		BuildOnly:                   input.BuildOnly,
+		Repo:                        input.Repo,
+		Branch:                      input.Branch,
+		AuthorizationClassification: input.AuthorizationClassification,
+		AuthorityJobID:              input.AuthorityJobID,
 	}, buildkitConfig)
 }

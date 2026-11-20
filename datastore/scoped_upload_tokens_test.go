@@ -47,7 +47,8 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	binding := testUploadAuthorityBinding(now)
 	const raw = "scoped-upload-token-fixture"
 
-	if err := CreateScopedUploadToken(raw, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding); err != nil {
+	const durableJobID = "00000000-0000-4000-8000-000000000004"
+	if err := CreateScopedUploadToken(raw, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err != nil {
 		t.Fatalf("CreateScopedUploadToken: %v", err)
 	}
 
@@ -57,6 +58,9 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	}
 	if got.AuthorizationClassification != AuthorizationScoped {
 		t.Fatalf("classification = %q, want %q", got.AuthorizationClassification, AuthorizationScoped)
+	}
+	if got.DurableJobID != durableJobID {
+		t.Fatalf("durable job id = %q, want %q", got.DurableJobID, durableJobID)
 	}
 	if got.AuthorizationBinding == nil {
 		t.Fatal("authorization binding is nil")
@@ -92,6 +96,23 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	}
 	if after.AuthorizationBinding != before.AuthorizationBinding || after.AuthorizationClassification != before.AuthorizationClassification {
 		t.Fatal("single-use mutation changed immutable authorization data")
+	}
+}
+
+// TestCreateScopedUploadToken_RejectsMalformedDurableJobID proves a scoped
+// upload is refused a mint, not stored with a durable job id it can never
+// use (story 339): every later queue_admission/build_start/deployment_patch
+// stage recheck presents this value to agentstream.JobAuthority, which
+// requires a canonical lowercase UUID.
+func TestCreateScopedUploadToken_RejectsMalformedDurableJobID(t *testing.T) {
+	setupTestDB(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	binding := testUploadAuthorityBinding(now)
+
+	for _, durableJobID := range []string{"", "not-a-uuid", "00000000-0000-4000-8000-00000000000Z"} {
+		if err := CreateScopedUploadToken("tok-"+durableJobID, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err == nil {
+			t.Errorf("durableJobID %q: expected an error, got none", durableJobID)
+		}
 	}
 }
 

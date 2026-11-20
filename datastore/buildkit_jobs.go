@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"fmt"
+	"regexp"
 	"time"
 
 	"gorm.io/gorm"
@@ -11,18 +12,31 @@ import (
 // BuildKitJob represents a build job record returned to callers. The JSON tags
 // are part of the on-the-wire contract for LIST_BUILD_JOBS, so they are
 // preserved exactly; the persistence shape lives in BuildKitJobModel.
+//
+// AuthorizationClassification and AuthorityJobID are internal attribution
+// (story 339), not part of the LIST_BUILD_JOBS wire contract; they carry no
+// `json` tag so they are never serialized to that response.
 type BuildKitJob struct {
-	ID          int64      `json:"id"`
-	JobID       string     `json:"job_id"`
-	OSID        string     `json:"osid"`
-	Repo        string     `json:"repo"`
-	Branch      string     `json:"branch"`
-	CommitHash  string     `json:"commit_hash"`
-	Status      string     `json:"status"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	CompletedAt *time.Time `json:"completed_at"`
+	ID                          int64      `json:"id"`
+	JobID                       string     `json:"job_id"`
+	OSID                        string     `json:"osid"`
+	Repo                        string     `json:"repo"`
+	Branch                      string     `json:"branch"`
+	CommitHash                  string     `json:"commit_hash"`
+	Status                      string     `json:"status"`
+	CreatedAt                   time.Time  `json:"created_at"`
+	UpdatedAt                   time.Time  `json:"updated_at"`
+	CompletedAt                 *time.Time `json:"completed_at"`
+	AuthorizationClassification string     `json:"-"`
+	AuthorityJobID              string     `json:"-"`
 }
+
+// buildKitJobAuthorityJobIDPattern requires a canonical lowercase UUID,
+// matching agentstream.JobAuthority's own requirement (agentstream's
+// authority.validate()): storing anything else here would pass creation
+// but fail every later stage recheck with an opaque transport error
+// instead of a clear refusal now.
+var buildKitJobAuthorityJobIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // JobStatus constants
 const (
@@ -34,16 +48,18 @@ const (
 
 func (m BuildKitJobModel) toDTO() BuildKitJob {
 	return BuildKitJob{
-		ID:          int64(m.ID),
-		JobID:       m.JobID,
-		OSID:        m.OSID,
-		Repo:        m.Repo,
-		Branch:      m.Branch,
-		CommitHash:  m.CommitHash,
-		Status:      m.Status,
-		CreatedAt:   m.CreatedAt,
-		UpdatedAt:   m.UpdatedAt,
-		CompletedAt: m.CompletedAt,
+		ID:                          int64(m.ID),
+		JobID:                       m.JobID,
+		OSID:                        m.OSID,
+		Repo:                        m.Repo,
+		Branch:                      m.Branch,
+		CommitHash:                  m.CommitHash,
+		Status:                      m.Status,
+		CreatedAt:                   m.CreatedAt,
+		UpdatedAt:                   m.UpdatedAt,
+		CompletedAt:                 m.CompletedAt,
+		AuthorizationClassification: m.AuthorizationClassification,
+		AuthorityJobID:              m.AuthorityJobID,
 	}
 }
 
@@ -60,17 +76,51 @@ func (m BuildKitJobModel) toDTO() BuildKitJob {
 // a fresh pending job; created_at is left untouched so the row's original
 // first-seen time survives.
 func CreateBuildKitJob(jobID, osid, repo, branch, commitHash string) error {
+	return createBuildKitJob(jobID, osid, repo, branch, commitHash, AuthorizationLegacy, "")
+}
+
+// CreateScopedBuildKitJob creates a new build job record bound to a durable,
+// authoritative job id (handbook 949 C3's "job: jobId" stage authority),
+// or re-opens an existing row under the same job_id as a fresh pending row
+// (the same upsert-reopens discipline CreateBuildKitJob uses, review
+// finding 1133). authorityJobID is the public, non-secret job-authority
+// reference every later queue_admission/build_start/deployment_patch
+// recheck for this job presents to agentstream.JobAuthority; it must be a
+// canonical lowercase UUID.
+//
+// The caller must request and receive a queue_admission permit for
+// authorityJobID BEFORE calling this (plan "CLI/VCS propagation": "Request
+// queue admission for the bound job. Create the build job only after
+// permit."). This function only persists the attribution; it performs no
+// recheck itself.
+func CreateScopedBuildKitJob(jobID, authorityJobID, osid, repo, branch, commitHash string) error {
+	if !buildKitJobAuthorityJobIDPattern.MatchString(authorityJobID) {
+		return fmt.Errorf("invalid authority job id")
+	}
+	return createBuildKitJob(jobID, osid, repo, branch, commitHash, AuthorizationScoped, authorityJobID)
+}
+
+// createBuildKitJob is CreateBuildKitJob/CreateScopedBuildKitJob's shared
+// upsert. The DoUpdates clause deliberately OMITS authorization_classification
+// and authority_job_id: once a job_id row exists, its binding is immutable
+// (plan "Durable job binding": "Keep the binding immutable after job
+// creation"), so a reopen (retry with the same job_id) preserves whatever
+// attribution the row was FIRST created with, even if a later caller on the
+// same job_id passes a different classification.
+func createBuildKitJob(jobID, osid, repo, branch, commitHash, classification, authorityJobID string) error {
 	gdb, err := activeDB()
 	if err != nil {
 		return err
 	}
 	job := BuildKitJobModel{
-		JobID:      jobID,
-		OSID:       osid,
-		Repo:       repo,
-		Branch:     branch,
-		CommitHash: commitHash,
-		Status:     JobStatusPending,
+		JobID:                       jobID,
+		OSID:                        osid,
+		Repo:                        repo,
+		Branch:                      branch,
+		CommitHash:                  commitHash,
+		Status:                      JobStatusPending,
+		AuthorizationClassification: classification,
+		AuthorityJobID:              authorityJobID,
 	}
 	return gdb.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "job_id"}},
@@ -166,10 +216,11 @@ func recordFailedUploadIfUnclaimedSQLite(gdb *gorm.DB, token, jobID, osid, reaso
 // above).
 func writeFailedBuildRow(tx *gorm.DB, jobID, osid, reason string) error {
 	job := BuildKitJobModel{
-		JobID:      jobID,
-		OSID:       osid,
-		CommitHash: jobID,
-		Status:     JobStatusPending,
+		JobID:                       jobID,
+		OSID:                        osid,
+		CommitHash:                  jobID,
+		Status:                      JobStatusPending,
+		AuthorizationClassification: AuthorizationLegacy,
 	}
 	if err := tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "job_id"}},

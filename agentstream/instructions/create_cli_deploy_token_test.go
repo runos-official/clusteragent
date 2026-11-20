@@ -52,7 +52,7 @@ func TestCreateCLIDeployToken_SelectsLegacyOrScopedStorage(t *testing.T) {
 			legacyCalls++
 			return nil
 		}
-		createScopedUploadToken = func(string, string, string, string, []datastore.BuildArg, time.Time, datastore.UploadAuthorityBinding) error {
+		createScopedUploadToken = func(string, string, string, string, []datastore.BuildArg, time.Time, datastore.UploadAuthorityBinding, string) error {
 			scopedCalls++
 			return nil
 		}
@@ -81,10 +81,14 @@ func TestCreateCLIDeployToken_SelectsLegacyOrScopedStorage(t *testing.T) {
 			legacyCalls++
 			return nil
 		}
-		createScopedUploadToken = func(_ string, appID, uploadID, _ string, _ []datastore.BuildArg, _ time.Time, got datastore.UploadAuthorityBinding) error {
+		const durableJobID = "00000000-0000-4000-8000-000000000005"
+		createScopedUploadToken = func(_ string, appID, uploadID, _ string, _ []datastore.BuildArg, _ time.Time, got datastore.UploadAuthorityBinding, gotDurableJobID string) error {
 			scopedCalls++
 			if appID != binding.AppID || uploadID != binding.UploadID || got.BindingID != binding.BindingID {
 				t.Fatalf("scoped store received wrong target or binding: app=%q upload=%q binding=%q", appID, uploadID, got.BindingID)
+			}
+			if gotDurableJobID != durableJobID {
+				t.Fatalf("scoped store received durableJobID = %q, want %q", gotDurableJobID, durableJobID)
 			}
 			return nil
 		}
@@ -94,6 +98,7 @@ func TestCreateCLIDeployToken_SelectsLegacyOrScopedStorage(t *testing.T) {
 			ExpirySeconds:               300,
 			AuthorizationClassification: datastore.AuthorizationScoped,
 			AuthorizationBinding:        &binding,
+			DurableJobID:                durableJobID,
 		})
 		if err != nil {
 			t.Fatalf("encode request: %v", err)
@@ -311,7 +316,7 @@ func TestCreateCLIDeployToken_ScopedPurposeAndExpiry(t *testing.T) {
 			binding.CreatedAt = createdAt.Format(time.RFC3339Nano)
 			binding.ExpiresAt = createdAt.Add(5 * time.Minute).Format(time.RFC3339Nano)
 			calls := 0
-			createScopedUploadToken = func(_ string, _ string, _ string, _ string, _ []datastore.BuildArg, expiry time.Time, got datastore.UploadAuthorityBinding) error {
+			createScopedUploadToken = func(_ string, _ string, _ string, _ string, _ []datastore.BuildArg, expiry time.Time, got datastore.UploadAuthorityBinding, _ string) error {
 				calls++
 				if expiry.Format(time.RFC3339Nano) != binding.ExpiresAt || got != binding {
 					t.Errorf("storage changed binding or expiry: expiry=%s want=%s", expiry, binding.ExpiresAt)

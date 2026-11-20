@@ -142,6 +142,36 @@ func permitStillValid(resp *agentstream.StageResponse) *uploadRefusal {
 	return nil
 }
 
+// requireJobStagePermit asks for one fresh, correlated job-authority permit
+// (story 339) for authorityJobID at stage, over the SAME injected transport
+// admitScopedUpload uses. It returns nil only for an exact current permit;
+// every other outcome, or a transport/validation failure, returns a
+// non-nil, generic refusal that reveals nothing about the account, cluster,
+// app, or job involved. Callers invoke this ONLY for a scoped job (a
+// non-empty authorityJobID); a legacy job skips it entirely, matching the
+// upload path's own no-fallback discipline.
+//
+// Unlike admitScopedUpload's archive_persist check, no second
+// permitStillValid-style recheck follows this one: every caller performs
+// the stage's mutation immediately after this call returns, with no
+// interposed round trip (no atomic claim) that could let the permit's own
+// short deadline or a disconnect pass unnoticed in between.
+func requireJobStagePermit(ctx context.Context, authorityJobID string, stage agentstream.RecheckStage) *uploadRefusal {
+	retryID := uuid.New().String()
+	resp, err := requestStageRecheck(ctx, agentstream.JobAuthority(authorityJobID), stage, retryID)
+	if err != nil {
+		return unavailableUpload(fmt.Sprintf("deployment stage recheck unavailable: %v", err))
+	}
+	switch resp.Outcome {
+	case agentstream.OutcomePermit:
+		return nil
+	case agentstream.OutcomeDeny, agentstream.OutcomeNeeds:
+		return forbiddenUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
+	default:
+		return unavailableUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
+	}
+}
+
 // verifyBuildImageHarborIdentity implements story 338 criteria 6(b) and
 // 6(b2): before any build or push, compare the Harbor identity Conductor
 // verified and locked before minting the token (persisted on the token row)

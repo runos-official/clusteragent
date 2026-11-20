@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/runos-official/clusteragent/commons"
+	"github.com/runos-official/clusteragent/datastore"
 	"gopkg.in/yaml.v3"
 )
 
@@ -41,6 +42,13 @@ type VcsFetchSourceRequest struct {
 	AuthHeader   string `json:"authHeader,omitempty"`
 	Branch       string `json:"branch,omitempty"`
 	ConfigPath   string `json:"configPath,omitempty"`
+	// ConductorJobID (story 339) is Conductor's durable job-authority id
+	// (handbook 949 C3's "job: jobId" stage authority: source_fetch) for
+	// this VCS deploy — the durable Postgres jobs.id, a SIBLING of SHA,
+	// never a repurposing of it. Empty means an explicit legacy VCS deploy
+	// (no stage recheck), matching the upload path's no-fallback
+	// discipline. Omitted by a caller that predates this field.
+	ConductorJobID string `json:"conductorJobId,omitempty"`
 }
 
 // VcsFetchSourceServiceYaml carries one runos.service.*.yaml file's contents
@@ -74,6 +82,7 @@ type VcsFetchSourceServiceYaml struct {
 //   - field PRESENT (incl. {}) → the manifest names a file that exists → the
 //     conductor APPLIES it (full replace of that ConfigMap/Secret, matching
 //     CLI deploy semantics); an empty committed file legitimately clears it.
+//
 // A missing committed plain `env:` file FAILS the fetch (Success:false)
 // rather than ship a half-state. A missing gitignored `secretEnv:` file is
 // EXPECTED (VCS secrets are server-state managed), so it omits the secret
@@ -190,6 +199,21 @@ func VcsFetchSource(jsonB64 string) (string, string, error) {
 		})
 	}
 
+	// Story 339: a scoped VCS deploy requires a fresh, current source_fetch
+	// permit before the clone - the stage model's own mutation boundary
+	// ("before a scoped VCS clone or cache write"). An explicit legacy
+	// deploy (empty ConductorJobID) keeps its historical, unconditional
+	// behavior; there is no fallback in either direction.
+	if req.ConductorJobID != "" {
+		if err := requireJobStagePermit(context.Background(), req.ConductorJobID, StageSourceFetch); err != nil {
+			log.Printf("VCS_FETCH_SOURCE: source_fetch stage recheck refused for osid=%s sha=%s: %v", req.OSID, req.SHA, err)
+			return reply(replyType, VcsFetchSourceResponse{
+				Success: false,
+				Message: "source fetch refused",
+			})
+		}
+	}
+
 	if err := gitFetchSHA(req.RepoCloneURL, req.SHA, workdir); err != nil {
 		return reply(replyType, VcsFetchSourceResponse{
 			Success: false,
@@ -238,12 +262,19 @@ func VcsFetchSource(jsonB64 string) (string, string, error) {
 		})
 	}
 
+	authorizationClassification := ""
+	if req.ConductorJobID != "" {
+		authorizationClassification = datastore.AuthorizationScoped
+	}
+
 	cacheKey := vcsWorkdirCacheKey(req.OSID, req.SHA)
 	vcsWorkdirCachePut(req.OSID, req.SHA, VcsWorkdirBuildPaths{
-		Workdir:            workdir,
-		ContextPath:        paths.ContextPath,
-		DockerfileDir:      paths.DockerfileDir,
-		DockerfileFilename: paths.DockerfileFilename,
+		Workdir:                     workdir,
+		ContextPath:                 paths.ContextPath,
+		DockerfileDir:               paths.DockerfileDir,
+		DockerfileFilename:          paths.DockerfileFilename,
+		AuthorizationClassification: authorizationClassification,
+		ConductorJobID:              req.ConductorJobID,
 	})
 
 	// -1 = field omitted on the wire (conductor preserves live state); >=0 =

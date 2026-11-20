@@ -63,6 +63,8 @@ type uploadHarness struct {
 	claimErr                    error
 	pushed                      bool
 	cliStarted                  bool
+	cliStartedClassification    string
+	cliStartedAuthorityJobID    string
 	buildImgRun                 bool
 	failedUploadJobIDs          []string
 	skipFailedUploadIfUnclaimed bool
@@ -161,9 +163,11 @@ func (h *uploadHarness) install() {
 		h.pushed = true
 		return h.pushErr
 	}
-	startCLIDeploymentAsync = func(_ []byte, _, _, _ string, _ []datastore.BuildArg, _ *agentstream.BuildKitConfig, end func()) {
+	startCLIDeploymentAsync = func(_ []byte, _, _, _ string, _ []datastore.BuildArg, authorizationClassification, authorityJobID string, _ *agentstream.BuildKitConfig, end func()) {
 		h.mu.Lock()
 		h.cliStarted = true
+		h.cliStartedClassification = authorizationClassification
+		h.cliStartedAuthorityJobID = authorityJobID
 		h.mu.Unlock()
 		end()
 	}
@@ -238,6 +242,7 @@ func scopedUploadToken() *datastore.UploadToken {
 			BindingID: "00000000-0000-4000-8000-000000000001",
 			UploadID:  "00000000-0000-4000-8000-000000000002",
 		},
+		DurableJobID: "00000000-0000-4000-8000-000000000003",
 	}
 }
 

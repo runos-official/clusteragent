@@ -35,6 +35,13 @@ type vcsWorkdirEntry struct {
 	contextPath        string
 	dockerfileDir      string
 	dockerfileFilename string
+	// authorizationClassification and conductorJobID (story 339) are the
+	// public, non-secret job-authority attribution VCS_FETCH_SOURCE bound
+	// this fetch to. VCS_BUILD must present the SAME values again at
+	// queue_admission; a cache entry from a different binding, app, job, or
+	// source identity cannot satisfy that request (plan "VCS propagation").
+	authorizationClassification string
+	conductorJobID              string
 }
 
 const (
@@ -76,6 +83,11 @@ type VcsWorkdirBuildPaths struct {
 	ContextPath        string
 	DockerfileDir      string
 	DockerfileFilename string
+	// AuthorizationClassification and ConductorJobID are the job-authority
+	// attribution VCS_FETCH_SOURCE bound to this fetch (story 339). Empty
+	// classification means legacy (no stage recheck).
+	AuthorizationClassification string
+	ConductorJobID              string
 }
 
 // vcsWorkdirCachePut records the workdir path and resolved build paths for a
@@ -85,11 +97,13 @@ type VcsWorkdirBuildPaths struct {
 func vcsWorkdirCachePut(osid, sha string, paths VcsWorkdirBuildPaths) {
 	startVcsWorkdirJanitor()
 	vcsWorkdirCache.Store(vcsWorkdirCacheKey(osid, sha), vcsWorkdirEntry{
-		path:               paths.Workdir,
-		createdAt:          time.Now(),
-		contextPath:        paths.ContextPath,
-		dockerfileDir:      paths.DockerfileDir,
-		dockerfileFilename: paths.DockerfileFilename,
+		path:                        paths.Workdir,
+		createdAt:                   time.Now(),
+		contextPath:                 paths.ContextPath,
+		dockerfileDir:               paths.DockerfileDir,
+		dockerfileFilename:          paths.DockerfileFilename,
+		authorizationClassification: paths.AuthorizationClassification,
+		conductorJobID:              paths.ConductorJobID,
 	})
 }
 
@@ -108,10 +122,12 @@ func vcsWorkdirCacheGet(osid, sha string) (VcsWorkdirBuildPaths, bool) {
 		return VcsWorkdirBuildPaths{}, false
 	}
 	return VcsWorkdirBuildPaths{
-		Workdir:            entry.path,
-		ContextPath:        entry.contextPath,
-		DockerfileDir:      entry.dockerfileDir,
-		DockerfileFilename: entry.dockerfileFilename,
+		Workdir:                     entry.path,
+		ContextPath:                 entry.contextPath,
+		DockerfileDir:               entry.dockerfileDir,
+		DockerfileFilename:          entry.dockerfileFilename,
+		AuthorizationClassification: entry.authorizationClassification,
+		ConductorJobID:              entry.conductorJobID,
 	}, true
 }
 
