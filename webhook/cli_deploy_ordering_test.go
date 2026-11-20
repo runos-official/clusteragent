@@ -268,7 +268,7 @@ func TestHandleCLIDeployUpload_ScopedPermitClaimsAndProceeds(t *testing.T) {
 		t:              t,
 		token:          scopedUploadToken(),
 		buildkitConfig: &agentstream.BuildKitConfig{},
-		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), Lifetime: agentstream.NewTestLifetime(true)},
 	}
 	h.install()
 
@@ -306,7 +306,7 @@ func TestHandleCLIDeployUpload_PermitExpiresDuringClaimRefusesBeforePersistence(
 		t:              t,
 		token:          scopedUploadToken(),
 		buildkitConfig: &agentstream.BuildKitConfig{},
-		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: deadline},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: deadline, Lifetime: agentstream.NewTestLifetime(true)},
 	}
 	h.install()
 
@@ -351,36 +351,27 @@ func TestHandleCLIDeployUpload_PermitExpiresDuringClaimRefusesBeforePersistence(
 }
 
 // TestHandleCLIDeployUpload_StreamReconnectsDuringClaimRefusesBeforePersistence
-// pins review finding 1169: a permit received on one control-stream
-// connection must not authorize persistence once that connection has
-// disconnected and a replacement has connected, even though the permit's
-// own expiry is still in the future. The permit payload carries no
-// connection identity by itself; permitStillValid compares the stream
-// generation captured when the permit arrived against the current one.
+// pins review finding 1313 (repeat of 1270/1240/1169): a permit received on
+// one control-stream connection must not authorize persistence once that
+// connection has disconnected and a replacement has connected, even though
+// the permit's own expiry is still in the future. The permit payload
+// carries no connection identity by itself; permitStillValid checks the
+// Lifetime that delivered the permit directly.
 func TestHandleCLIDeployUpload_StreamReconnectsDuringClaimRefusesBeforePersistence(t *testing.T) {
 	deadline := time.Now().Add(1 * time.Hour) // plenty of time left on the permit itself
+	lt := agentstream.NewTestLifetime(true)
 	h := &uploadHarness{
 		t:              t,
 		token:          scopedUploadToken(),
 		buildkitConfig: &agentstream.BuildKitConfig{},
-		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: deadline, StreamGeneration: 1},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: deadline, Lifetime: lt},
 	}
 	h.install()
-
-	prevGen := currentStreamGeneration
-	t.Cleanup(func() { currentStreamGeneration = prevGen })
-	var reconnected bool
-	currentStreamGeneration = func() uint64 {
-		if reconnected {
-			return 2 // the original connection closed; a replacement is now live
-		}
-		return 1 // matches the permit's StreamGeneration, for the pre-claim check
-	}
 
 	prevClaim := claimUploadToken
 	t.Cleanup(func() { claimUploadToken = prevClaim })
 	claimUploadToken = func(token string, _ *time.Time) error {
-		reconnected = true // simulate a disconnect and reconnect during the claim round trip
+		agentstream.EndTestLifetime(lt) // simulate a disconnect and reconnect during the claim round trip
 		h.mu.Lock()
 		h.claimed = append(h.claimed, token)
 		h.mu.Unlock()
@@ -404,22 +395,20 @@ func TestHandleCLIDeployUpload_StreamReconnectsDuringClaimRefusesBeforePersisten
 	}
 }
 
-// TestHandleCLIDeployUpload_SameStreamGenerationProceeds proves the
-// legitimate case for review finding 1169: when the control stream never
-// disconnects, the generation never changes, and the upload proceeds
-// exactly as it would have before this check existed.
-func TestHandleCLIDeployUpload_SameStreamGenerationProceeds(t *testing.T) {
+// TestHandleCLIDeployUpload_LiveLifetimeProceeds proves the legitimate case
+// for review finding 1313 (repeat of 1270/1240/1169): when the control
+// stream never disconnects, the delivering Lifetime stays live, and the
+// upload proceeds exactly as it would have before this check existed.
+// Replaces TestHandleCLIDeployUpload_SameStreamGenerationProceeds
+// (generation counter replaced by Lifetime).
+func TestHandleCLIDeployUpload_LiveLifetimeProceeds(t *testing.T) {
 	h := &uploadHarness{
 		t:              t,
 		token:          scopedUploadToken(),
 		buildkitConfig: &agentstream.BuildKitConfig{},
-		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), StreamGeneration: 42},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), Lifetime: agentstream.NewTestLifetime(true)},
 	}
 	h.install()
-
-	prevGen := currentStreamGeneration
-	t.Cleanup(func() { currentStreamGeneration = prevGen })
-	currentStreamGeneration = func() uint64 { return 42 }
 
 	w := doUpload(t, validTarGz(t))
 	if w.Code != http.StatusAccepted {
@@ -752,7 +741,7 @@ func TestHandleCLIDeployUpload_ConcurrentClaimRaceOnlyOnePersists(t *testing.T) 
 		t:              t,
 		token:          scopedUploadToken(),
 		buildkitConfig: &agentstream.BuildKitConfig{},
-		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), Lifetime: agentstream.NewTestLifetime(true)},
 	}
 	h.install()
 

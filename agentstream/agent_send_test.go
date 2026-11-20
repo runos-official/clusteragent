@@ -35,7 +35,7 @@ func TestSendAndWait_SendPhaseBoundedByContext(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := sendAndWait(ctx, slowSend, &l2sec.FromClusterAgent{Type: "TEST"})
+	_, _, err := sendAndWait(ctx, slowSend, &l2sec.FromClusterAgent{Type: "TEST"})
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -59,7 +59,7 @@ func TestSendAndWait_WaitPhaseBoundedByContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	_, err := sendAndWait(ctx, func(*l2sec.FromClusterAgent) error { return nil }, &l2sec.FromClusterAgent{Type: "TEST"})
+	_, _, err := sendAndWait(ctx, func(*l2sec.FromClusterAgent) error { return nil }, &l2sec.FromClusterAgent{Type: "TEST"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
@@ -74,6 +74,13 @@ func TestSendAndWait_WaitPhaseBoundedByContext(t *testing.T) {
 // even though they share the same pendingResponses map and the same
 // production send path's correlation-by-tag.
 func TestSendAndWait_ConcurrentCallsResolveIndependently(t *testing.T) {
+	// sendAndWait only accepts a reply while the Lifetime it was sent on is
+	// still live (L3); give it one, since this test is about correlation,
+	// not disconnect handling.
+	prev := currentLifetime.Load()
+	currentLifetime.Store(newLifetime(&fakeBidiStream{}))
+	t.Cleanup(func() { currentLifetime.Store(prev) })
+
 	// The fake send immediately "delivers" a reply correlated to msg.Tag,
 	// the same way the real stream dispatcher resolves a reply by tag.
 	fakeSend := func(msg *l2sec.FromClusterAgent) error {
@@ -92,7 +99,7 @@ func TestSendAndWait_ConcurrentCallsResolveIndependently(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			resp, err := sendAndWait(ctx, fakeSend, &l2sec.FromClusterAgent{Type: types[i]})
+			resp, _, err := sendAndWait(ctx, fakeSend, &l2sec.FromClusterAgent{Type: types[i]})
 			if err != nil {
 				t.Errorf("call %d: unexpected error: %v", i, err)
 				return
@@ -106,6 +113,43 @@ func TestSendAndWait_ConcurrentCallsResolveIndependently(t *testing.T) {
 		if results[i] == nil || results[i].Type != "ECHO:"+want {
 			t.Errorf("call %d: response = %+v, want echo of %q", i, results[i], want)
 		}
+	}
+}
+
+// TestSendAndWait_RefusesReplyAfterLifetimeEnded pins review finding 1313
+// (repeat of 1245/1169): a reply already buffered for a pending call's tag
+// must not be accepted once the Lifetime that was current when the call
+// sent has since ended - even though the buffered channel read itself
+// succeeds (closing a channel does not discard a value already written to
+// it). Replaces TestRequestStageRecheck_RefusesWhenGenerationMovesDuringSend,
+// which used to pin this one layer up, in deploymentrecheck.go, with a
+// generation counter; the guarantee now lives once, here, for every
+// sendAndWait caller.
+func TestSendAndWait_RefusesReplyAfterLifetimeEnded(t *testing.T) {
+	prev := currentLifetime.Load()
+	lt := newLifetime(&fakeBidiStream{})
+	currentLifetime.Store(lt)
+	t.Cleanup(func() { currentLifetime.Store(prev) })
+
+	// The fake send delivers the reply, then - still inside send, before
+	// sendAndWait's own select can read it - ends the Lifetime that was
+	// current when sendAndWait sampled it. This models a disconnect
+	// detected while the reply is already sitting in the buffered channel.
+	fakeSend := func(msg *l2sec.FromClusterAgent) error {
+		if v, ok := pendingResponses.Load(msg.Tag); ok {
+			ch := v.(chan *l2sec.ToClusterAgent)
+			ch <- &l2sec.ToClusterAgent{Tag: msg.Tag, Type: "ECHO:" + msg.Type}
+		}
+		lt.end()
+		return nil
+	}
+
+	resp, gotLifetime, err := sendAndWait(context.Background(), fakeSend, &l2sec.FromClusterAgent{Type: "RECHECK"})
+	if err == nil {
+		t.Fatalf("expected a refusal once the Lifetime ended before the reply was accepted, got %+v", resp)
+	}
+	if resp != nil || gotLifetime != nil {
+		t.Errorf("expected no response or Lifetime alongside the refusal, got resp=%+v lifetime=%v", resp, gotLifetime)
 	}
 }
 
@@ -156,15 +200,9 @@ func (f *fakeBidiStream) RecvMsg(m any) error                  { return nil }
 func TestSendOnStream_SerializesConcurrentSends(t *testing.T) {
 	fake := &fakeBidiStream{sendDelay: 5 * time.Millisecond}
 
-	globalStreamMu.Lock()
-	prevStream := globalStream
-	globalStream = fake
-	globalStreamMu.Unlock()
-	t.Cleanup(func() {
-		globalStreamMu.Lock()
-		globalStream = prevStream
-		globalStreamMu.Unlock()
-	})
+	prev := currentLifetime.Load()
+	currentLifetime.Store(newLifetime(fake))
+	t.Cleanup(func() { currentLifetime.Store(prev) })
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -181,42 +219,47 @@ func TestSendOnStream_SerializesConcurrentSends(t *testing.T) {
 	}
 }
 
-// TestListenForInstructions_InvalidatesStreamGenerationAtDetection pins
-// review finding 1270 (repeat of 1169/1240): the stream generation must
-// advance the moment listenForInstructions itself observes the stream has
-// failed, not later when establishAndMaintainStream's own goroutine is
-// scheduled to dequeue errChan and run its cleanup. That scheduling gap is
-// exactly where a reply already buffered for a pending recheck could be
-// read as still belonging to a live connection, because the generation
-// had not advanced yet. fakeBidiStream.Recv always returns io.EOF, so one
-// call reproduces the failure deterministically with no real stream.
-func TestListenForInstructions_InvalidatesStreamGenerationAtDetection(t *testing.T) {
-	genBefore := CurrentStreamGeneration()
+// TestListenForInstructions_EndsLifetimeAtDetection pins review finding
+// 1313 (repeat of 1270/1240/1169): the stream's own Lifetime must end the
+// moment listenForInstructions itself observes the stream has failed, not
+// later when establishAndMaintainStream's own goroutine is scheduled to
+// dequeue errChan and run its cleanup (runStream's pendingResponses
+// drain). That scheduling gap is exactly where a reply already buffered
+// for a pending recheck could be read as still belonging to a live
+// connection, because the Lifetime had not ended yet. fakeBidiStream.Recv
+// always returns io.EOF, so one call reproduces the failure
+// deterministically with no real stream. Replaces
+// TestListenForInstructions_InvalidatesStreamGenerationAtDetection (same
+// case, generation counter replaced by Lifetime).
+func TestListenForInstructions_EndsLifetimeAtDetection(t *testing.T) {
+	lt := newLifetime(&fakeBidiStream{})
 	sm := &streamManager{}
-	if err := sm.listenForInstructions(&fakeBidiStream{}); err == nil {
+	if err := sm.listenForInstructions(&fakeBidiStream{}, lt); err == nil {
 		t.Fatal("expected an error once Recv() fails")
 	}
-	if CurrentStreamGeneration() == genBefore {
-		t.Fatal("expected streamGeneration to advance synchronously inside listenForInstructions, not later")
+	if lt.Live() {
+		t.Fatal("expected the Lifetime to end synchronously inside listenForInstructions, not later")
 	}
 }
 
-// TestRunHeartbeat_InvalidatesStreamGenerationAtDetection is
-// listenForInstructions' sibling case: three consecutive heartbeat
-// failures must also advance the generation at the point runHeartbeat
-// itself gives up, not later.
-func TestRunHeartbeat_InvalidatesStreamGenerationAtDetection(t *testing.T) {
-	genBefore := CurrentStreamGeneration()
-	sm := &streamManager{heartbeatInterval: 1 * time.Millisecond}
+// TestRunHeartbeat_EndsLifetimeAtDetection is
+// TestListenForInstructions_EndsLifetimeAtDetection's sibling case: three
+// consecutive heartbeat failures must also end the Lifetime at the point
+// runHeartbeat itself gives up, not later. Replaces
+// TestRunHeartbeat_InvalidatesStreamGenerationAtDetection (same case,
+// generation counter replaced by Lifetime).
+func TestRunHeartbeat_EndsLifetimeAtDetection(t *testing.T) {
 	fake := &fakeBidiStream{sendErr: errors.New("send boom")}
+	lt := newLifetime(fake)
+	sm := &streamManager{heartbeatInterval: 1 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := sm.runHeartbeat(ctx, fake)
+	err := sm.runHeartbeat(ctx, fake, lt)
 	if err == nil {
 		t.Fatal("expected an error after three consecutive heartbeat failures")
 	}
-	if CurrentStreamGeneration() == genBefore {
-		t.Fatal("expected streamGeneration to advance synchronously inside runHeartbeat, not later")
+	if lt.Live() {
+		t.Fatal("expected the Lifetime to end synchronously inside runHeartbeat, not later")
 	}
 }

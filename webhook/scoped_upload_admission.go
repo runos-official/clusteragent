@@ -25,13 +25,6 @@ var permitClock = time.Now
 // stream. Production wiring is agentstream.RequestStageRecheck.
 var requestStageRecheck = agentstream.RequestStageRecheck
 
-// currentStreamGeneration is the injected reader of the control stream's
-// current generation (review finding 1169). A package var so tests can
-// simulate a disconnect/reconnect between receiving a permit and acting on
-// it without a live stream. Production wiring is
-// agentstream.CurrentStreamGeneration.
-var currentStreamGeneration = agentstream.CurrentStreamGeneration
-
 // uploadRefusal is a refusal to admit an upload past the checks that run
 // before the atomic token claim. status and message are what the caller
 // sees; message is deliberately generic (plan "Refusal behavior": never
@@ -115,28 +108,33 @@ func admitScopedUpload(ctx context.Context, binding *datastore.UploadAuthorityBi
 	}
 }
 
-// permitStillValid re-checks a granted permit's own deadline and its
-// binding to the control stream it arrived on (review findings
-// 1076/1128/1169). Time can pass between admitScopedUpload returning and
-// the handler reaching the atomic claim, and again between the claim and
-// the archive push; this closes both gaps without a second network round
-// trip. Equality counts as expired (finding 1128: "Treat equality with
+// permitStillValid re-checks a granted permit's own deadline and the
+// Lifetime of the control stream it arrived on (review findings
+// 1076/1128, and 1313 repeat of 1270/1240/1169). The handler calls this
+// twice: once before the atomic claim (time can pass between
+// admitScopedUpload returning and the claim), and again immediately
+// before the archive push (L6) - after the claim itself, and after every
+// blocking step since, including the log write that used to sit between
+// that second check and the push with no check of its own in between.
+// Two calls close both gaps without a second network round trip.
+// Equality counts as expired (finding 1128: "Treat equality with
 // expiresAt as expired") - a permit is valid only strictly before its own
 // deadline.
 //
-// Finding 1169: the response payload carries no connection identity, so a
+// L4: the response payload carries no connection identity of its own, so a
 // disconnect and reconnect between receiving the permit and acting on it
 // would otherwise be invisible - a replacement connection can be live by
 // then, and the original permit would keep authorizing persistence until
-// its timestamp expires. Comparing the stream generation captured when the
-// permit was received against the current one catches that: any
-// disconnect or reconnect since changes the generation, even if a new
-// connection is active again by the time this runs.
+// its timestamp expires. resp.Lifetime is the Lifetime that delivered this
+// permit (sendAndWait validated it against this exact value, L3); once a
+// Lifetime goes live-to-ended it never comes back, so Live() here catches
+// any disconnect or reconnect since, even if a new connection is active
+// again by the time this runs.
 func permitStillValid(resp *agentstream.StageResponse) *uploadRefusal {
 	if !permitClock().Before(resp.ExpiresAt) {
 		return unavailableUpload("permit expired at the claim or persistence boundary")
 	}
-	if currentStreamGeneration() != resp.StreamGeneration {
+	if !resp.Lifetime.Live() {
 		return unavailableUpload("control stream disconnected or reconnected since the permit was received")
 	}
 	return nil

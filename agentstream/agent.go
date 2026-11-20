@@ -24,63 +24,7 @@ import (
 	"time"
 )
 
-var (
-	globalStream     grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent]
-	globalStreamMu   sync.RWMutex
-	pendingResponses sync.Map
-
-	// streamConnected reflects whether the gRPC control stream is currently up.
-	// The webhook /health handler reads it to surface "disconnected" in its
-	// body without failing the liveness probe (see webhook.HandleHealth): a
-	// disconnected agent is still alive and retrying, so it must not be killed.
-	streamConnected atomic.Bool
-
-	// streamGeneration increments on every control-stream transition:
-	// connect, disconnect, and reconnect (review finding 1169). globalStream
-	// is replaced wholesale on each transition and briefly set to nil on a
-	// disconnect, so it cannot itself serve as a stable identity to compare
-	// across time; the generation counter can. A caller that captured a
-	// generation value when it received a response can compare it later: a
-	// different value proves the stream has disconnected, reconnected, or
-	// both since, even if a replacement connection is live again by then.
-	streamGeneration atomic.Uint64
-)
-
-// invalidateStream marks the control stream unusable and advances its
-// generation the moment a failure is DETECTED, in the same goroutine that
-// detects it (review finding 1270, repeat of 1169/1240). Before this, the
-// generation only advanced later, in establishAndMaintainStream's cleanup
-// after its own goroutine was scheduled to dequeue errChan - a gap that can
-// be wide under host load. A reply already buffered for a pending recheck
-// (agent.go's handleInstruction writes it into a capacity-one channel and
-// returns) could be read by sendAndWait during exactly that gap, with
-// CurrentStreamGeneration() still reporting the stale, pre-disconnect
-// value. Calling this at the point of detection closes that gap: the
-// generation is already advanced by the time any reader observes it,
-// regardless of when establishAndMaintainStream's own goroutine runs its
-// cleanup. Safe to call more than once for the same disconnect; callers do
-// not coordinate who calls it first.
-func invalidateStream() {
-	streamConnected.Store(false)
-	streamGeneration.Add(1)
-}
-
-// StreamConnected reports whether the agent currently holds a live gRPC stream
-// to the control plane. Used by the webhook health endpoint to surface
-// connection state without affecting liveness.
-func StreamConnected() bool {
-	return streamConnected.Load()
-}
-
-// CurrentStreamGeneration returns the control stream's current generation.
-// Compare a value captured earlier (for example, when a response was
-// received on the stream) against a later call's result: a difference
-// means the stream has disconnected, reconnected, or both in between
-// (review finding 1169), so anything that response authorized must be
-// treated as no longer bound to a live, unbroken connection.
-func CurrentStreamGeneration() uint64 {
-	return streamGeneration.Load()
-}
+var pendingResponses sync.Map
 
 type streamManager struct {
 	client          l2sec.NodewardClient
@@ -393,12 +337,22 @@ func (sm *streamManager) establishAndMaintainStream() error {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
 
-	// Update global stream with mutex
-	globalStreamMu.Lock()
-	globalStream = stream
-	globalStreamMu.Unlock()
-	streamConnected.Store(true)
-	streamGeneration.Add(1)
+	return sm.runStream(streamCtx, stream, nil)
+}
+
+// runStream publishes stream as the one live Lifetime for its duration (L1
+// publication), runs its heartbeat and listen goroutines, and returns the
+// error produced once one of them ends that Lifetime (L5 invalidation).
+//
+// pauseCleanup, if non-nil, is received from right after that error is
+// known and before the deferred pendingResponses drain below, so a test
+// (review finding 1313's regression) can hold the drain back indefinitely
+// while still observing that every Lifetime-gated behavior - SendToServer,
+// sendAndWait, a recheck permit - already reflects the ended stream, with
+// no dependency on this drain having run at all. nil in production.
+func (sm *streamManager) runStream(streamCtx context.Context, stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent], pauseCleanup <-chan struct{}) error {
+	lt := newLifetime(stream)
+	currentLifetime.Store(lt)
 
 	// Run onConnect callback once
 	if onConnectCallback != nil {
@@ -411,24 +365,19 @@ func (sm *streamManager) establishAndMaintainStream() error {
 	errChan := make(chan error, 2)
 
 	go func() {
-		errChan <- sm.listenForInstructions(stream)
+		errChan <- sm.listenForInstructions(stream, lt)
 	}()
 
 	go func() {
-		errChan <- sm.runHeartbeat(streamCtx, stream)
+		errChan <- sm.runHeartbeat(streamCtx, stream, lt)
 	}()
 
 	// Wait for any error
-	err = <-errChan
+	err := <-errChan
 
-	// Clean up. The other goroutine sees the cancel and returns into the
-	// buffered errChan.
-	cancelStream()
-	streamConnected.Store(false)
-	streamGeneration.Add(1)
-	globalStreamMu.Lock()
-	globalStream = nil
-	globalStreamMu.Unlock()
+	if pauseCleanup != nil {
+		<-pauseCleanup
+	}
 
 	// Clear pending responses on disconnect
 	pendingResponses.Range(func(key, value any) bool {
@@ -442,14 +391,14 @@ func (sm *streamManager) establishAndMaintainStream() error {
 	return err
 }
 
-func (sm *streamManager) listenForInstructions(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent]) error {
+func (sm *streamManager) listenForInstructions(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent], lt *Lifetime) error {
 	for {
 		instruction, err := stream.Recv()
 		if err != nil {
-			// Invalidate now, in this goroutine, at the moment the
-			// closure is actually observed (review finding 1270): do not
-			// wait for establishAndMaintainStream's cleanup to run.
-			invalidateStream()
+			// L5: end this stream's own Lifetime now, in this goroutine, at
+			// the moment the closure is actually observed - before any log
+			// write or return for the manager's own deferred cleanup.
+			lt.end()
 			if err == io.EOF {
 				return fmt.Errorf("server closed the stream")
 			}
@@ -467,7 +416,7 @@ func (sm *streamManager) listenForInstructions(stream grpc.BidiStreamingClient[l
 
 // runHeartbeat heartbeats on the stream it was started for until ctx ends or
 // three heartbeats in a row fail. It never sends on a later stream.
-func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent]) error {
+func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent], lt *Lifetime) error {
 	activeHeartbeats.Add(1)
 	defer activeHeartbeats.Add(-1)
 	interval := sm.heartbeatInterval
@@ -487,7 +436,7 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStrea
 			return ctx.Err()
 		case <-ticker.C:
 			hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			res, err := sendAndWait(hbCtx, send, instructions.ClusterAgentHeartbeatToServer())
+			res, _, err := sendAndWait(hbCtx, send, instructions.ClusterAgentHeartbeatToServer())
 			cancel()
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -497,10 +446,10 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStrea
 				log.Printf("Heartbeat failed (%d/%d): %v", consecutiveFailures, maxConsecutiveFailures, err)
 
 				if consecutiveFailures >= maxConsecutiveFailures {
-					// Same reasoning as listenForInstructions (review
-					// finding 1270): invalidate here, at the point this
-					// goroutine decides the stream is dead, not later.
-					invalidateStream()
+					// L5: same reasoning as listenForInstructions - end
+					// this stream's own Lifetime here, at the point this
+					// goroutine decides it is dead, not later.
+					lt.end()
 					return fmt.Errorf("heartbeat failed %d times consecutively", maxConsecutiveFailures)
 				}
 				continue
@@ -512,12 +461,16 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStrea
 	}
 }
 
+// SendToServer sends msg on the current control stream (L1 publication, L2
+// send): it refuses rather than select a stream whose Lifetime has ended,
+// even if the manager's own cleanup for that stream has not run yet.
 func SendToServer(msg *l2sec.FromClusterAgent) error {
-	globalStreamMu.RLock()
-	stream := globalStream
-	globalStreamMu.RUnlock()
+	lt := currentLifetime.Load()
+	if !lt.Live() {
+		return fmt.Errorf("stream not initialized")
+	}
 
-	return sendOnStream(stream, msg)
+	return sendOnStream(lt.stream, msg)
 }
 
 // sendMu serializes every Send call on the stream. gRPC does not allow
@@ -525,7 +478,7 @@ func SendToServer(msg *l2sec.FromClusterAgent) error {
 // any instruction reply or outbound request (including a deployment stage
 // recheck) otherwise race here with no ordering guarantee (review finding
 // 1077). The agent has exactly one active bidi stream at a time - a
-// reconnect replaces globalStream wholesale - so one mutex for the whole
+// reconnect replaces currentLifetime wholesale - so one mutex for the whole
 // package is the stream's own serialization point.
 var sendMu sync.Mutex
 
@@ -658,17 +611,37 @@ func respond(jsonB64, replyType string, tagID uuid.UUID) {
 }
 
 func SendAndWaitForResponse(ctx context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
+	resp, _, err := sendAndWait(ctx, SendToServer, msg)
+	return resp, err
+}
+
+// SendAndWaitForResponseWithLifetime is SendAndWaitForResponse plus the
+// Lifetime the reply was validated against (L3). The published
+// deployment-stage-recheck contract (deploymentrecheck.go) is the only
+// caller that needs to bind further authority - a permit - to this exact
+// connection (L4); every other caller uses SendAndWaitForResponse and
+// ignores it.
+func SendAndWaitForResponseWithLifetime(ctx context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
 	return sendAndWait(ctx, SendToServer, msg)
 }
 
-// sendAndWait sends msg with send and waits for the reply on its tag.
-func sendAndWait(ctx context.Context, send func(*l2sec.FromClusterAgent) error, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
+// sendAndWait sends msg with send and waits for the reply on its tag. It
+// returns the Lifetime the reply was validated against (L3 reply
+// dispatch): the one in effect when send was attempted, accepted only if
+// it is still live at the moment the reply arrives. This replaces the ad
+// hoc generation-sampling that used to live only in deploymentrecheck.go
+// (review findings 1169/1245) with one mechanism every sendAndWait caller
+// gets for free - a reply is delivered only to a waiter that sent on a
+// Lifetime that is still live when it is accepted.
+func sendAndWait(ctx context.Context, send func(*l2sec.FromClusterAgent) error, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
 	tagID := uuid.New()
 	msg.Tag = tagID.String()
 
 	responseChan := make(chan *l2sec.ToClusterAgent, 1)
 	pendingResponses.Store(tagID.String(), responseChan)
 	defer pendingResponses.Delete(tagID.String())
+
+	lt := currentLifetime.Load()
 
 	// Review finding 1077: send used to run synchronously and unbounded by
 	// ctx. gRPC flow control can stall stream.Send past any caller deadline
@@ -685,20 +658,29 @@ func sendAndWait(ctx context.Context, send func(*l2sec.FromClusterAgent) error, 
 	select {
 	case err := <-sendDone:
 		if err != nil {
-			return nil, fmt.Errorf("failed to send message: %w", err)
+			return nil, nil, fmt.Errorf("failed to send message: %w", err)
 		}
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 
 	select {
 	case response, ok := <-responseChan:
 		if !ok {
-			return nil, fmt.Errorf("response channel was closed unexpectedly")
+			return nil, nil, fmt.Errorf("response channel was closed unexpectedly")
 		}
-		return response, nil
+		// L3: a reply already buffered for this tag (agent.go's
+		// handleInstruction writes it into this capacity-one channel and
+		// returns) can still be read successfully here even after the
+		// stream it arrived on has since ended - a close on a buffered
+		// channel does not discard a value already written to it. Refuse
+		// it unless the Lifetime sampled above is still live now.
+		if !lt.Live() {
+			return nil, nil, fmt.Errorf("control stream disconnected or reconnected while the reply was in flight")
+		}
+		return response, lt, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 }
 

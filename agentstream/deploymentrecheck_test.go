@@ -19,15 +19,19 @@ const (
 )
 
 // fakeRequestResponse builds a stub for the injectable send function. It
-// records the outgoing message and returns a canned reply, mirroring
-// agentstream.SendAndWaitForResponse's signature exactly so
+// records the outgoing message and returns a canned reply plus a live
+// test Lifetime, mirroring
+// agentstream.SendAndWaitForResponseWithLifetime's signature exactly so
 // requestStageRecheckWith can take either.
-func fakeRequestResponse(t *testing.T, reply *l2sec.ToClusterAgent, err error) (func(context.Context, *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error), *[]*l2sec.FromClusterAgent) {
+func fakeRequestResponse(t *testing.T, reply *l2sec.ToClusterAgent, err error) (func(context.Context, *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error), *[]*l2sec.FromClusterAgent) {
 	t.Helper()
 	var sent []*l2sec.FromClusterAgent
-	fn := func(_ context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
+	fn := func(_ context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
 		sent = append(sent, msg)
-		return reply, err
+		if err != nil {
+			return nil, nil, err
+		}
+		return reply, NewTestLifetime(true), nil
 	}
 	return fn, &sent
 }
@@ -64,59 +68,37 @@ func wrapResponse(jsonB64, tag string) *l2sec.ToClusterAgent {
 	return &l2sec.ToClusterAgent{Type: recheckResponseType, JsonB64: jsonB64, Tag: tag}
 }
 
-// TestRequestStageRecheck_CapturesCurrentStreamGeneration pins review
-// finding 1169: a validated response must carry the stream generation that
-// was current when it was received, so a caller can later detect a
-// disconnect/reconnect that happened since. The generation must reflect
-// whatever establishAndMaintainStream's real connect/disconnect
-// transitions have produced, not a value requestStageRecheckWith invents.
-func TestRequestStageRecheck_CapturesCurrentStreamGeneration(t *testing.T) {
+// TestRequestStageRecheck_CapturesDeliveringLifetime pins review finding
+// 1313/1169/1245: a validated response must carry the Lifetime that
+// delivered it (L4), so a caller can later detect a disconnect/reconnect
+// that happened since by checking Live(). Replaces
+// TestRequestStageRecheck_CapturesCurrentStreamGeneration (generation
+// counter replaced by Lifetime).
+func TestRequestStageRecheck_CapturesDeliveringLifetime(t *testing.T) {
 	authority := UploadAuthority(testBindingID, testUploadID)
 	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))
-	send, _ := fakeRequestResponse(t, wrapResponse(b64, "whatever"), nil)
+	wantLifetime := NewTestLifetime(true)
+	send := func(_ context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
+		return wrapResponse(b64, "whatever"), wantLifetime, nil
+	}
 
-	wantGen := CurrentStreamGeneration()
 	resp, err := requestStageRecheckWith(context.Background(), send, authority, StageArchivePersist, testRetryID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if resp.StreamGeneration != wantGen {
-		t.Fatalf("StreamGeneration = %d, want the generation current at the time: %d", resp.StreamGeneration, wantGen)
+	if resp.Lifetime != wantLifetime {
+		t.Fatalf("Lifetime = %p, want the one send delivered on: %p", resp.Lifetime, wantLifetime)
 	}
 }
 
-// TestRequestStageRecheck_RefusesWhenGenerationMovesDuringSend pins review
-// finding 1245 (repeat of 1169): the prior fix sampled the generation AFTER
-// decoding the reply, which can already be the post-disconnect value if the
-// reply sat in agent.go's buffered, capacity-one tag channel across a
-// disconnect and reconnect - a close on a buffered channel does not discard
-// a value already written to it, so the read still succeeds. This models
-// that: the stream "disconnects" (the generation moves) while the reply is
-// in flight, inside the injected send, before requestStageRecheckWith ever
-// looks at the generation. The call must refuse, not return a permit
-// stamped with the generation it moved to.
-func TestRequestStageRecheck_RefusesWhenGenerationMovesDuringSend(t *testing.T) {
-	authority := UploadAuthority(testBindingID, testUploadID)
-	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))
-	reply := wrapResponse(b64, "whatever")
-
-	send := func(_ context.Context, _ *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
-		streamGeneration.Add(1)
-		return reply, nil
-	}
-
-	genBefore := CurrentStreamGeneration()
-	resp, err := requestStageRecheckWith(context.Background(), send, authority, StageArchivePersist, testRetryID)
-	if err == nil {
-		t.Fatalf("expected a refusal when the generation moved during the send, got permit %+v", resp)
-	}
-	if resp != nil {
-		t.Errorf("expected no response alongside the refusal")
-	}
-	if CurrentStreamGeneration() == genBefore {
-		t.Fatalf("test bug: the generation did not actually move")
-	}
-}
+// The other half of review finding 1245/1169 (repeated as 1313) - that a
+// reply must never be accepted once the Lifetime it was sent on has ended,
+// even though it arrived successfully through a buffered channel - is now
+// enforced once, generically, by sendAndWait itself (see
+// agent_send_test.go's TestSendAndWait_RefusesReplyAfterLifetimeEnded),
+// not by requestStageRecheckWith. This replaces the old
+// TestRequestStageRecheck_RefusesWhenGenerationMovesDuringSend, which
+// exercised that check at this layer back when it lived here.
 
 // TestRequestStageRecheck_RefusesWhenRecheckDeadlinePassedBeforeAcceptingReply
 // pins review finding 1271: a Go select with both a ready reply and a
@@ -132,9 +114,9 @@ func TestRequestStageRecheck_RefusesWhenRecheckDeadlinePassedBeforeAcceptingRepl
 	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))
 	reply := wrapResponse(b64, "whatever")
 
-	send := func(ctx context.Context, _ *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
+	send := func(ctx context.Context, _ *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
 		<-ctx.Done() // the recheck's own deadline passes before the reply is "accepted"
-		return reply, nil
+		return reply, NewTestLifetime(true), nil
 	}
 
 	// A short parent context, so reqCtx (a child bounded by recheckTimeout

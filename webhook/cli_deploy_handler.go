@@ -124,6 +124,16 @@ var (
 			processBuildImageDeployment(tarballData, osid, jobID, repo, tags, dockerfile, buildArgs, buildkitConfig)
 		}()
 	}
+
+	// logReceivedCLIUpload logs that an app-deploy upload passed every
+	// check and the atomic claim. A package var only so a test can observe
+	// this exact point - immediately after the claim and immediately
+	// before the L6 permit recheck and the archive push - and inject a
+	// stream failure there (review finding 1313's "closed during the log
+	// write" case).
+	logReceivedCLIUpload = func(n int, osid, uploadID, token string) {
+		log.Printf("Received CLI deploy upload: %d bytes for osid=%s, uploadID=%s, token=%s...", n, osid, uploadID, token[:8])
+	}
 )
 
 // HandleCLIDeployUpload processes CLI deployment tarball uploads with presigned tokens
@@ -360,21 +370,27 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Review finding 1128: "Check the permit again at the start of archive
-	// persistence." The claim itself is a datastore round trip and can take
-	// long enough for even the permit's own short deadline to pass between
-	// the pre-claim check above and this point. The token is ALREADY
-	// claimed by now regardless of this outcome, so - unlike the pre-claim
-	// check - this is unconditionally terminal: no retry with this token
-	// is possible any more, and Conductor's poller needs a recorded reason.
+	logReceivedCLIUpload(len(tarballData), osid, uploadID, token)
+
+	// Review finding 1128, widened by finding 1313 (repeat of
+	// 1270/1240/1169) to L6: check the permit's own deadline AND its
+	// Lifetime again immediately before archive entry - after every
+	// blocking step since the claim, including the log write just above.
+	// That write used to sit between this check and the push with no check
+	// of its own after it, so a disconnect during it slipped through
+	// uncaught. The claim itself is also a datastore round trip and can
+	// take long enough for even the permit's own short deadline to pass
+	// between the pre-claim check above and this point. The token is
+	// ALREADY claimed by now regardless of this outcome, so - unlike the
+	// pre-claim check - this is unconditionally terminal: no retry with
+	// this token is possible any more, and Conductor's poller needs a
+	// recorded reason.
 	if permit != nil {
 		if refusal := permitStillValid(permit); refusal != nil {
 			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
 			return
 		}
 	}
-
-	log.Printf("Received CLI deploy upload: %d bytes for osid=%s, uploadID=%s, token=%s...", len(tarballData), osid, uploadID, token[:8])
 
 	// Persist the source archive in Harbor before kicking off the build.
 	pushCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)

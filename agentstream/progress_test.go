@@ -65,15 +65,9 @@ func (f *fakeStream) Recv() (*l2sec.ToClusterAgent, error) { select {} }
 func withFakeStream(t *testing.T) *fakeStream {
 	t.Helper()
 	f := &fakeStream{}
-	globalStreamMu.Lock()
-	prev := globalStream
-	globalStream = f
-	globalStreamMu.Unlock()
-	t.Cleanup(func() {
-		globalStreamMu.Lock()
-		globalStream = prev
-		globalStreamMu.Unlock()
-	})
+	prev := currentLifetime.Load()
+	currentLifetime.Store(newLifetime(f))
+	t.Cleanup(func() { currentLifetime.Store(prev) })
 	return f
 }
 

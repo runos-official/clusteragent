@@ -168,12 +168,9 @@ func TestVerifyBuildImageHarborIdentity(t *testing.T) {
 func TestPermitStillValid(t *testing.T) {
 	prevClock := permitClock
 	t.Cleanup(func() { permitClock = prevClock })
-	prevGen := currentStreamGeneration
-	t.Cleanup(func() { currentStreamGeneration = prevGen })
-	currentStreamGeneration = func() uint64 { return 7 }
 
 	deadline := time.Date(2026, 1, 1, 0, 0, 5, 0, time.UTC)
-	resp := &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, ExpiresAt: deadline, StreamGeneration: 7}
+	resp := &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, ExpiresAt: deadline, Lifetime: agentstream.NewTestLifetime(true)}
 
 	permitClock = func() time.Time { return deadline.Add(-1 * time.Millisecond) }
 	if refusal := permitStillValid(resp); refusal != nil {
@@ -190,31 +187,30 @@ func TestPermitStillValid(t *testing.T) {
 	}
 }
 
-// TestPermitStillValid_RefusesOnStreamGenerationMismatch pins review
-// finding 1169: a permit received on one stream generation must not
-// authorize anything once the control stream has disconnected, reconnected,
-// or both - even while the permit's own expiry is still in the future, and
-// even if a replacement connection is live again by the time this runs.
-func TestPermitStillValid_RefusesOnStreamGenerationMismatch(t *testing.T) {
+// TestPermitStillValid_RefusesWhenLifetimeEnded pins review finding 1313
+// (repeat of 1270/1240/1169): a permit received on one Lifetime must not
+// authorize anything once the control stream it arrived on has ended -
+// even while the permit's own expiry is still in the future, and even if a
+// replacement connection is live again by the time this runs. Replaces
+// TestPermitStillValid_RefusesOnStreamGenerationMismatch (generation
+// counter replaced by Lifetime).
+func TestPermitStillValid_RefusesWhenLifetimeEnded(t *testing.T) {
 	prevClock := permitClock
 	t.Cleanup(func() { permitClock = prevClock })
 	permitClock = func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) }
 
-	prevGen := currentStreamGeneration
-	t.Cleanup(func() { currentStreamGeneration = prevGen })
-
 	deadline := time.Date(2026, 1, 1, 0, 0, 5, 0, time.UTC)
-	resp := &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, ExpiresAt: deadline, StreamGeneration: 3}
+	lt := agentstream.NewTestLifetime(true)
+	resp := &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, ExpiresAt: deadline, Lifetime: lt}
 
-	currentStreamGeneration = func() uint64 { return 3 }
 	if refusal := permitStillValid(resp); refusal != nil {
-		t.Fatalf("same generation must pass, got status=%d reason=%q", refusal.status, refusal.reason)
+		t.Fatalf("a live Lifetime must pass, got status=%d reason=%q", refusal.status, refusal.reason)
 	}
 
-	currentStreamGeneration = func() uint64 { return 4 } // disconnected and/or reconnected since
+	agentstream.EndTestLifetime(lt) // disconnected and/or reconnected since
 	refusal := permitStillValid(resp)
 	if refusal == nil {
-		t.Fatal("expected a refusal once the stream generation has changed")
+		t.Fatal("expected a refusal once the Lifetime has ended")
 	}
 	if refusal.status != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", refusal.status)
