@@ -31,7 +31,7 @@ func TestHandleCLIDeployUpload_QueueAdmissionRefusalRecordsPollableFailure(t *te
 	t.Cleanup(func() { requestStageRecheck = prevRecheck })
 	requestStageRecheck = func(_ context.Context, authority agentstream.RecheckAuthority, stage agentstream.RecheckStage, _ string) (*agentstream.StageResponse, error) {
 		if stage == agentstream.StageArchivePersist {
-			return &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)}, nil
+			return &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), Lifetime: agentstream.NewTestLifetime(true)}, nil
 		}
 		return &agentstream.StageResponse{Outcome: agentstream.OutcomeDeny, Code: "queue_admission_denied"}, nil
 	}
@@ -68,7 +68,7 @@ func TestHandleCLIDeployUpload_ScopedPermitForwardsAuthorityToAsyncBuild(t *test
 		t:              t,
 		token:          token,
 		buildkitConfig: &agentstream.BuildKitConfig{},
-		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)},
+		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), Lifetime: agentstream.NewTestLifetime(true)},
 	}
 	h.install()
 
@@ -113,7 +113,7 @@ func TestHandleCLIDeployUpload_ScopedWithoutDurableJobIDRefusesAtQueueAdmission(
 	t.Cleanup(func() { requestStageRecheck = prevRecheck })
 	requestStageRecheck = func(_ context.Context, authority agentstream.RecheckAuthority, stage agentstream.RecheckStage, _ string) (*agentstream.StageResponse, error) {
 		calls++
-		return &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)}, nil
+		return &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), Lifetime: agentstream.NewTestLifetime(true)}, nil
 	}
 
 	w := doUpload(t, validTarGz(t))

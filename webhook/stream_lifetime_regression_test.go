@@ -176,8 +176,7 @@ func TestHandleCLIDeployUpload_StreamLifetime(t *testing.T) {
 
 		ts2 := newRegressionStream(t)
 		resultCh2 := h.uploadAsync(t, 2*time.Second)
-		req2 := ts2.awaitSent(t)
-		ts2.deliver(permitReplyFor(t, req2))
+		ts2.servePermits(t, scopedUploadRecheckCount)
 
 		w2 := <-resultCh2
 		if w2.Code != http.StatusAccepted {
@@ -195,8 +194,7 @@ func TestHandleCLIDeployUpload_StreamLifetime(t *testing.T) {
 		h.mu.Unlock()
 
 		resultCh3 := h.uploadAsync(t, 2*time.Second)
-		req3 := ts2.awaitSent(t)
-		ts2.deliver(permitReplyFor(t, req3))
+		ts2.servePermits(t, scopedUploadRecheckCount)
 		w3 := <-resultCh3
 		if w3.Code != http.StatusAccepted {
 			t.Fatalf("request #3 (after ts1's delayed drain ran) status = %d, want 202 (body %q)", w3.Code, w3.Body.String())
@@ -235,8 +233,7 @@ func TestHandleCLIDeployUpload_StreamLifetime(t *testing.T) {
 
 		// The successor must still be usable for an ordinary request.
 		resultCh := h.uploadAsync(t, 2*time.Second)
-		req := ts2.awaitSent(t)
-		ts2.deliver(permitReplyFor(t, req))
+		ts2.servePermits(t, scopedUploadRecheckCount)
 		got := <-resultCh
 		if got.Code != http.StatusAccepted {
 			t.Fatalf("status = %d, want 202 on the live successor stream (body %q)", got.Code, got.Body.String())
@@ -249,8 +246,7 @@ func TestHandleCLIDeployUpload_StreamLifetime(t *testing.T) {
 		ts := newRegressionStream(t)
 
 		resultCh := h.uploadAsync(t, 2*time.Second)
-		req := ts.awaitSent(t)
-		ts.deliver(permitReplyFor(t, req))
+		ts.servePermits(t, scopedUploadRecheckCount)
 
 		w := <-resultCh
 		if w.Code != http.StatusAccepted {
@@ -455,6 +451,28 @@ func permitReplyFor(t *testing.T, req *l2sec.FromClusterAgent) *l2sec.ToClusterA
 	}
 }
 
+// scopedUploadRecheckCount is how many stage rechecks HandleCLIDeployUpload
+// performs for ONE scoped upload that runs to completion: archive_persist
+// before the token claim (story 338), and queue_admission after the archive
+// push and before the build job row (story 339). A row that expects the
+// upload to SUCCEED must answer both. Answering only the first leaves the
+// second waiting for a reply that never arrives, so it hits its own recheck
+// deadline and the upload is refused with "Upload refused; prepare a new
+// upload to retry" - a reply timeout, not a Lifetime problem. A row that
+// expects a REFUSAL deliberately answers fewer and is left alone.
+const scopedUploadRecheckCount = 2
+
+// servePermits answers the next n recheck requests with correlated permits,
+// in sequence: the handler sends request i+1 only after acting on the
+// permit for request i, so awaiting and answering them one at a time from
+// the test goroutine drives the whole upload through.
+func (s *regressionStream) servePermits(t *testing.T, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		s.deliver(permitReplyFor(t, s.awaitSent(t)))
+	}
+}
+
 // --- handler harness ---------------------------------------------------
 
 // regressionHarness installs every HandleCLIDeployUpload collaborator
@@ -599,4 +617,77 @@ func (h *regressionHarness) assertClaimedPushedAndBuilt(t *testing.T) {
 func mustValidTarGz(t *testing.T) []byte {
 	t.Helper()
 	return validTarGz(t)
+}
+
+// TestRequestStageRecheck_RealPathStampsDeliveringLifetime drives the REAL,
+// unstubbed agentstream.RequestStageRecheck - the exact function the
+// production requestStageRecheck variable points at
+// (webhook/scoped_upload_admission.go) - over the real send, receive and
+// tag-dispatch loop (agentstream.DriveTestStream), with nothing faked but
+// the gRPC stream itself.
+//
+// It exists because every OTHER test in this package supplies the permit's
+// Lifetime by hand, in a StageResponse literal. That makes all of them
+// blind to the one thing permitStillValid depends on: that the production
+// path actually STAMPS the delivering stream's Lifetime onto the permit it
+// returns. If the stamp were dropped, those literals would keep passing
+// while every real upload was refused. This test is the only thing that
+// would notice, so it asserts the stamp directly: live while the
+// delivering stream is up, ended once that stream disconnects, and still
+// ended after a successor stream has reconnected.
+func TestRequestStageRecheck_RealPathStampsDeliveringLifetime(t *testing.T) {
+	ts := newRegressionStream(t)
+
+	binding := scopedUploadToken().AuthorizationBinding
+	authority := agentstream.UploadAuthority(binding.BindingID, binding.UploadID)
+
+	type outcome struct {
+		resp *agentstream.StageResponse
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		resp, err := agentstream.RequestStageRecheck(
+			context.Background(), authority, agentstream.StageArchivePersist, uuid.New().String())
+		done <- outcome{resp: resp, err: err}
+	}()
+
+	// The real listenForInstructions loop dispatches this reply; nothing
+	// here touches requestStageRecheck or StageResponse.Lifetime by hand.
+	ts.deliver(permitReplyFor(t, ts.awaitSent(t)))
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("the real recheck path returned an error: %v", got.err)
+	}
+	if got.resp.Outcome != agentstream.OutcomePermit {
+		t.Fatalf("outcome = %q, want permit", got.resp.Outcome)
+	}
+
+	// Live, while the stream that delivered the permit is still up.
+	if got.resp.Lifetime == nil {
+		t.Fatal("the real recheck path returned a permit with NO Lifetime stamped: permitStillValid would refuse every real scoped upload")
+	}
+	if !got.resp.Lifetime.Live() {
+		t.Fatal("permit Lifetime is not live while the stream that delivered it is still up")
+	}
+	if got.resp.Lifetime != ts.lifetime {
+		t.Fatalf("permit carries Lifetime %p, want the one the delivering stream published (%p)", got.resp.Lifetime, ts.lifetime)
+	}
+
+	// Ended, once that exact stream disconnects.
+	ts.fail(io.ErrClosedPipe)
+	if got.resp.Lifetime.Live() {
+		t.Fatal("permit Lifetime is still live after the stream that delivered it disconnected")
+	}
+
+	// Still ended after a RECONNECT: a live successor must never revive an
+	// earlier stream's permit, which is the gap L4 exists to close.
+	successor := newRegressionStream(t)
+	if !successor.lifetime.Live() {
+		t.Fatal("test bug: expected a live successor stream")
+	}
+	if got.resp.Lifetime.Live() {
+		t.Fatal("permit Lifetime came back to life once a successor stream reconnected")
+	}
 }
