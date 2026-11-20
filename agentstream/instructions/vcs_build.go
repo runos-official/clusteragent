@@ -48,20 +48,26 @@ type VcsBuildRequest struct {
 	// ConductorJobID (story 339) is Conductor's durable job-authority id
 	// (handbook 949 C3's "job: jobId" stage authority), a SIBLING of JobID
 	// (which keeps its existing, unrelated meaning above) — never a
-	// repurposing of it. Must equal the value VCS_FETCH_SOURCE bound to
-	// this osid+sha's cache entry; empty means an explicit legacy VCS
-	// deploy. Omitted by a caller that predates this field.
+	// repurposing of it. Conductor sends this unconditionally, for legacy
+	// and human-initiated dispatches too (review finding 1397), so its
+	// presence alone is NOT the authorization signal: see
+	// AuthorizationClassification. Must equal the value VCS_FETCH_SOURCE
+	// bound to this osid+sha+job's cache slot.
 	ConductorJobID string `json:"conductorJobId,omitempty"`
+	// AuthorizationClassification (story 339, review finding 1397) is the
+	// EXPLICIT scoped/legacy signal, independent of ConductorJobID's
+	// presence: "scoped" requires a well-formed ConductorJobID and
+	// performs the queue_admission/build_start/deployment_patch stage
+	// rechecks; omitted or any other value is an explicit legacy deploy
+	// and never performs a recheck, even though ConductorJobID may still
+	// be present. There is no fallback in either direction.
+	AuthorizationClassification string `json:"authorizationClassification,omitempty"`
 }
 
-// authorizationClassification reports this request's classification purely
-// from ConductorJobID's presence, matching VCS_FETCH_SOURCE's own rule
-// (vcs_fetch_source.go): empty id means legacy, non-empty means scoped.
-func (r VcsBuildRequest) authorizationClassification() string {
-	if r.ConductorJobID == "" {
-		return ""
-	}
-	return datastore.AuthorizationScoped
+// isScoped reports this request's EXPLICIT classification. Never inferred
+// from ConductorJobID's presence (review finding 1397).
+func (r VcsBuildRequest) isScoped() bool {
+	return r.AuthorizationClassification == datastore.AuthorizationScoped
 }
 
 // VcsBuildResponse acknowledges that the cluster agent has accepted the
@@ -186,7 +192,27 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 		})
 	}
 
-	paths, ok := vcsWorkdirCacheGet(req.OSID, req.SHA)
+	// Review finding 1397: classification is EXPLICIT, never inferred from
+	// ConductorJobID's presence. A scoped request with no well-formed id
+	// refuses outright, before any cache lookup - there is no fallback to
+	// legacy.
+	isScoped := req.isScoped()
+	if isScoped && !jobAuthorityIDPattern.MatchString(req.ConductorJobID) {
+		return replyVcsBuild(replyType, VcsBuildResponse{
+			Success: false,
+			Message: "missing or invalid durable job authority for a scoped build",
+		})
+	}
+	// Review finding 1400: look the workdir up by the SAME {osid, sha,
+	// jobID} slot VCS_FETCH_SOURCE stored it under (jobID "" for legacy,
+	// ignoring any raw ConductorJobID on a legacy request per finding
+	// 1397), so two overlapping fetches for the same app+SHA under
+	// different jobs can never collide on one shared slot.
+	cacheJobID := ""
+	if isScoped {
+		cacheJobID = req.ConductorJobID
+	}
+	paths, ok := vcsWorkdirCacheGet(req.OSID, req.SHA, cacheJobID)
 	if !ok {
 		return replyVcsBuild(replyType, VcsBuildResponse{
 			Success: false,
@@ -194,21 +220,15 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 		})
 	}
 
-	// Story 339: the cache entry's own job-authority attribution (bound by
-	// VCS_FETCH_SOURCE) must match this request's exactly. A cache entry
-	// from another binding, app, job, or source identity cannot satisfy
-	// this request (plan "VCS propagation") - never fall back to treating
-	// either side's mismatch as legacy.
-	if paths.AuthorizationClassification != req.authorizationClassification() {
+	// Defense in depth: the slot lookup above already isolates by job, but
+	// confirm the entry's own stored attribution still agrees - a cache
+	// entry from another binding, app, job, or source identity must never
+	// satisfy this request (plan "VCS propagation"), and this never falls
+	// back to treating either side's mismatch as legacy.
+	if paths.AuthorizationClassification != req.AuthorizationClassification || paths.ConductorJobID != cacheJobID {
 		return replyVcsBuild(replyType, VcsBuildResponse{
 			Success: false,
-			Message: "fetched source does not match this build's authorization classification",
-		})
-	}
-	if paths.ConductorJobID != req.ConductorJobID {
-		return replyVcsBuild(replyType, VcsBuildResponse{
-			Success: false,
-			Message: "fetched source does not match this build's job authority",
+			Message: "fetched source does not match this build's authorization",
 		})
 	}
 
@@ -217,7 +237,7 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 	// build row is created."). A refusal creates no job row and starts no
 	// goroutine; the already-authorized source fetch remains the only
 	// completed effect for this stage.
-	if req.ConductorJobID != "" {
+	if isScoped {
 		if err := requireJobStagePermit(context.Background(), req.ConductorJobID, StageQueueAdmission); err != nil {
 			log.Printf("VCS_BUILD: queue_admission stage recheck refused for osid=%s sha=%s: %v", req.OSID, req.SHA, err)
 			return replyVcsBuild(replyType, VcsBuildResponse{
@@ -238,7 +258,7 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 
 	cleanRepoURL := stripURLCredentials(req.RepoCloneURL)
 	var createErr error
-	if req.ConductorJobID != "" {
+	if isScoped {
 		createErr = createScopedBuildKitJob(buildJobID, req.ConductorJobID, req.OSID, cleanRepoURL, req.Branch, req.SHA)
 	} else {
 		createErr = createBuildKitJob(buildJobID, req.OSID, cleanRepoURL, req.Branch, req.SHA)
@@ -269,20 +289,19 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 			BuildOnly:                   req.BuildOnly,
 			Repo:                        cleanRepoURL,
 			Branch:                      req.Branch,
-			AuthorizationClassification: req.authorizationClassification(),
-			AuthorityJobID:              req.ConductorJobID,
-			// Cleanup deletes the specific workdir this build used. We can't
-			// chase the cache (vcsWorkdirCacheDelete) because workdirs are now
-			// unique per VCS_FETCH_SOURCE call: a concurrent fetch for the
-			// same {osid, sha} may have overwritten the cache entry between
-			// fetch return and build cleanup, and we don't want to wipe its
-			// fresh tree. We only clear the cache entry if it still points
-			// at our workdir.
+			AuthorizationClassification: req.AuthorizationClassification,
+			AuthorityJobID:              cacheJobID,
+			// Cleanup deletes the specific workdir this build used, from
+			// this job's own isolated cache slot (review finding 1400): a
+			// concurrent fetch for a DIFFERENT job under the same osid+sha
+			// has its own slot now, so clearing this one never touches it.
+			// We still only clear the entry if it still points at our
+			// workdir, in case this same slot was re-fetched since.
 			Cleanup: func() {
 				if err := os.RemoveAll(workdir); err != nil {
 					log.Printf("VCS_BUILD: cleanup of workdir %s: %v", workdir, err)
 				}
-				vcsWorkdirCacheDeleteIfPath(osid, sha, workdir)
+				vcsWorkdirCacheDeleteIfPath(osid, sha, cacheJobID, workdir)
 			},
 		})
 	}()

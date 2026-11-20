@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -11,6 +12,16 @@ import (
 	"github.com/runos-official/clusteragent/agentstream"
 	"github.com/runos-official/clusteragent/datastore"
 )
+
+// jobAuthorityIDPattern requires a canonical lowercase UUID, matching
+// agentstream.JobAuthority's own requirement (agentstream's
+// authority.validate()). requireJobStagePermit checks this locally before
+// ever calling the transport, so a scoped caller whose stored durable job
+// id is missing or malformed (review finding 1397: this must never be
+// confused with a legacy job that simply has none to check) gets a clean
+// refusal instead of an opaque transport error - or, in a test with a
+// transport fake that does not itself validate shape, a false permit.
+var jobAuthorityIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // permitClock is the injected clock admitScopedUpload and its caller use to
 // judge a permit's own expiry. A package var so tests can simulate time
@@ -157,6 +168,9 @@ func permitStillValid(resp *agentstream.StageResponse) *uploadRefusal {
 // interposed round trip (no atomic claim) that could let the permit's own
 // short deadline or a disconnect pass unnoticed in between.
 func requireJobStagePermit(ctx context.Context, authorityJobID string, stage agentstream.RecheckStage) *uploadRefusal {
+	if !jobAuthorityIDPattern.MatchString(authorityJobID) {
+		return unavailableUpload("missing or invalid durable job authority")
+	}
 	retryID := uuid.New().String()
 	resp, err := requestStageRecheck(ctx, agentstream.JobAuthority(authorityJobID), stage, retryID)
 	if err != nil {

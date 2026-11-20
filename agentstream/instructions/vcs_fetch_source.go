@@ -45,10 +45,21 @@ type VcsFetchSourceRequest struct {
 	// ConductorJobID (story 339) is Conductor's durable job-authority id
 	// (handbook 949 C3's "job: jobId" stage authority: source_fetch) for
 	// this VCS deploy — the durable Postgres jobs.id, a SIBLING of SHA,
-	// never a repurposing of it. Empty means an explicit legacy VCS deploy
-	// (no stage recheck), matching the upload path's no-fallback
-	// discipline. Omitted by a caller that predates this field.
+	// never a repurposing of it. Conductor sends this unconditionally, for
+	// legacy and human-initiated dispatches too (review finding 1397), so
+	// its presence alone is NOT the authorization signal: see
+	// AuthorizationClassification.
 	ConductorJobID string `json:"conductorJobId,omitempty"`
+	// AuthorizationClassification (story 339, review finding 1397) is the
+	// EXPLICIT scoped/legacy signal, independent of ConductorJobID's
+	// presence: "scoped" requires a well-formed ConductorJobID and
+	// performs the source_fetch stage recheck; omitted or any other value
+	// is an explicit legacy deploy and never performs a recheck, even
+	// though ConductorJobID may still be present. There is no fallback in
+	// either direction - a scoped classification with a missing or
+	// malformed ConductorJobID refuses outright, it does not fall back to
+	// legacy.
+	AuthorizationClassification string `json:"authorizationClassification,omitempty"`
 }
 
 // VcsFetchSourceServiceYaml carries one runos.service.*.yaml file's contents
@@ -199,12 +210,22 @@ func VcsFetchSource(jsonB64 string) (string, string, error) {
 		})
 	}
 
-	// Story 339: a scoped VCS deploy requires a fresh, current source_fetch
-	// permit before the clone - the stage model's own mutation boundary
-	// ("before a scoped VCS clone or cache write"). An explicit legacy
-	// deploy (empty ConductorJobID) keeps its historical, unconditional
-	// behavior; there is no fallback in either direction.
-	if req.ConductorJobID != "" {
+	// Story 339 / review finding 1397: classification is EXPLICIT, never
+	// inferred from ConductorJobID's presence - Conductor sends that id
+	// unconditionally, including for legacy and human-initiated deploys.
+	// A scoped deploy with no well-formed id refuses outright, before the
+	// clone, rather than falling back to legacy. An explicit legacy
+	// deploy never performs the recheck, even if ConductorJobID happens
+	// to be present.
+	isScoped := req.AuthorizationClassification == datastore.AuthorizationScoped
+	if isScoped {
+		if !jobAuthorityIDPattern.MatchString(req.ConductorJobID) {
+			log.Printf("VCS_FETCH_SOURCE: scoped deploy missing a valid durable job id for osid=%s sha=%s", req.OSID, req.SHA)
+			return reply(replyType, VcsFetchSourceResponse{
+				Success: false,
+				Message: "source fetch refused",
+			})
+		}
 		if err := requireJobStagePermit(context.Background(), req.ConductorJobID, StageSourceFetch); err != nil {
 			log.Printf("VCS_FETCH_SOURCE: source_fetch stage recheck refused for osid=%s sha=%s: %v", req.OSID, req.SHA, err)
 			return reply(replyType, VcsFetchSourceResponse{
@@ -262,19 +283,26 @@ func VcsFetchSource(jsonB64 string) (string, string, error) {
 		})
 	}
 
-	authorizationClassification := ""
-	if req.ConductorJobID != "" {
-		authorizationClassification = datastore.AuthorizationScoped
+	// Review finding 1400: key the cache slot by the durable job id for a
+	// scoped fetch, so two overlapping fetches for the same app+SHA under
+	// DIFFERENT scoped jobs never collide. An explicit legacy fetch keeps
+	// the historical osid:sha-only key (cacheJobID "") - there is no job
+	// id to disambiguate legacy traffic by, and review finding 1397
+	// requires ignoring any raw ConductorJobID Conductor sends alongside
+	// a legacy classification rather than using it here.
+	cacheJobID := ""
+	if isScoped {
+		cacheJobID = req.ConductorJobID
 	}
+	cacheKey := vcsWorkdirCacheKey(req.OSID, req.SHA, cacheJobID)
 
-	cacheKey := vcsWorkdirCacheKey(req.OSID, req.SHA)
-	vcsWorkdirCachePut(req.OSID, req.SHA, VcsWorkdirBuildPaths{
+	vcsWorkdirCachePut(req.OSID, req.SHA, cacheJobID, VcsWorkdirBuildPaths{
 		Workdir:                     workdir,
 		ContextPath:                 paths.ContextPath,
 		DockerfileDir:               paths.DockerfileDir,
 		DockerfileFilename:          paths.DockerfileFilename,
-		AuthorizationClassification: authorizationClassification,
-		ConductorJobID:              req.ConductorJobID,
+		AuthorizationClassification: req.AuthorizationClassification,
+		ConductorJobID:              cacheJobID,
 	})
 
 	// -1 = field omitted on the wire (conductor preserves live state); >=0 =

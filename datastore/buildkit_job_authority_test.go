@@ -3,6 +3,7 @@ package datastore
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -117,9 +118,10 @@ func TestCreateScopedBuildKitJob_RejectsInvalidAuthorityJobID(t *testing.T) {
 }
 
 // TestCreateScopedBuildKitJob_UpsertPreservesOriginalBinding proves a retry
-// through the SAME job_id (the CLI upsert-reopens path, review finding
-// 1133) never changes the row's classification or authority job id: the
-// binding is immutable once the row first exists, even across a reopen.
+// through the SAME job_id, with the SAME attribution (the CLI
+// upsert-reopens path, review finding 1133), succeeds and leaves the
+// binding unchanged: the binding is immutable once the row first exists,
+// even across a reopen.
 func TestCreateScopedBuildKitJob_UpsertPreservesOriginalBinding(t *testing.T) {
 	setupTestDB(t)
 
@@ -132,10 +134,9 @@ func TestCreateScopedBuildKitJob_UpsertPreservesOriginalBinding(t *testing.T) {
 		t.Fatalf("UpdateBuildKitJobStatus(failed): %v", err)
 	}
 
-	// A legacy re-creation call (e.g. a caller that forgot the binding) must
-	// not silently downgrade or overwrite the stored scoped attribution.
-	if err := CreateBuildKitJob(jobID, "osid-1", "", "", jobID); err != nil {
-		t.Fatalf("retry CreateBuildKitJob: %v", err)
+	// A legitimate retry with the SAME scoped attribution reopens cleanly.
+	if err := CreateScopedBuildKitJob(jobID, firstAuthority, "osid-1", "", "", jobID); err != nil {
+		t.Fatalf("retry CreateScopedBuildKitJob with the same attribution: %v", err)
 	}
 	reopened, err := GetBuildKitJob(jobID)
 	if err != nil {
@@ -147,6 +148,41 @@ func TestCreateScopedBuildKitJob_UpsertPreservesOriginalBinding(t *testing.T) {
 	}
 	if reopened.Status != JobStatusPending {
 		t.Fatalf("status after reopen = %q, want pending", reopened.Status)
+	}
+}
+
+// TestCreateBuildKitJob_RefusesConflictingReopen proves review finding
+// 1401's fix: a caller that reopens the SAME job_id with DIFFERENT
+// attribution (here, a legacy re-creation call reopening a row that was
+// first created scoped) is refused outright - the row's real scoped
+// attribution is never silently discarded, and a build never runs under
+// attribution it was not actually granted.
+func TestCreateBuildKitJob_RefusesConflictingReopen(t *testing.T) {
+	setupTestDB(t)
+
+	const jobID = "scoped-job-conflict"
+	const firstAuthority = "33333333-3333-3333-3333-333333333333"
+	if err := CreateScopedBuildKitJob(jobID, firstAuthority, "osid-1", "", "", jobID); err != nil {
+		t.Fatalf("first CreateScopedBuildKitJob: %v", err)
+	}
+	if err := UpdateBuildKitJobStatus(jobID, JobStatusFailed); err != nil {
+		t.Fatalf("UpdateBuildKitJobStatus(failed): %v", err)
+	}
+
+	if err := CreateBuildKitJob(jobID, "osid-1", "", "", jobID); err == nil {
+		t.Fatal("expected a conflict error reopening a scoped row as legacy")
+	}
+
+	unchanged, err := GetBuildKitJob(jobID)
+	if err != nil {
+		t.Fatalf("GetBuildKitJob after the refused reopen: %v", err)
+	}
+	if unchanged.AuthorizationClassification != AuthorizationScoped || unchanged.AuthorityJobID != firstAuthority {
+		t.Fatalf("binding after refused reopen = (%q, %q), want unchanged (%q, %q)",
+			unchanged.AuthorizationClassification, unchanged.AuthorityJobID, AuthorizationScoped, firstAuthority)
+	}
+	if unchanged.Status != JobStatusFailed {
+		t.Fatalf("status after refused reopen = %q, want unchanged failed", unchanged.Status)
 	}
 }
 
@@ -181,5 +217,59 @@ func TestFailNonTerminalBuildKitJobs_PreservesBinding(t *testing.T) {
 	if job.AuthorizationClassification != AuthorizationScoped || job.AuthorityJobID != authorityJobID {
 		t.Fatalf("binding after restart cleanup = (%q, %q), want unchanged (%q, %q)",
 			job.AuthorizationClassification, job.AuthorityJobID, AuthorizationScoped, authorityJobID)
+	}
+}
+
+// TestRecordFailedUploadIfUnclaimed_ThenCorrectedScopedRetrySucceeds proves
+// review finding 1401's real scenario end to end: a pre-claim refusal for
+// a SCOPED token (the tarball/Dockerfile checks, before the token is
+// claimed) must record the token's real attribution, not a hardcoded
+// legacy default - otherwise a later corrected retry that claims the same
+// token and reaches CreateScopedBuildKitJob under the same job_id (the
+// uploadID) would be refused by the reopen conflict check, and the
+// legitimate scoped build could never run.
+func TestRecordFailedUploadIfUnclaimed_ThenCorrectedScopedRetrySucceeds(t *testing.T) {
+	setupTestDB(t)
+
+	const raw = "token-1401-scoped-retry"
+	const jobID = "upload-1401-scoped"
+	const authorityJobID = "44444444-4444-4444-4444-444444444444"
+	if err := CreatePullToken(raw, "osid-1", jobID, time.Now().Add(5*time.Minute)); err != nil {
+		t.Fatalf("CreatePullToken: %v", err)
+	}
+
+	// The first attempt's pre-claim refusal (e.g. an oversized tarball)
+	// carries the token's REAL scoped attribution, not a hardcoded legacy
+	// default.
+	if err := RecordFailedUploadIfUnclaimed(raw, jobID, "osid-1", "tarball refused", AuthorizationScoped, authorityJobID); err != nil {
+		t.Fatalf("RecordFailedUploadIfUnclaimed: %v", err)
+	}
+	afterRefusal, err := GetBuildKitJob(jobID)
+	if err != nil {
+		t.Fatalf("GetBuildKitJob after refusal: %v", err)
+	}
+	if afterRefusal.AuthorizationClassification != AuthorizationScoped || afterRefusal.AuthorityJobID != authorityJobID {
+		t.Fatalf("refusal row attribution = (%q, %q), want (%q, %q)",
+			afterRefusal.AuthorizationClassification, afterRefusal.AuthorityJobID, AuthorizationScoped, authorityJobID)
+	}
+
+	// The token is still unused (pre-claim refusal never claims it), so a
+	// corrected retry can claim it and reach the real admission path.
+	if err := MarkUploadTokenUsed(raw, nil); err != nil {
+		t.Fatalf("a corrected retry's claim must still succeed: %v", err)
+	}
+	if err := CreateScopedBuildKitJob(jobID, authorityJobID, "osid-1", "", "", jobID); err != nil {
+		t.Fatalf("the corrected retry's CreateScopedBuildKitJob must succeed, not conflict: %v", err)
+	}
+	reopened, err := GetBuildKitJob(jobID)
+	if err != nil {
+		t.Fatalf("GetBuildKitJob after the corrected retry: %v", err)
+	}
+	if reopened.Status != JobStatusPending {
+		t.Fatalf("status after the corrected retry = %q, want pending", reopened.Status)
+	}
+	if reopened.AuthorizationClassification != AuthorizationScoped || reopened.AuthorityJobID != authorityJobID {
+		t.Fatalf("binding after the corrected retry = (%q, %q), want (%q, %q)",
+			reopened.AuthorizationClassification, reopened.AuthorityJobID, AuthorizationScoped, authorityJobID)
 	}
 }

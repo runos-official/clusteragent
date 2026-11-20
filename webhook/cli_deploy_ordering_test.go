@@ -95,7 +95,7 @@ func (h *uploadHarness) install() {
 	// never reserve the token's (fixed, retryable) uploadID as a
 	// build-job row, but a TERMINAL one must record exactly one. Track
 	// every call so tests can assert either shape.
-	recordFailedUpload = func(jobID, _, _ string) error {
+	recordFailedUpload = func(jobID, _, _, _, _ string) error {
 		h.mu.Lock()
 		h.failedUploadJobIDs = append(h.failedUploadJobIDs, jobID)
 		h.mu.Unlock()
@@ -107,7 +107,7 @@ func (h *uploadHarness) install() {
 	// else", so every existing test's assumptions keep holding; a test for
 	// finding 1267 itself overrides h.unclaimedCheck to simulate a
 	// concurrent winner.
-	recordFailedUploadIfUnclaimed = func(_, jobID, _, _ string) error {
+	recordFailedUploadIfUnclaimed = func(_, jobID, _, _, _, _ string) error {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.skipFailedUploadIfUnclaimed {

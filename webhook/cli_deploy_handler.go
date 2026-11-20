@@ -221,7 +221,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// poll budget. failUpload's row is upsert-safe, so a later retry with a
 	// fixed tarball and the SAME token/uploadID still claims and builds.
 	if err := checkTarballLimits(tarballData); err != nil {
-		failPreClaimUpload(w, token, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err), uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 		return
 	}
 
@@ -231,7 +231,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// Scans the same in-memory tarball bytes without extracting to disk.
 	// Also terminal (finding 1133): same reasoning as the tarball check.
 	if err := validateDockerfileTarget(tarballData, uploadToken.Dockerfile); err != nil {
-		failPreClaimUpload(w, token, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err))
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err), uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 		return
 	}
 
@@ -274,7 +274,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		// endpoint, against the buildkitConfig the push below will use -
 		// before the build starts and before any push.
 		if refusal := verifyBuildImageHarborIdentity(boundHarborOsid, buildkitConfig.HarborOsid, buildkitConfig.HarborURL); refusal != nil {
-			reportUploadRefusal(w, token, repo, uploadID, refusal)
+			reportUploadRefusal(w, token, repo, uploadID, refusal, uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 
@@ -315,7 +315,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		var refusal *uploadRefusal
 		permit, refusal = admitScopedUpload(ctx, uploadToken.AuthorizationBinding)
 		if refusal != nil {
-			reportUploadRefusal(w, token, osid, uploadID, refusal)
+			reportUploadRefusal(w, token, osid, uploadID, refusal, uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 	case datastore.AuthorizationLegacy:
@@ -335,7 +335,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// outcomes are retryable).
 	if permit != nil {
 		if refusal := permitStillValid(permit); refusal != nil {
-			reportUploadRefusal(w, token, osid, uploadID, refusal)
+			reportUploadRefusal(w, token, osid, uploadID, refusal, uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 	}
@@ -369,7 +369,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// is possible any more, and Conductor's poller needs a recorded reason.
 	if permit != nil {
 		if refusal := permitStillValid(permit); refusal != nil {
-			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message, uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 	}
@@ -384,29 +384,38 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		Username: buildkitConfig.HarborUsername,
 		Password: buildkitConfig.HarborPassword,
 	}, osid, uploadID, tarballData); err != nil {
-		failUpload(w, osid, uploadID, http.StatusInternalServerError, archiveStoreFailure(err))
+		failUpload(w, osid, uploadID, http.StatusInternalServerError, archiveStoreFailure(err), uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 		return
 	}
 	log.Printf("Pushed CLI archive to Harbor: osid=%s uploadID=%s", osid, uploadID)
 
-	// Story 339: a scoped upload with a durable job authority requests
-	// queue admission for it BEFORE the build job row is created (plan
-	// "CLI propagation": "Create the build job only after permit."). A
-	// refusal here creates no job row and starts no goroutine - the
-	// already authorized archive remains the only completed effect for
-	// this upload (plan "Already-started effect boundary").
+	// Story 339: a scoped upload requests queue admission for its durable
+	// job authority BEFORE the build job row is created (plan "CLI
+	// propagation": "Create the build job only after permit."). No job
+	// row is created and no goroutine starts on refusal - the already
+	// authorized archive remains the only completed effect for this
+	// upload (plan "Already-started effect boundary"). The token is
+	// ALREADY claimed and the archive ALREADY pushed by this point, so -
+	// like every other post-claim refusal in this handler - this is
+	// unconditionally terminal: no retry with this token is possible, and
+	// Conductor's deploy job polls uploadID's build row and would
+	// otherwise wait out its whole poll budget instead of failing with a
+	// reason (review findings 1395/1402, FCR 744). The message tells the
+	// caller to prepare a fresh upload rather than retry: the consumed
+	// token itself now only answers 401.
 	//
-	// Gated on DurableJobID's PRESENCE, not on AuthorizationClassification:
-	// Conductor's rollout of durableJobId is independent of (and currently
-	// behind) the scoped-archive-persist rollout story 338 already
-	// consumes, so a scoped upload with no durableJobID is a normal,
-	// supported shape that must keep working exactly as story 338 left
-	// it - archive_persist already rechecked via the upload binding above;
-	// there is simply no later job authority to recheck yet.
-	if uploadToken.DurableJobID != "" {
+	// Gated on AuthorizationClassification, not on DurableJobID's
+	// presence (review finding 1397): datastore.CreateScopedUploadToken
+	// requires a durable job id for every scoped mint, so a scoped token
+	// with a missing or malformed one here is never a supported "nothing
+	// to recheck yet" shape - requireJobStagePermit's own authority-shape
+	// validation refuses it, rather than this silently skipping the
+	// check.
+	if uploadToken.AuthorizationClassification == datastore.AuthorizationScoped {
 		if refusal := requireJobStagePermit(ctx, uploadToken.DurableJobID, agentstream.StageQueueAdmission); refusal != nil {
-			log.Printf("Upload admitted but queue admission refused (osid=%s, uploadID=%s): %s", osid, uploadID, refusal.reason)
-			http.Error(w, refusal.message, refusal.status)
+			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason,
+				"Upload refused; prepare a new upload to retry",
+				uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 	}

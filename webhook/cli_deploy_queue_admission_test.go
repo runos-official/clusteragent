@@ -9,15 +9,17 @@ import (
 	"github.com/runos-official/clusteragent/agentstream"
 )
 
-// TestHandleCLIDeployUpload_QueueAdmissionRefusalStopsBeforeBuildJob pins
-// story 339's plan ("CLI propagation": "If queue admission refuses, do not
-// create or start a build job. The already authorized archive remains the
-// only completed effect."). The archive_persist recheck (admitScopedUpload)
-// permits, the token is claimed and the archive pushed, but the SECOND
-// recheck call (queue_admission) denies: no build starts, and - unlike
-// every other post-claim refusal in this file - no build-job row is
-// recorded either, matching the plan's explicit exception.
-func TestHandleCLIDeployUpload_QueueAdmissionRefusalStopsBeforeBuildJob(t *testing.T) {
+// TestHandleCLIDeployUpload_QueueAdmissionRefusalRecordsPollableFailure
+// pins review findings 1395/1402: the archive_persist recheck
+// (admitScopedUpload) permits, the token is claimed and the archive
+// pushed, but the SECOND recheck call (queue_admission) denies. No
+// goroutine starts and no RUNNABLE build job is created - but, unlike a
+// pre-claim refusal, this one is unconditionally terminal (the token is
+// already consumed), so it MUST still leave a pollable failed row under
+// uploadID, exactly like every other post-claim refusal in this handler;
+// otherwise Conductor's deploy job waits out its whole poll budget at
+// "Wait for build" (FCR 744) instead of failing with a reason.
+func TestHandleCLIDeployUpload_QueueAdmissionRefusalRecordsPollableFailure(t *testing.T) {
 	h := &uploadHarness{
 		t:              t,
 		token:          scopedUploadToken(),
@@ -46,8 +48,8 @@ func TestHandleCLIDeployUpload_QueueAdmissionRefusalStopsBeforeBuildJob(t *testi
 	if h.cliStarted {
 		t.Error("CLI deployment build must not start when queue_admission refuses")
 	}
-	if len(h.failedUploadJobIDs) != 0 {
-		t.Errorf("queue_admission refusal must record no build-job row, got %v", h.failedUploadJobIDs)
+	if len(h.failedUploadJobIDs) != 1 || h.failedUploadJobIDs[0] != "00000000-0000-4000-8000-000000000002" {
+		t.Errorf("queue_admission refusal must record exactly one pollable failed row under uploadID, got %v", h.failedUploadJobIDs)
 	}
 	if w.Code == http.StatusAccepted {
 		t.Errorf("status = %d, want a refusal status, not 202", w.Code)
@@ -87,17 +89,16 @@ func TestHandleCLIDeployUpload_ScopedPermitForwardsAuthorityToAsyncBuild(t *test
 	}
 }
 
-// TestHandleCLIDeployUpload_ScopedWithoutDurableJobIDSkipsQueueAdmission
-// proves backward compatibility with Conductor's current production
-// rollout: a scoped upload (archive_persist already rechecked via the
-// upload binding) whose token carries NO durableJobID - because
-// Conductor's durableJobId field is independent of, and currently behind,
-// the scoped-archive-persist rollout story 338 already consumes - must
-// proceed exactly as story 338 left it. Gating queue_admission on
-// AuthorizationClassification alone (rather than DurableJobID's presence)
-// would refuse every such upload today; this is the regression this test
-// pins.
-func TestHandleCLIDeployUpload_ScopedWithoutDurableJobIDSkipsQueueAdmission(t *testing.T) {
+// TestHandleCLIDeployUpload_ScopedWithoutDurableJobIDRefusesAtQueueAdmission
+// defends in depth against review finding 1397's regression: datastore.
+// CreateScopedUploadToken now refuses to mint a scoped token with no
+// durable job id, so this shape should not reach the handler in practice -
+// but a malformed or legacy-written row could still carry it, and the
+// handler must still fail closed (refuse, no job row, no goroutine)
+// rather than silently treating the missing id as "nothing to recheck,
+// proceed like legacy". requireJobStagePermit's own authority-shape
+// validation (agentstream.JobAuthority) is what actually refuses here.
+func TestHandleCLIDeployUpload_ScopedWithoutDurableJobIDRefusesAtQueueAdmission(t *testing.T) {
 	token := scopedUploadToken()
 	token.DurableJobID = ""
 	h := &uploadHarness{
@@ -112,26 +113,23 @@ func TestHandleCLIDeployUpload_ScopedWithoutDurableJobIDSkipsQueueAdmission(t *t
 	t.Cleanup(func() { requestStageRecheck = prevRecheck })
 	requestStageRecheck = func(_ context.Context, authority agentstream.RecheckAuthority, stage agentstream.RecheckStage, _ string) (*agentstream.StageResponse, error) {
 		calls++
-		if stage != agentstream.StageArchivePersist {
-			t.Errorf("unexpected recheck at stage %q with no durableJobID", stage)
-		}
 		return &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)}, nil
 	}
 
 	w := doUpload(t, validTarGz(t))
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202 (body %q)", w.Code, w.Body.String())
-	}
-	if calls != 1 {
-		t.Errorf("recheck calls = %d, want exactly 1 (archive_persist only)", calls)
+	if w.Code == http.StatusAccepted {
+		t.Fatalf("status = %d, want a refusal, not 202", w.Code)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.cliStarted {
-		t.Fatal("expected the CLI deployment build to start")
+	if h.cliStarted {
+		t.Error("CLI deployment build must not start with a scoped token that carries no durable job id")
 	}
-	if h.cliStartedAuthorityJobID != "" {
-		t.Errorf("forwarded authority job id = %q, want empty", h.cliStartedAuthorityJobID)
+	// archive_persist alone may have been requested (classification is
+	// scoped), but queue_admission must never be, since there is no valid
+	// authority to present for it.
+	if calls > 1 {
+		t.Errorf("recheck calls = %d, want at most 1 (archive_persist only; queue_admission must be skipped on an invalid id)", calls)
 	}
 }
 

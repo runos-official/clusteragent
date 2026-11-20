@@ -99,48 +99,22 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	}
 }
 
-// TestCreateScopedUploadToken_RejectsMalformedDurableJobID proves a scoped
-// upload is refused a mint, not stored with a durable job id it can never
-// use (story 339): every later queue_admission/build_start/deployment_patch
-// stage recheck presents this value to agentstream.JobAuthority, which
-// requires a canonical lowercase UUID. Empty is NOT malformed - durableJobID
-// is optional (Conductor's rollout of it trails the scoped-archive-persist
-// rollout story 338 already consumes) - so it is covered by the separate
-// optional-field test below, not this one.
-func TestCreateScopedUploadToken_RejectsMalformedDurableJobID(t *testing.T) {
+// TestCreateScopedUploadToken_RequiresDurableJobID proves a scoped upload
+// with a missing or malformed durable job id refuses the mint rather than
+// silently selecting legacy (no-recheck) behavior for the later
+// queue_admission/build_start/deployment_patch stages (review finding
+// 1397): the authorization class and the presence of a job id are two
+// independent signals, so an empty id is not a lesser-but-valid shape, it
+// is invalid.
+func TestCreateScopedUploadToken_RequiresDurableJobID(t *testing.T) {
 	setupTestDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	binding := testUploadAuthorityBinding(now)
 
-	for _, durableJobID := range []string{"not-a-uuid", "00000000-0000-4000-8000-00000000000Z"} {
+	for _, durableJobID := range []string{"", "not-a-uuid", "00000000-0000-4000-8000-00000000000Z"} {
 		if err := CreateScopedUploadToken("tok-"+durableJobID, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err == nil {
 			t.Errorf("durableJobID %q: expected an error, got none", durableJobID)
 		}
-	}
-}
-
-// TestCreateScopedUploadToken_DurableJobIDIsOptional proves a scoped upload
-// with NO durable job id mints successfully and round-trips as empty: this
-// is today's real shape (Conductor has not yet rolled out durableJobId),
-// and archive_persist's own recheck (story 338) does not depend on it.
-func TestCreateScopedUploadToken_DurableJobIDIsOptional(t *testing.T) {
-	setupTestDB(t)
-	now := time.Now().UTC().Truncate(time.Second)
-	binding := testUploadAuthorityBinding(now)
-	const raw = "scoped-upload-no-durable-job-id"
-
-	if err := CreateScopedUploadToken(raw, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, ""); err != nil {
-		t.Fatalf("CreateScopedUploadToken with no durableJobID: %v", err)
-	}
-	got, err := GetUploadToken(raw)
-	if err != nil {
-		t.Fatalf("GetUploadToken: %v", err)
-	}
-	if got.AuthorizationClassification != AuthorizationScoped {
-		t.Errorf("classification = %q, want scoped", got.AuthorizationClassification)
-	}
-	if got.DurableJobID != "" {
-		t.Errorf("durable job id = %q, want empty", got.DurableJobID)
 	}
 }
 

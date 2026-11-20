@@ -434,7 +434,9 @@ func TestRecordFailedUploadIfUnclaimed_PostgresLosesRaceToRealClaim(t *testing.T
 	// queue grants the claim first once the lock is released.
 	go func() { claimDone <- MarkUploadTokenUsed(raw, nil) }()
 	time.Sleep(200 * time.Millisecond)
-	go func() { recordDone <- RecordFailedUploadIfUnclaimed(raw, jobID, "osid-1", "lost the race") }()
+	go func() {
+		recordDone <- RecordFailedUploadIfUnclaimed(raw, jobID, "osid-1", "lost the race", AuthorizationLegacy, "")
+	}()
 	time.Sleep(200 * time.Millisecond)
 
 	if err := tx.Commit().Error; err != nil {
