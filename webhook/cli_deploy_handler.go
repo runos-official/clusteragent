@@ -389,14 +389,21 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("Pushed CLI archive to Harbor: osid=%s uploadID=%s", osid, uploadID)
 
-	// Story 339: a scoped upload requests queue admission for its durable
-	// job authority BEFORE the build job row is created (plan "CLI
-	// propagation": "Create the build job only after permit."). A refusal
-	// here creates no job row and starts no goroutine - the already
-	// authorized archive remains the only completed effect for this
-	// upload (plan "Already-started effect boundary"). An explicit legacy
-	// upload (uploadToken.DurableJobID empty) skips this entirely.
-	if uploadToken.AuthorizationClassification == datastore.AuthorizationScoped {
+	// Story 339: a scoped upload with a durable job authority requests
+	// queue admission for it BEFORE the build job row is created (plan
+	// "CLI propagation": "Create the build job only after permit."). A
+	// refusal here creates no job row and starts no goroutine - the
+	// already authorized archive remains the only completed effect for
+	// this upload (plan "Already-started effect boundary").
+	//
+	// Gated on DurableJobID's PRESENCE, not on AuthorizationClassification:
+	// Conductor's rollout of durableJobId is independent of (and currently
+	// behind) the scoped-archive-persist rollout story 338 already
+	// consumes, so a scoped upload with no durableJobID is a normal,
+	// supported shape that must keep working exactly as story 338 left
+	// it - archive_persist already rechecked via the upload binding above;
+	// there is simply no later job authority to recheck yet.
+	if uploadToken.DurableJobID != "" {
 		if refusal := requireJobStagePermit(ctx, uploadToken.DurableJobID, agentstream.StageQueueAdmission); refusal != nil {
 			log.Printf("Upload admitted but queue admission refused (osid=%s, uploadID=%s): %s", osid, uploadID, refusal.reason)
 			http.Error(w, refusal.message, refusal.status)

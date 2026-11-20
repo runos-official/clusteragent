@@ -140,6 +140,17 @@ entry; `VCS_BUILD` must present the exact same values again, or it refuses
 without creating a job row - a cache entry from a different job, app, or
 source identity can never satisfy a different request.
 
+Both fields are optional, and gate every later-stage recheck purely by
+their own presence, never by the request's `authorizationClassification`:
+Conductor's rollout of the durable job id is independent of, and currently
+behind, the scoped-archive-persist rollout story 338 already consumes. A
+scoped CLI upload with no `durableJobId`, or a VCS deploy with no
+`conductorJobId` (today's real shape for every production Conductor),
+keeps working exactly as story 338 left it - archive_persist still
+rechecks via the upload binding; the later stages simply have no job
+authority to recheck against yet and run unchecked until Conductor starts
+sending one.
+
 A build job row (`cluster_agent_buildkit_jobs`) persists an explicit
 `authorization_classification` (`legacy` by default) and a non-secret
 `authority_job_id`, exactly as the upload-token table persists its own

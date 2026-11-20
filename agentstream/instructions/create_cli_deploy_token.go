@@ -56,8 +56,15 @@ type CreateCLIDeployTokenRequest struct {
 	// DurableJobID (story 339) is Conductor's durable job-authority id
 	// (handbook 949 C3's "job: jobId" stage authority) for the deploy this
 	// upload belongs to: a SIBLING of AuthorizationBinding, never stored
-	// inside it (the binding's own jobId must stay null). Required when
-	// AuthorizationClassification is scoped; ignored for a legacy request.
+	// inside it (the binding's own jobId must stay null). OPTIONAL even on
+	// a scoped request: Conductor's rollout of this field is independent
+	// of, and currently behind, the scoped-archive-persist rollout story
+	// 338 already consumes. Present and non-empty, it must be a canonical
+	// lowercase UUID (datastore.CreateScopedUploadToken validates this);
+	// absent, the later queue_admission/build_start/deployment_patch
+	// stages simply have no job authority to recheck against yet and run
+	// unchecked (legacy), same as before this story. Ignored for a legacy
+	// request.
 	DurableJobID string `json:"durableJobId,omitempty"`
 }
 

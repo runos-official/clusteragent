@@ -117,12 +117,19 @@ func CreateUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []
 }
 
 // CreateScopedUploadToken stores one immutable scoped authorization binding
-// plus Conductor's durable job-authority id (story 339), required for every
-// scoped upload: every later queue_admission/build_start/deployment_patch
-// stage recheck for the resulting build presents it to
-// agentstream.JobAuthority. A scoped upload is of no later use without one,
-// so a missing or malformed durableJobID fails the mint rather than storing
-// a token that can admit an archive but can never reach a build.
+// plus, optionally, Conductor's durable job-authority id (story 339):
+// every later queue_admission/build_start/deployment_patch stage recheck
+// for the resulting build presents it to agentstream.JobAuthority.
+// durableJobID is OPTIONAL, not required: Conductor's rollout of this field
+// is independent of (and currently behind) the scoped-archive-persist
+// rollout story 338 already consumes, so a scoped upload with no
+// durableJobID is a normal, supported shape - archive_persist still
+// rechecks via the upload binding exactly as before; only the later job-
+// authority stages have nothing to recheck against and run unchecked
+// (legacy) until Conductor starts sending one. A NON-EMPTY durableJobID
+// must still be well-formed: storing a value that cannot pass
+// agentstream.JobAuthority's own validation would fail every later stage
+// recheck with an opaque transport error instead of a clear refusal now.
 func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []BuildArg, expiresAt time.Time, binding UploadAuthorityBinding, durableJobID string) error {
 	if err := ValidateUploadAuthorityBinding(binding, UploadAuthorityTarget{
 		AppID:    osid,
@@ -131,7 +138,7 @@ func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildA
 	}, expiresAt); err != nil {
 		return err
 	}
-	if !uuidPattern.MatchString(durableJobID) {
+	if durableJobID != "" && !uuidPattern.MatchString(durableJobID) {
 		return fmt.Errorf("invalid durable job id")
 	}
 	gdb, err := activeDB()

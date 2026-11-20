@@ -87,6 +87,54 @@ func TestHandleCLIDeployUpload_ScopedPermitForwardsAuthorityToAsyncBuild(t *test
 	}
 }
 
+// TestHandleCLIDeployUpload_ScopedWithoutDurableJobIDSkipsQueueAdmission
+// proves backward compatibility with Conductor's current production
+// rollout: a scoped upload (archive_persist already rechecked via the
+// upload binding) whose token carries NO durableJobID - because
+// Conductor's durableJobId field is independent of, and currently behind,
+// the scoped-archive-persist rollout story 338 already consumes - must
+// proceed exactly as story 338 left it. Gating queue_admission on
+// AuthorizationClassification alone (rather than DurableJobID's presence)
+// would refuse every such upload today; this is the regression this test
+// pins.
+func TestHandleCLIDeployUpload_ScopedWithoutDurableJobIDSkipsQueueAdmission(t *testing.T) {
+	token := scopedUploadToken()
+	token.DurableJobID = ""
+	h := &uploadHarness{
+		t:              t,
+		token:          token,
+		buildkitConfig: &agentstream.BuildKitConfig{},
+	}
+	h.install()
+
+	calls := 0
+	prevRecheck := requestStageRecheck
+	t.Cleanup(func() { requestStageRecheck = prevRecheck })
+	requestStageRecheck = func(_ context.Context, authority agentstream.RecheckAuthority, stage agentstream.RecheckStage, _ string) (*agentstream.StageResponse, error) {
+		calls++
+		if stage != agentstream.StageArchivePersist {
+			t.Errorf("unexpected recheck at stage %q with no durableJobID", stage)
+		}
+		return &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second)}, nil
+	}
+
+	w := doUpload(t, validTarGz(t))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body %q)", w.Code, w.Body.String())
+	}
+	if calls != 1 {
+		t.Errorf("recheck calls = %d, want exactly 1 (archive_persist only)", calls)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.cliStarted {
+		t.Fatal("expected the CLI deployment build to start")
+	}
+	if h.cliStartedAuthorityJobID != "" {
+		t.Errorf("forwarded authority job id = %q, want empty", h.cliStartedAuthorityJobID)
+	}
+}
+
 // TestHandleCLIDeployUpload_LegacyUploadNeverCallsQueueAdmission proves an
 // explicit legacy upload never calls the recheck transport at all - not at
 // archive_persist (already covered elsewhere) and not at queue_admission -
