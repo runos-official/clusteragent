@@ -7,6 +7,23 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.3.0-rc.1
+
+This hidden release candidate adds the cluster agent's part of scoped machine credentials. A deployment that starts with a scoped credential is now bound to that credential's authority for its whole life, and the agent asks again before each later stage. It needs the Conductor and Nodeward releases of the same work.
+
+### Added
+- **A scoped upload carries its authority with it.** The agent stores the authority binding of a scoped upload, and enforces the upload's purpose and the expiry of the binding.
+- **The agent asks again before it keeps an archive.** Before it persists an uploaded archive, the agent rechecks that the scoped authority still holds. A credential that was revoked or narrowed after the upload started stops here.
+- **The agent asks again before each queued build stage.** A build that waits in the queue is rechecked when it starts, not only when it was accepted.
+
+### Changed
+- **Each agent stream has one lifetime.** A recheck permit belongs to the stream that granted it. A permit from a stream that closed or was replaced is refused, so an upload cannot continue on authority from a connection that is gone.
+- **A refused upload records its failure before the token is claimed**, and a late refusal cannot overwrite the result of the upload that won.
+- **The Dockerfile target check and the extraction agree.** The check before the token claim and the later extraction use the same rules for path components, symlinks and entry order, so a build context is not refused at one step and accepted at the other.
+
+### Known limit
+- When the shared build configuration names one registry and its credentials name another, and both stay that way, the agent cannot tell. A build-image upload could then push to a registry that was not the one verified. This needs a change on the control plane and is tracked for a later release.
+
 ## v1.2.5
 
 No change to the agent's behaviour. This release carries the release tooling into the published history, so the prod record (main) matches dev. The same commit shipped as the hidden release candidate v1.2.5-rc.1.
