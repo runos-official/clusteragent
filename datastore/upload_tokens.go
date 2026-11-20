@@ -77,6 +77,9 @@ type UploadToken struct {
 	BuildTarget                 *BuildTargetSpec        `json:"build_target,omitempty"`
 	AuthorizationClassification string                  `json:"authorizationClassification"`
 	AuthorizationBinding        *UploadAuthorityBinding `json:"authorizationBinding,omitempty"`
+	// DurableJobID is Conductor's durable job-authority id (story 339);
+	// empty for a legacy token. See UploadTokenModel.DurableJobID.
+	DurableJobID string `json:"durableJobId,omitempty"`
 }
 
 // CreateUploadToken creates a new single-use token for uploading code for an OSID.
@@ -113,14 +116,25 @@ func CreateUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []
 	return gdb.Create(&row).Error
 }
 
-// CreateScopedUploadToken stores one immutable scoped authorization binding.
-func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []BuildArg, expiresAt time.Time, binding UploadAuthorityBinding) error {
+// CreateScopedUploadToken stores one immutable scoped authorization binding
+// plus Conductor's durable job-authority id (story 339), REQUIRED: every
+// later queue_admission/build_start/deployment_patch stage recheck for the
+// resulting build presents it to agentstream.JobAuthority. Review finding
+// 1397: a scoped classification with no durable job id must refuse the
+// mint, not silently select legacy (no-recheck) behavior for the later
+// stages - the authorization class and the presence of a job id are two
+// independent signals, and a scoped upload that can never reach its later
+// stage rechecks is not a supported shape.
+func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []BuildArg, expiresAt time.Time, binding UploadAuthorityBinding, durableJobID string) error {
 	if err := ValidateUploadAuthorityBinding(binding, UploadAuthorityTarget{
 		AppID:    osid,
 		UploadID: cliUploadID,
 		Purpose:  PurposeUpload,
 	}, expiresAt); err != nil {
 		return err
+	}
+	if !uuidPattern.MatchString(durableJobID) {
+		return fmt.Errorf("invalid durable job id")
 	}
 	gdb, err := activeDB()
 	if err != nil {
@@ -144,6 +158,7 @@ func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildA
 		AuthorizationClassification: AuthorizationScoped,
 		AuthorizationBindingVersion: binding.Version,
 		AuthorizationBinding:        string(bindingJSON),
+		DurableJobID:                durableJobID,
 	}
 	return gdb.Create(&row).Error
 }
@@ -285,6 +300,7 @@ func getTokenByPurposes(token string, purposes ...string) (*UploadToken, error) 
 		CreatedAt:                   m.CreatedAt,
 		Purpose:                     m.Purpose,
 		AuthorizationClassification: m.AuthorizationClassification,
+		DurableJobID:                m.DurableJobID,
 	}
 	if err := loadAuthorizationBinding(m, &t); err != nil {
 		return nil, err

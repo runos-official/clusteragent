@@ -109,10 +109,10 @@ var (
 	// app-deploy upload once admission has permitted it and the token is
 	// claimed. end must be called exactly once, on every path out of the
 	// goroutine, matching the pre-story drain-tracking contract.
-	startCLIDeploymentAsync = func(tarballData []byte, osid, jobID, dockerfile string, buildArgs []datastore.BuildArg, buildkitConfig *agentstream.BuildKitConfig, end func()) {
+	startCLIDeploymentAsync = func(tarballData []byte, osid, jobID, dockerfile string, buildArgs []datastore.BuildArg, authorizationClassification, authorityJobID string, buildkitConfig *agentstream.BuildKitConfig, end func()) {
 		go func() {
 			defer end()
-			processCLIDeployment(tarballData, osid, jobID, dockerfile, buildArgs, buildkitConfig)
+			processCLIDeployment(tarballData, osid, jobID, dockerfile, buildArgs, authorizationClassification, authorityJobID, buildkitConfig)
 		}()
 	}
 
@@ -221,7 +221,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// poll budget. failUpload's row is upsert-safe, so a later retry with a
 	// fixed tarball and the SAME token/uploadID still claims and builds.
 	if err := checkTarballLimits(tarballData); err != nil {
-		failPreClaimUpload(w, token, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err), uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 		return
 	}
 
@@ -231,7 +231,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// Scans the same in-memory tarball bytes without extracting to disk.
 	// Also terminal (finding 1133): same reasoning as the tarball check.
 	if err := validateDockerfileTarget(tarballData, uploadToken.Dockerfile); err != nil {
-		failPreClaimUpload(w, token, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err))
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err), uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 		return
 	}
 
@@ -274,7 +274,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		// endpoint, against the buildkitConfig the push below will use -
 		// before the build starts and before any push.
 		if refusal := verifyBuildImageHarborIdentity(boundHarborOsid, buildkitConfig.HarborOsid, buildkitConfig.HarborURL); refusal != nil {
-			reportUploadRefusal(w, token, repo, uploadID, refusal)
+			reportUploadRefusal(w, token, repo, uploadID, refusal, uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 
@@ -315,7 +315,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		var refusal *uploadRefusal
 		permit, refusal = admitScopedUpload(ctx, uploadToken.AuthorizationBinding)
 		if refusal != nil {
-			reportUploadRefusal(w, token, osid, uploadID, refusal)
+			reportUploadRefusal(w, token, osid, uploadID, refusal, uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 	case datastore.AuthorizationLegacy:
@@ -335,7 +335,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// outcomes are retryable).
 	if permit != nil {
 		if refusal := permitStillValid(permit); refusal != nil {
-			reportUploadRefusal(w, token, osid, uploadID, refusal)
+			reportUploadRefusal(w, token, osid, uploadID, refusal, uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 	}
@@ -369,7 +369,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// is possible any more, and Conductor's poller needs a recorded reason.
 	if permit != nil {
 		if refusal := permitStillValid(permit); refusal != nil {
-			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message, uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 			return
 		}
 	}
@@ -384,17 +384,48 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		Username: buildkitConfig.HarborUsername,
 		Password: buildkitConfig.HarborPassword,
 	}, osid, uploadID, tarballData); err != nil {
-		failUpload(w, osid, uploadID, http.StatusInternalServerError, archiveStoreFailure(err))
+		failUpload(w, osid, uploadID, http.StatusInternalServerError, archiveStoreFailure(err), uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 		return
 	}
 	log.Printf("Pushed CLI archive to Harbor: osid=%s uploadID=%s", osid, uploadID)
+
+	// Story 339: a scoped upload requests queue admission for its durable
+	// job authority BEFORE the build job row is created (plan "CLI
+	// propagation": "Create the build job only after permit."). No job
+	// row is created and no goroutine starts on refusal - the already
+	// authorized archive remains the only completed effect for this
+	// upload (plan "Already-started effect boundary"). The token is
+	// ALREADY claimed and the archive ALREADY pushed by this point, so -
+	// like every other post-claim refusal in this handler - this is
+	// unconditionally terminal: no retry with this token is possible, and
+	// Conductor's deploy job polls uploadID's build row and would
+	// otherwise wait out its whole poll budget instead of failing with a
+	// reason (review findings 1395/1402, FCR 744). The message tells the
+	// caller to prepare a fresh upload rather than retry: the consumed
+	// token itself now only answers 401.
+	//
+	// Gated on AuthorizationClassification, not on DurableJobID's
+	// presence (review finding 1397): datastore.CreateScopedUploadToken
+	// requires a durable job id for every scoped mint, so a scoped token
+	// with a missing or malformed one here is never a supported "nothing
+	// to recheck yet" shape - requireJobStagePermit's own authority-shape
+	// validation refuses it, rather than this silently skipping the
+	// check.
+	if uploadToken.AuthorizationClassification == datastore.AuthorizationScoped {
+		if refusal := requireJobStagePermit(ctx, uploadToken.DurableJobID, agentstream.StageQueueAdmission); refusal != nil {
+			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason,
+				"Upload refused; prepare a new upload to retry",
+				uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
+			return
+		}
+	}
 
 	// Process deployment asynchronously (buildkit treats uploadID as its jobID).
 	// uploadToken.Dockerfile carries the path inside the tarball (iter-27 I27-Y);
 	// empty defaults to "Dockerfile" at the tarball root. uploadToken.BuildArgs
 	// carries the effective build args captured when the token was minted.
 	started = true
-	startCLIDeploymentAsync(tarballData, osid, uploadID, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig, end)
+	startCLIDeploymentAsync(tarballData, osid, uploadID, uploadToken.Dockerfile, uploadToken.BuildArgs, uploadToken.AuthorizationClassification, uploadToken.DurableJobID, buildkitConfig, end)
 
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte("Upload received, processing CLI deployment"))
@@ -415,7 +446,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 // request; we split it into DockerfileDir + DockerfileFilename so
 // BuildKit's `--local dockerfile=` + `--opt filename=` get the right
 // values (matching what the VCS path already does for monorepo apps).
-func processCLIDeployment(tarballData []byte, osid, jobID, dockerfile string, buildArgs []datastore.BuildArg, buildkitConfig *agentstream.BuildKitConfig) {
+func processCLIDeployment(tarballData []byte, osid, jobID, dockerfile string, buildArgs []datastore.BuildArg, authorizationClassification, authorityJobID string, buildkitConfig *agentstream.BuildKitConfig) {
 	ctx := context.Background()
 
 	// Create K8s client (separate from the synchronous one; goroutine outlives the request)
@@ -425,8 +456,17 @@ func processCLIDeployment(tarballData []byte, osid, jobID, dockerfile string, bu
 		return
 	}
 
-	// Create build job in database with empty repo/branch, jobID as commit
-	if err := datastore.CreateBuildKitJob(jobID, osid, "", "", jobID); err != nil {
+	// Create build job in database with empty repo/branch, jobID as commit.
+	// The caller (HandleCLIDeployUpload) already obtained and checked the
+	// queue_admission permit for a scoped job BEFORE starting this
+	// goroutine (plan "CLI propagation": "Create the build job only after
+	// permit."); this just persists the resulting attribution.
+	if authorityJobID != "" {
+		err = datastore.CreateScopedBuildKitJob(jobID, authorityJobID, osid, "", "", jobID)
+	} else {
+		err = datastore.CreateBuildKitJob(jobID, osid, "", "", jobID)
+	}
+	if err != nil {
 		log.Printf("Failed to create build job: %v", err)
 		return
 	}
@@ -474,12 +514,14 @@ func processCLIDeployment(tarballData []byte, osid, jobID, dockerfile string, bu
 	}
 
 	ProcessBuildAndDeploy(ctx, k8sClient, BuildAndDeployInput{
-		Workdir:            tmpDir,
-		OSID:               osid,
-		JobID:              jobID,
-		DockerfileDir:      dockerfileDir,
-		DockerfileFilename: dockerfileFilename,
-		BuildArgs:          buildArgs,
+		Workdir:                     tmpDir,
+		OSID:                        osid,
+		JobID:                       jobID,
+		DockerfileDir:               dockerfileDir,
+		DockerfileFilename:          dockerfileFilename,
+		BuildArgs:                   buildArgs,
+		AuthorizationClassification: authorizationClassification,
+		AuthorityJobID:              authorityJobID,
 	}, buildkitConfig)
 }
 
@@ -654,6 +696,16 @@ type BuildAndDeployInput struct {
 	// ref. The project is fixed to runos-apps. Empty for app deploys.
 	TargetRepo string
 	TargetTags []string
+	// AuthorizationClassification and AuthorityJobID (story 339) carry the
+	// job-authority attribution the build job row was created with. A
+	// non-empty AuthorityJobID (classification scoped) requires a fresh
+	// build_start permit before BuildKit starts, and a fresh
+	// deployment_patch permit before the Kubernetes deployment update
+	// (skipped for BuildOnly, which never rolls out). Empty means legacy:
+	// no stage recheck, matching every other scoped/legacy boundary in
+	// this codebase.
+	AuthorizationClassification string
+	AuthorityJobID              string
 }
 
 // ProcessBuildAndDeploy runs the shared build+push+patch tail used by both the
@@ -723,6 +775,23 @@ func ProcessBuildAndDeploy(ctx context.Context, k8sClient *agentstream.K8sClient
 		HarborPassword:     buildkitConfig.HarborPassword,
 	}
 
+	// Story 339: a scoped job requires a fresh build_start permit
+	// immediately before BuildKit starts. A refused later stage marks the
+	// job failed with one generic, non-secret reason (plan "CLI
+	// propagation"/"VCS propagation": "If a later stage refuses, mark the
+	// existing job failed with a generic non-secret reason. Do not start
+	// the refused stage."). The job row already exists by this point
+	// (queue_admission already succeeded), so - unlike a pre-admission
+	// refusal - this is unconditionally terminal for this attempt.
+	if in.AuthorityJobID != "" {
+		if refusal := requireJobStagePermit(ctx, in.AuthorityJobID, agentstream.StageBuildStart); refusal != nil {
+			log.Printf("build_start stage recheck refused for job %s: %s", in.JobID, refusal.reason)
+			datastore.InsertBuildKitLog(in.JobID, "ERROR: build refused")
+			datastore.UpdateBuildKitJobStatus(in.JobID, datastore.JobStatusFailed)
+			return
+		}
+	}
+
 	if err := buildkitclient.Build(ctx, k8sClient.GetClientset(), buildConfig); err != nil {
 		log.Printf("Build failed for job %s: %v", in.JobID, err)
 		return
@@ -746,6 +815,20 @@ func ProcessBuildAndDeploy(ctx context.Context, k8sClient *agentstream.K8sClient
 		log.Printf("Build-only complete for job %s, osid=%s, image=%s (no rollout)", in.JobID, in.OSID, imageTag)
 		datastore.InsertBuildKitLog(in.JobID, fmt.Sprintf("Image built and pushed: %s (build-only, deployment not patched)", imageTag))
 		return
+	}
+
+	// Story 339: a scoped job requires a fresh deployment_patch permit
+	// immediately before the first Kubernetes deployment update. Never
+	// reached for BuildOnly (returned above), matching the stage model's
+	// own rule ("A standalone build stops after the build stage. It never
+	// requests a deployment-patch permit.").
+	if in.AuthorityJobID != "" {
+		if refusal := requireJobStagePermit(ctx, in.AuthorityJobID, agentstream.StageDeploymentPatch); refusal != nil {
+			log.Printf("deployment_patch stage recheck refused for job %s: %s", in.JobID, refusal.reason)
+			datastore.InsertBuildKitLog(in.JobID, "ERROR: deployment patch refused")
+			datastore.UpdateBuildKitJobStatus(in.JobID, datastore.JobStatusFailed)
+			return
+		}
 	}
 
 	if err := patchDeploymentImage(ctx, k8sClient.GetClientset(), in.OSID, imageTag); err != nil {

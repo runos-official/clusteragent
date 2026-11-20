@@ -35,6 +35,13 @@ type vcsWorkdirEntry struct {
 	contextPath        string
 	dockerfileDir      string
 	dockerfileFilename string
+	// authorizationClassification and conductorJobID (story 339) are the
+	// public, non-secret job-authority attribution VCS_FETCH_SOURCE bound
+	// this fetch to. VCS_BUILD must present the SAME values again at
+	// queue_admission; a cache entry from a different binding, app, job, or
+	// source identity cannot satisfy that request (plan "VCS propagation").
+	authorizationClassification string
+	conductorJobID              string
 }
 
 const (
@@ -63,8 +70,20 @@ func startVcsWorkdirJanitor() {
 	})
 }
 
-func vcsWorkdirCacheKey(osid, sha string) string {
-	return osid + ":" + sha
+// vcsWorkdirCacheKey builds the cache slot key. jobID is the scoped durable
+// job id, or "" for legacy traffic (review finding 1400): a non-empty
+// jobID isolates this fetch's slot from any other fetch - scoped or
+// legacy - for the SAME osid+sha, so two concurrent scoped deploys of the
+// same app and commit under different job ids never share a workdir or
+// collide on cleanup. Legacy traffic (jobID "") keeps the historical
+// osid:sha-only key, matching pre-story behavior exactly - there is no job
+// id to disambiguate it by, and review finding 1397 requires ignoring any
+// raw conductorJobId Conductor sends alongside a legacy classification.
+func vcsWorkdirCacheKey(osid, sha, jobID string) string {
+	if jobID == "" {
+		return osid + ":" + sha
+	}
+	return osid + ":" + sha + ":" + jobID
 }
 
 // VcsWorkdirBuildPaths is what VCS_BUILD needs from the cache to wire
@@ -76,27 +95,36 @@ type VcsWorkdirBuildPaths struct {
 	ContextPath        string
 	DockerfileDir      string
 	DockerfileFilename string
+	// AuthorizationClassification and ConductorJobID are the job-authority
+	// attribution VCS_FETCH_SOURCE bound to this fetch (story 339). Empty
+	// classification means legacy (no stage recheck).
+	AuthorizationClassification string
+	ConductorJobID              string
 }
 
 // vcsWorkdirCachePut records the workdir path and resolved build paths for a
-// {osid, sha} pair. Overwrites any existing entry — re-running
-// VCS_FETCH_SOURCE for the same pair (e.g. retry after a crash) leaves the
-// most recent entry pointing at the most recent workdir.
-func vcsWorkdirCachePut(osid, sha string, paths VcsWorkdirBuildPaths) {
+// {osid, sha, jobID} slot (review finding 1400). Overwrites any existing
+// entry under the SAME slot — re-running VCS_FETCH_SOURCE for the same
+// pair under the same job (e.g. retry after a crash) leaves the most
+// recent entry pointing at the most recent workdir; a DIFFERENT job id (or
+// legacy vs. scoped) gets its own isolated slot instead of overwriting.
+func vcsWorkdirCachePut(osid, sha, jobID string, paths VcsWorkdirBuildPaths) {
 	startVcsWorkdirJanitor()
-	vcsWorkdirCache.Store(vcsWorkdirCacheKey(osid, sha), vcsWorkdirEntry{
-		path:               paths.Workdir,
-		createdAt:          time.Now(),
-		contextPath:        paths.ContextPath,
-		dockerfileDir:      paths.DockerfileDir,
-		dockerfileFilename: paths.DockerfileFilename,
+	vcsWorkdirCache.Store(vcsWorkdirCacheKey(osid, sha, jobID), vcsWorkdirEntry{
+		path:                        paths.Workdir,
+		createdAt:                   time.Now(),
+		contextPath:                 paths.ContextPath,
+		dockerfileDir:               paths.DockerfileDir,
+		dockerfileFilename:          paths.DockerfileFilename,
+		authorizationClassification: paths.AuthorizationClassification,
+		conductorJobID:              paths.ConductorJobID,
 	})
 }
 
-// vcsWorkdirCacheGet returns the cached build paths for a {osid, sha} pair,
-// or ok=false if the entry is missing or expired.
-func vcsWorkdirCacheGet(osid, sha string) (VcsWorkdirBuildPaths, bool) {
-	raw, ok := vcsWorkdirCache.Load(vcsWorkdirCacheKey(osid, sha))
+// vcsWorkdirCacheGet returns the cached build paths for a {osid, sha, jobID}
+// slot, or ok=false if the entry is missing or expired.
+func vcsWorkdirCacheGet(osid, sha, jobID string) (VcsWorkdirBuildPaths, bool) {
+	raw, ok := vcsWorkdirCache.Load(vcsWorkdirCacheKey(osid, sha, jobID))
 	if !ok {
 		return VcsWorkdirBuildPaths{}, false
 	}
@@ -108,20 +136,24 @@ func vcsWorkdirCacheGet(osid, sha string) (VcsWorkdirBuildPaths, bool) {
 		return VcsWorkdirBuildPaths{}, false
 	}
 	return VcsWorkdirBuildPaths{
-		Workdir:            entry.path,
-		ContextPath:        entry.contextPath,
-		DockerfileDir:      entry.dockerfileDir,
-		DockerfileFilename: entry.dockerfileFilename,
+		Workdir:                     entry.path,
+		ContextPath:                 entry.contextPath,
+		DockerfileDir:               entry.dockerfileDir,
+		DockerfileFilename:          entry.dockerfileFilename,
+		AuthorizationClassification: entry.authorizationClassification,
+		ConductorJobID:              entry.conductorJobID,
 	}, true
 }
 
-// vcsWorkdirCacheDeleteIfPath clears the cache entry for {osid, sha} only
-// when it still points at expectedPath. Used by VCS_BUILD cleanup so a
-// concurrent VCS_FETCH_SOURCE that landed a fresher entry between fetch
-// and build isn't clobbered. The caller is responsible for removing the
-// disk path itself; this function only touches the cache.
-func vcsWorkdirCacheDeleteIfPath(osid, sha, expectedPath string) {
-	key := vcsWorkdirCacheKey(osid, sha)
+// vcsWorkdirCacheDeleteIfPath clears the cache entry for the {osid, sha,
+// jobID} slot only when it still points at expectedPath. Used by VCS_BUILD
+// cleanup so a concurrent VCS_FETCH_SOURCE that landed a fresher entry in
+// the SAME slot between fetch and build isn't clobbered, and so cleanup of
+// one job's slot never touches another job's isolated slot for the same
+// osid+sha (review finding 1400). The caller is responsible for removing
+// the disk path itself; this function only touches the cache.
+func vcsWorkdirCacheDeleteIfPath(osid, sha, jobID, expectedPath string) {
+	key := vcsWorkdirCacheKey(osid, sha, jobID)
 	raw, ok := vcsWorkdirCache.Load(key)
 	if !ok {
 		return

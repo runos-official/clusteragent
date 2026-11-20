@@ -47,7 +47,8 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	binding := testUploadAuthorityBinding(now)
 	const raw = "scoped-upload-token-fixture"
 
-	if err := CreateScopedUploadToken(raw, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding); err != nil {
+	const durableJobID = "00000000-0000-4000-8000-000000000004"
+	if err := CreateScopedUploadToken(raw, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err != nil {
 		t.Fatalf("CreateScopedUploadToken: %v", err)
 	}
 
@@ -57,6 +58,9 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	}
 	if got.AuthorizationClassification != AuthorizationScoped {
 		t.Fatalf("classification = %q, want %q", got.AuthorizationClassification, AuthorizationScoped)
+	}
+	if got.DurableJobID != durableJobID {
+		t.Fatalf("durable job id = %q, want %q", got.DurableJobID, durableJobID)
 	}
 	if got.AuthorizationBinding == nil {
 		t.Fatal("authorization binding is nil")
@@ -92,6 +96,25 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	}
 	if after.AuthorizationBinding != before.AuthorizationBinding || after.AuthorizationClassification != before.AuthorizationClassification {
 		t.Fatal("single-use mutation changed immutable authorization data")
+	}
+}
+
+// TestCreateScopedUploadToken_RequiresDurableJobID proves a scoped upload
+// with a missing or malformed durable job id refuses the mint rather than
+// silently selecting legacy (no-recheck) behavior for the later
+// queue_admission/build_start/deployment_patch stages (review finding
+// 1397): the authorization class and the presence of a job id are two
+// independent signals, so an empty id is not a lesser-but-valid shape, it
+// is invalid.
+func TestCreateScopedUploadToken_RequiresDurableJobID(t *testing.T) {
+	setupTestDB(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	binding := testUploadAuthorityBinding(now)
+
+	for _, durableJobID := range []string{"", "not-a-uuid", "00000000-0000-4000-8000-00000000000Z"} {
+		if err := CreateScopedUploadToken("tok-"+durableJobID, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err == nil {
+			t.Errorf("durableJobID %q: expected an error, got none", durableJobID)
+		}
 	}
 }
 

@@ -14,18 +14,18 @@ import (
 // whole budget. The failure must now name its cause to the CLI AND leave a
 // failed build row with one ERROR line under the upload's job id.
 func TestFailUpload(t *testing.T) {
-	type recorded struct{ jobID, osid, message string }
+	type recorded struct{ jobID, osid, message, classification, authorityJobID string }
 	var got []recorded
 	prev := recordFailedUpload
-	recordFailedUpload = func(jobID, osid, message string) error {
-		got = append(got, recorded{jobID, osid, message})
+	recordFailedUpload = func(jobID, osid, message, classification, authorityJobID string) error {
+		got = append(got, recorded{jobID, osid, message, classification, authorityJobID})
 		return nil
 	}
 	t.Cleanup(func() { recordFailedUpload = prev })
 
 	cause := errors.New(`ensure project: Post "https://harbor.example.test:8890/api/v2.0/projects": tls: failed to verify certificate: x509: certificate signed by unknown authority`)
 	w := httptest.NewRecorder()
-	failUpload(w, "app-ab1cd", "upload-1", http.StatusInternalServerError, archiveStoreFailure(cause))
+	failUpload(w, "app-ab1cd", "upload-1", http.StatusInternalServerError, archiveStoreFailure(cause), "legacy", "")
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", w.Code)
@@ -51,11 +51,11 @@ func TestFailUpload(t *testing.T) {
 // swallow the answer to the CLI.
 func TestFailUpload_RecorderErrorStillAnswers(t *testing.T) {
 	prev := recordFailedUpload
-	recordFailedUpload = func(string, string, string) error { return errors.New("datastore down") }
+	recordFailedUpload = func(string, string, string, string, string) error { return errors.New("datastore down") }
 	t.Cleanup(func() { recordFailedUpload = prev })
 
 	w := httptest.NewRecorder()
-	failUpload(w, "app-ab1cd", "upload-1", http.StatusInternalServerError, "Internal error: no build config")
+	failUpload(w, "app-ab1cd", "upload-1", http.StatusInternalServerError, "Internal error: no build config", "legacy", "")
 
 	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "no build config") {
 		t.Fatalf("got %d %q, want 500 naming the cause", w.Code, w.Body.String())

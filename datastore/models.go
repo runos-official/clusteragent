@@ -22,17 +22,30 @@ import "time"
 // old hand-written SQL that relied on them.
 
 // BuildKitJobModel maps the cluster_agent_buildkit_jobs table.
+//
+// AuthorizationClassification and AuthorityJobID (story 339) carry the
+// public, non-secret job-authority reference a scoped CLI or VCS build
+// uses for its queue_admission/build_start/deployment_patch stage
+// rechecks (handbook 949 C3's "job: jobId" stage authority). They are set
+// once at row creation and are immutable afterwards: UpdateBuildKitJobStatus
+// and FailNonTerminalBuildKitJobs update only status/timestamps and must
+// never touch these two columns. An explicit "legacy" row (the default)
+// carries an empty AuthorityJobID and performs no stage recheck, matching
+// the upload-token binding's own explicit-legacy, no-fallback discipline
+// (datastore/upload_authority.go).
 type BuildKitJobModel struct {
-	ID          uint       `gorm:"primaryKey;autoIncrement"`
-	JobID       string     `gorm:"column:job_id;uniqueIndex:idx_buildkit_jobs_job_id;not null"`
-	OSID        string     `gorm:"column:osid;not null"`
-	Repo        string     `gorm:"column:repo;not null"`
-	Branch      string     `gorm:"column:branch;not null"`
-	CommitHash  string     `gorm:"column:commit_hash;not null"`
-	Status      string     `gorm:"column:status;index:idx_buildkit_jobs_status;not null"`
-	CreatedAt   time.Time  `gorm:"column:created_at;index:idx_buildkit_jobs_created_at;default:CURRENT_TIMESTAMP"`
-	UpdatedAt   time.Time  `gorm:"column:updated_at;default:CURRENT_TIMESTAMP"`
-	CompletedAt *time.Time `gorm:"column:completed_at"`
+	ID                          uint       `gorm:"primaryKey;autoIncrement"`
+	JobID                       string     `gorm:"column:job_id;uniqueIndex:idx_buildkit_jobs_job_id;not null"`
+	OSID                        string     `gorm:"column:osid;not null"`
+	Repo                        string     `gorm:"column:repo;not null"`
+	Branch                      string     `gorm:"column:branch;not null"`
+	CommitHash                  string     `gorm:"column:commit_hash;not null"`
+	Status                      string     `gorm:"column:status;index:idx_buildkit_jobs_status;not null"`
+	CreatedAt                   time.Time  `gorm:"column:created_at;index:idx_buildkit_jobs_created_at;default:CURRENT_TIMESTAMP"`
+	UpdatedAt                   time.Time  `gorm:"column:updated_at;default:CURRENT_TIMESTAMP"`
+	CompletedAt                 *time.Time `gorm:"column:completed_at"`
+	AuthorizationClassification string     `gorm:"column:authorization_classification;not null;default:'legacy'"`
+	AuthorityJobID              string     `gorm:"column:authority_job_id;not null;default:''"`
 }
 
 // TableName returns the full physical name (prefix included); an explicit
@@ -81,6 +94,13 @@ type UploadTokenModel struct {
 	AuthorizationClassification string    `gorm:"column:authorization_classification;not null;default:'legacy'"`
 	AuthorizationBindingVersion string    `gorm:"column:authorization_binding_version;not null;default:''"`
 	AuthorizationBinding        string    `gorm:"column:authorization_binding;type:text;not null;default:''"`
+	// DurableJobID (story 339) is Conductor's durable job-authority id
+	// (handbook 949 C3's "job: jobId" stage authority) for the deploy this
+	// upload belongs to. It is a SIBLING of AuthorizationBinding, never
+	// stored inside it: the upload binding's own jobId must stay null
+	// (queue admission mints a separate job binding). Empty for a legacy
+	// token, or for any caller that omits it.
+	DurableJobID string `gorm:"column:durable_job_id;not null;default:''"`
 }
 
 func (UploadTokenModel) TableName() string { return tablePrefix + "upload_tokens" }

@@ -63,6 +63,8 @@ type uploadHarness struct {
 	claimErr                    error
 	pushed                      bool
 	cliStarted                  bool
+	cliStartedClassification    string
+	cliStartedAuthorityJobID    string
 	buildImgRun                 bool
 	failedUploadJobIDs          []string
 	skipFailedUploadIfUnclaimed bool
@@ -93,7 +95,7 @@ func (h *uploadHarness) install() {
 	// never reserve the token's (fixed, retryable) uploadID as a
 	// build-job row, but a TERMINAL one must record exactly one. Track
 	// every call so tests can assert either shape.
-	recordFailedUpload = func(jobID, _, _ string) error {
+	recordFailedUpload = func(jobID, _, _, _, _ string) error {
 		h.mu.Lock()
 		h.failedUploadJobIDs = append(h.failedUploadJobIDs, jobID)
 		h.mu.Unlock()
@@ -105,7 +107,7 @@ func (h *uploadHarness) install() {
 	// else", so every existing test's assumptions keep holding; a test for
 	// finding 1267 itself overrides h.unclaimedCheck to simulate a
 	// concurrent winner.
-	recordFailedUploadIfUnclaimed = func(_, jobID, _, _ string) error {
+	recordFailedUploadIfUnclaimed = func(_, jobID, _, _, _, _ string) error {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.skipFailedUploadIfUnclaimed {
@@ -161,9 +163,11 @@ func (h *uploadHarness) install() {
 		h.pushed = true
 		return h.pushErr
 	}
-	startCLIDeploymentAsync = func(_ []byte, _, _, _ string, _ []datastore.BuildArg, _ *agentstream.BuildKitConfig, end func()) {
+	startCLIDeploymentAsync = func(_ []byte, _, _, _ string, _ []datastore.BuildArg, authorizationClassification, authorityJobID string, _ *agentstream.BuildKitConfig, end func()) {
 		h.mu.Lock()
 		h.cliStarted = true
+		h.cliStartedClassification = authorizationClassification
+		h.cliStartedAuthorityJobID = authorityJobID
 		h.mu.Unlock()
 		end()
 	}
@@ -238,6 +242,7 @@ func scopedUploadToken() *datastore.UploadToken {
 			BindingID: "00000000-0000-4000-8000-000000000001",
 			UploadID:  "00000000-0000-4000-8000-000000000002",
 		},
+		DurableJobID: "00000000-0000-4000-8000-000000000003",
 	}
 }
 

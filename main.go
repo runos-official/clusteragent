@@ -6,12 +6,15 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/runos-official/clusteragent/agentstream"
 	"github.com/runos-official/clusteragent/agentstream/instructions"
 	"github.com/runos-official/clusteragent/buildkitclient"
@@ -53,6 +56,22 @@ func main() {
 	// directly without creating a cycle through agentstream).
 	instructions.VcsBuildExecutor = webhook.RunVcsBuild
 	instructions.HarborImageExistsExecutor = webhook.HarborImageExists
+
+	// Wire the job-authority stage-recheck client (story 339). instructions
+	// cannot import agentstream directly (agentstream already imports
+	// instructions to dispatch), so this adapter is the one place that
+	// converts the plain stage-name strings instructions uses into
+	// agentstream's typed RecheckStage/JobAuthority call.
+	instructions.RequestJobStagePermit = func(ctx context.Context, authorityJobID, stage string) error {
+		resp, err := agentstream.RequestStageRecheck(ctx, agentstream.JobAuthority(authorityJobID), agentstream.RecheckStage(stage), uuid.New().String())
+		if err != nil {
+			return fmt.Errorf("deployment stage recheck unavailable: %w", err)
+		}
+		if resp.Outcome != agentstream.OutcomePermit {
+			return fmt.Errorf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code)
+		}
+		return nil
+	}
 
 	// Set up cert cache check to run after agentstream connects
 	agentstream.SetOnConnectCallback(certcache.CheckAndRestoreClusterDomainCert)

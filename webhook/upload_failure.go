@@ -14,8 +14,20 @@ import (
 // leaving it at "Wait for build" (FCR 744). The log line goes in before the
 // status flip so a reader that sees "failed" also sees why. It is a variable
 // so tests can replace the datastore.
-var recordFailedUpload = func(jobID, osid, message string) error {
-	if err := datastore.CreateBuildKitJob(jobID, osid, "", "", jobID); err != nil {
+//
+// classification and authorityJobID (review finding 1401) must be the
+// token's OWN stored attribution, never a hardcoded legacy default: a
+// refusal row for a scoped upload must record scoped+its durable job id, or
+// a later legitimate reopen of the same job_id (with the real attribution)
+// is refused by createBuildKitJob's conflict check instead of succeeding.
+var recordFailedUpload = func(jobID, osid, message, classification, authorityJobID string) error {
+	var err error
+	if authorityJobID != "" {
+		err = datastore.CreateScopedBuildKitJob(jobID, authorityJobID, osid, "", "", jobID)
+	} else {
+		err = datastore.CreateBuildKitJob(jobID, osid, "", "", jobID)
+	}
+	if err != nil {
 		return fmt.Errorf("create build row: %w", err)
 	}
 	if err := datastore.InsertBuildKitLog(jobID, "ERROR: "+message); err != nil {
@@ -28,8 +40,10 @@ var recordFailedUpload = func(jobID, osid, message string) error {
 // counterpart (review finding 1267): it writes the failure row only if the
 // token has not already been claimed by a concurrent, faster request for
 // the SAME token. A variable so tests can replace the datastore.
-var recordFailedUploadIfUnclaimed = func(token, jobID, osid, message string) error {
-	return datastore.RecordFailedUploadIfUnclaimed(token, jobID, osid, message)
+// classification and authorityJobID carry the token's real attribution
+// (review finding 1401); see recordFailedUpload.
+var recordFailedUploadIfUnclaimed = func(token, jobID, osid, message, classification, authorityJobID string) error {
+	return datastore.RecordFailedUploadIfUnclaimed(token, jobID, osid, message, classification, authorityJobID)
 }
 
 // archiveStoreFailure names why the source archive could not be stored. It
@@ -53,8 +67,12 @@ func archiveStoreFailure(err error) string {
 // waiting out its whole budget (FCR 744) - CreateBuildKitJob upserts, so a
 // later, fixed retry that reuses this same token and uploadID can still
 // claim and build under this jobID.
-func failUpload(w http.ResponseWriter, osid, uploadID string, status int, message string) {
-	failUploadWithReason(w, osid, uploadID, status, message, message)
+//
+// classification and authorityJobID (review finding 1401) must be the
+// token's own stored attribution; pass "", "" for a purpose that never
+// carries scoped authority (build_image, pull).
+func failUpload(w http.ResponseWriter, osid, uploadID string, status int, message, classification, authorityJobID string) {
+	failUploadWithReason(w, osid, uploadID, status, message, message, classification, authorityJobID)
 }
 
 // failUploadWithReason is failUpload with the logged/recorded detail (reason)
@@ -64,9 +82,9 @@ func failUpload(w http.ResponseWriter, osid, uploadID string, status int, messag
 // enough to enumerate another account, cluster, app, binding, or
 // credential over HTTP; the build log is read only by whoever already holds
 // this token's own upload, so it is not the same exposure).
-func failUploadWithReason(w http.ResponseWriter, osid, uploadID string, status int, reason, message string) {
+func failUploadWithReason(w http.ResponseWriter, osid, uploadID string, status int, reason, message, classification, authorityJobID string) {
 	log.Printf("Upload failed (osid=%s, uploadID=%s): %s", osid, uploadID, reason)
-	if err := recordFailedUpload(uploadID, osid, reason); err != nil {
+	if err := recordFailedUpload(uploadID, osid, reason, classification, authorityJobID); err != nil {
 		log.Printf("Failed to record the failed upload (uploadID=%s): %v", uploadID, err)
 	}
 	http.Error(w, message, status)
@@ -95,9 +113,11 @@ func refuseUpload(w http.ResponseWriter, osid, uploadID string, status int, reas
 // this request's OWN successful claim (an archive-push failure, or a
 // permit that expired between claim and push): those always own the row
 // and must use failUploadWithReason instead.
-func failPreClaimUploadWithReason(w http.ResponseWriter, token, osid, uploadID string, status int, reason, message string) {
+// classification and authorityJobID carry the token's real attribution
+// (review finding 1401); see recordFailedUpload.
+func failPreClaimUploadWithReason(w http.ResponseWriter, token, osid, uploadID string, status int, reason, message, classification, authorityJobID string) {
 	log.Printf("Upload refused before token claim (osid=%s, uploadID=%s): %s", osid, uploadID, reason)
-	if err := recordFailedUploadIfUnclaimed(token, uploadID, osid, reason); err != nil {
+	if err := recordFailedUploadIfUnclaimed(token, uploadID, osid, reason, classification, authorityJobID); err != nil {
 		log.Printf("Failed to record the failed upload (uploadID=%s): %v", uploadID, err)
 	}
 	http.Error(w, message, status)
@@ -105,8 +125,8 @@ func failPreClaimUploadWithReason(w http.ResponseWriter, token, osid, uploadID s
 
 // failPreClaimUpload is failPreClaimUploadWithReason with the logged/
 // recorded reason and the caller-visible message the same string.
-func failPreClaimUpload(w http.ResponseWriter, token, osid, uploadID string, status int, message string) {
-	failPreClaimUploadWithReason(w, token, osid, uploadID, status, message, message)
+func failPreClaimUpload(w http.ResponseWriter, token, osid, uploadID string, status int, message, classification, authorityJobID string) {
+	failPreClaimUploadWithReason(w, token, osid, uploadID, status, message, message, classification, authorityJobID)
 }
 
 // reportUploadRefusal answers a pre-claim *uploadRefusal from the Harbor
@@ -116,10 +136,11 @@ func failPreClaimUpload(w http.ResponseWriter, token, osid, uploadID string, sta
 // refuseUpload (a retryable refusal: no row, token stays retryable) by
 // refusal.terminal (review finding 1133). Every call site of this function
 // runs before this request's own claim, so the ownership check is always
-// correct here (review finding 1267).
-func reportUploadRefusal(w http.ResponseWriter, token, osid, uploadID string, refusal *uploadRefusal) {
+// correct here (review finding 1267). classification and authorityJobID
+// carry the token's real attribution (review finding 1401).
+func reportUploadRefusal(w http.ResponseWriter, token, osid, uploadID string, refusal *uploadRefusal, classification, authorityJobID string) {
 	if refusal.terminal {
-		failPreClaimUploadWithReason(w, token, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+		failPreClaimUploadWithReason(w, token, osid, uploadID, refusal.status, refusal.reason, refusal.message, classification, authorityJobID)
 		return
 	}
 	refuseUpload(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)

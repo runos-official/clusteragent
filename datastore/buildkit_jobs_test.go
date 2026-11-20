@@ -126,7 +126,7 @@ func TestRecordFailedUploadIfUnclaimed_SkipsWhenAlreadyClaimed(t *testing.T) {
 
 	// The loser's terminal refusal arrives after the winner already
 	// claimed and finished. It must change nothing.
-	if err := RecordFailedUploadIfUnclaimed(raw, jobID, "osid-1", "loser's refusal, arrived late"); err != nil {
+	if err := RecordFailedUploadIfUnclaimed(raw, jobID, "osid-1", "loser's refusal, arrived late", AuthorizationLegacy, ""); err != nil {
 		t.Fatalf("RecordFailedUploadIfUnclaimed must not error when the token is already claimed: %v", err)
 	}
 
@@ -155,7 +155,7 @@ func TestRecordFailedUploadIfUnclaimed_WritesWhenStillUnclaimed(t *testing.T) {
 		t.Fatalf("CreatePullToken: %v", err)
 	}
 
-	if err := RecordFailedUploadIfUnclaimed(raw, jobID, "osid-1", "tarball refused"); err != nil {
+	if err := RecordFailedUploadIfUnclaimed(raw, jobID, "osid-1", "tarball refused", AuthorizationLegacy, ""); err != nil {
 		t.Fatalf("RecordFailedUploadIfUnclaimed: %v", err)
 	}
 

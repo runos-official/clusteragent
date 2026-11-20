@@ -110,6 +110,92 @@ persist and build start that follow are not retried or rolled back by this
 layer; a later deployment stage rechecks authority again before its own
 mutation.
 
+### Recheck before queued build/deploy stages
+
+Archive persistence is not the only mutation a CLI or VCS deploy performs.
+After an upload is admitted (or, for VCS, before anything is cloned), the
+agent asks for a fresh, current permit again at every later stage that
+changes something: queue admission (creating the build job row and
+starting the asynchronous work), build start (creating the BuildKit pod and
+pushing the image), and deployment patch (the first Kubernetes deployment
+update). A standalone build (`apps build`, and every app-less `build_image`
+upload) stops after build start and never requests a deployment-patch
+permit.
+
+Every one of these later stages uses a **job** authority
+(`agentstream.JobAuthority`), never the upload binding's `bindingId`/
+`uploadId`: a durable, non-secret job id that the control plane assigns
+before the first stage recheck for that job and that the agent carries
+forward, unchanged, through every later stage for the same job. For a CLI
+deploy the durable job id travels on `CREATE_CLI_DEPLOY_TOKEN`'s
+`durableJobId` field, stored on the token row as a sibling of the upload
+binding (never inside it - the upload binding's own `jobId` stays `null`).
+For a VCS deploy it travels on `VCS_FETCH_SOURCE` and `VCS_BUILD`'s
+`conductorJobId` field, a sibling of the existing `sha`/`jobId` fields,
+never a repurposing of either: `VcsBuildRequest.JobID` keeps its pre-story
+meaning (the commit SHA, used only for the BuildKit row's display id and
+image tag) and is never treated as authority.
+
+The scoped/legacy classification is always an EXPLICIT signal
+(`authorizationClassification` on every request that carries it), never
+inferred from a job id's mere presence. Conductor sends `conductorJobId`
+unconditionally on VCS dispatches today, including legacy and
+human-initiated ones (forward-compatible groundwork for this consumer);
+treating its presence as "scoped" would wrongly demand a stage permit for
+a job that has no scoped binding to check it against. A request whose
+classification IS explicitly scoped must carry a well-formed job id - a
+missing or malformed one refuses outright, before any clone or cache
+lookup, and never falls back to legacy. `VCS_FETCH_SOURCE` binds the
+durable job id (and the classification) to its own workdir cache **slot**,
+keyed by `{osid, sha, jobId}` for a scoped fetch (an empty jobId, and so
+the historical `osid:sha`-only key, for legacy): two scoped fetches for
+the same app and commit under different durable jobs get isolated slots
+and never collide, while a legacy fetch's slot is unaffected by - and
+ignores - any job id Conductor happens to attach. `VCS_BUILD` looks its
+workdir up under the same slot and must find the exact same classification
+and job id there, or it refuses without creating a job row; a cache entry
+for a different job, app, or source identity can never satisfy a
+different request.
+
+A build job row (`cluster_agent_buildkit_jobs`) persists an explicit
+`authorization_classification` (`legacy` by default) and a non-secret
+`authority_job_id`, exactly as the upload-token table persists its own
+binding. Both are set once, at row creation, and are immutable afterwards:
+a status update or the startup/restart cleanup below changes only status,
+timestamps, and the failure log, never this attribution. An existing
+pre-story row migrates to explicit `legacy`. Reopening an existing job_id
+(the CLI upsert-retry path) with attribution that disagrees with what is
+already stored - a legacy re-creation call landing on a row a scoped
+attempt already created, or vice versa - is refused outright rather than
+silently keeping or silently overwriting either side's attribution; a
+pre-claim refusal row for a scoped token therefore carries that token's
+real classification and job id, never a hardcoded legacy default, so a
+later corrected retry's real scoped attribution is never discarded.
+
+Queue admission is requested, and must permit, **before** the build job row
+is created at all: a refusal creates no RUNNABLE job row and starts no
+asynchronous work, so a scoped upload's already-pushed archive remains the
+only completed effect for that attempt. For the CLI upload path this
+refusal is still unconditionally terminal (the token is already claimed
+and the archive already pushed, exactly like every later stage's own
+refusal below): it writes one pollable failed row under the upload's id
+with a generic, non-secret reason, so Conductor's deploy job fails with
+that reason instead of waiting out its whole poll budget at "Wait for
+build"; the response tells the CLI to prepare a fresh upload rather than
+retry, since the consumed token itself now only answers 401. A later
+stage's refusal (build start, deployment patch) is unconditionally
+terminal for that job - the row already exists by then - and marks it
+failed with the same generic, non-secret reason. Nothing is retried or
+rolled back once a stage's own mutation has begun: a revocation after a
+build starts does not delete the pod or image it already produced, and a
+revocation after the first Kubernetes update attempt does not promise a
+rollback. The next stage always needs its own fresh decision; no permit
+from an earlier stage, job, or retry authorizes a later one. A VCS retry
+of the same commit always mints a fresh BuildKit row id and therefore
+always requests fresh decisions - there is no cached permit to replay. An
+explicit `legacy` job never calls any of these rechecks, at any stage,
+matching the upload path's own no-fallback rule in both directions.
+
 ### Build-image registry identity
 
 A `build_image` token can carry `harborOsid`: the Harbor service identity the
