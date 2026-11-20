@@ -319,6 +319,122 @@ func TestDockerfileTargetParity(t *testing.T) {
 			dockerfile: "Dockerfile",
 			wantAccept: false,
 		},
+		// Review finding 1456: extraction's filepath.Join absorbs a
+		// leading "/" and keeps the ".." elements after it, while
+		// path.Clean discards a ".." that follows a leading "/". The two
+		// boundaries therefore normalized the same header name
+		// differently, and C2/C4 only refused post-claim.
+		{
+			name: "finding 1456(1) traversing entry name that is also absolute",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "/../escape.txt", typeflag: tar.TypeReg, body: "pwned"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			name: "finding 1456(2) escaping symlink whose entry name is absolute",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "/a/link", typeflag: tar.TypeSymlink, linkname: "../../../etc/passwd"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		// Review finding 1456, the other direction: these names DO extract,
+		// because their net ascent never leaves the destination. Refusing
+		// any name that merely contains a ".." component would refuse them.
+		{
+			name: "finding 1456 must still pass: inner dot-dot that stays contained",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "a/../b", typeflag: tar.TypeReg, body: "y"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: true,
+		},
+		// Review finding 1457 group A: os.Symlink never replaces an
+		// existing path, so a symlink at an occupied path always fails.
+		{
+			name: "finding 1457(1) symlink at a path already declared regular",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "dup", typeflag: tar.TypeReg, body: "x"},
+				{name: "dup", typeflag: tar.TypeSymlink, linkname: "Dockerfile"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			name: "finding 1457(2) symlink at a path already declared a directory",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "dup", typeflag: tar.TypeDir},
+				{name: "dup", typeflag: tar.TypeSymlink, linkname: "Dockerfile"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			name: "finding 1457(3) symlink at a path already declared a symlink",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "dup", typeflag: tar.TypeSymlink, linkname: "Dockerfile"},
+				{name: "dup", typeflag: tar.TypeSymlink, linkname: "Dockerfile"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		// Review finding 1457 group B: os.MkdirAll cannot descend through
+		// a symlink that resolves to a non-directory.
+		{
+			name: "finding 1457(4) directory at a path declared a symlink to a non-directory",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "dup", typeflag: tar.TypeSymlink, linkname: "Dockerfile"},
+				{name: "dup", typeflag: tar.TypeDir},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			name: "finding 1457(5) entry under a symlink to a non-directory",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "a", typeflag: tar.TypeSymlink, linkname: "Dockerfile"},
+				{name: "a/b", typeflag: tar.TypeReg, body: "y"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		// Review finding 1457 group C: two literal names that extraction
+		// resolves to ONE real path through a contained ancestor symlink.
+		// Instance 6 is the case cycle 1's summary flagged and left open.
+		{
+			name: "finding 1457(6) cross-aliased directory then regular file",
+			entries: []tarEntry{
+				{name: "real", typeflag: tar.TypeDir},
+				{name: "link", typeflag: tar.TypeSymlink, linkname: "real"},
+				{name: "real/boom", typeflag: tar.TypeDir},
+				{name: "link/boom", typeflag: tar.TypeReg, body: "x"},
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			name: "finding 1457(7) cross-aliased regular file then directory",
+			entries: []tarEntry{
+				{name: "real", typeflag: tar.TypeDir},
+				{name: "link", typeflag: tar.TypeSymlink, linkname: "real"},
+				{name: "real/boom", typeflag: tar.TypeReg, body: "x"},
+				{name: "link/boom", typeflag: tar.TypeDir},
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
 	}
 
 	for _, tc := range cases {

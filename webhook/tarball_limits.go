@@ -133,14 +133,14 @@ type tarDockerfileLookup struct {
 // extractTarball's filepath.Join(destDir, header.Name) absorbs a leading
 // "/" into the join instead of treating it as a jump to the real
 // filesystem root, so an entry named "/abs/Dockerfile" lands at
-// destDir/abs/Dockerfile, not destDir/Dockerfile. This runs the SAME
-// path.Clean(strings.TrimPrefix(name, "./")) a caller's own traversal
-// check (checkTarballContainment) uses, then additionally strips a
-// leading "/". Callers that need to detect a traversing ("..") name must
-// still check their own unstripped path.Clean result: a leading ".." in
-// an absolute name is already collapsed by path.Clean's own rooted-path
-// rule before this function is ever reached, exactly as it always was,
-// and this function does not change that detection either way.
+// destDir/abs/Dockerfile, not destDir/Dockerfile.
+//
+// It is a KEY, not a containment test, and it must never be used as one:
+// path.Clean's rooted-path rule discards a ".." that follows a leading
+// "/", so "/../escape.txt" normalizes to the innocent-looking
+// "escape.txt" even though extraction's own join escapes the destination
+// with it (review finding 1456). tarEntryEscapes is the one containment
+// authority; call that before trusting a name this function returns.
 func normalizeTarEntryName(name string) string {
 	cleaned := path.Clean(strings.TrimPrefix(name, "./"))
 	return strings.TrimPrefix(cleaned, "/")
@@ -265,31 +265,29 @@ func (l *tarDockerfileLookup) stat(relPath string) dockerfileEntry {
 }
 
 // checkTarballContainment re-applies, header-only and before any claim,
-// the three archive-wide refusals extractTarball itself enforces while
-// writing to disk (review finding 1311's items 2-4, repeats of findings
-// this story closes as C2-C4): a traversing entry name, an absolute
-// symlink target, and a symlink whose resolved target escapes the
-// destination. These need only the tar headers, so FPL430's "every check
-// that CAN run before the claim must run there" moves them here,
-// independent of the configured dockerfile (or the lack of one). This does
-// NOT replace extractTarball's own copies, which stay as defence in depth
-// for whatever reaches extraction regardless (a direct call, a future
-// caller that skips this preflight).
+// every refusal extractTarball itself reaches while writing to disk, so an
+// archive extraction cannot write is refused before the token is claimed
+// and the archive is persisted (review finding 1311's items 2-4, closed as
+// C2-C4; review findings 1452, 1456 and 1457). FPL430's "every check that
+// CAN run before the claim must run there" applies: all of these need only
+// the tar headers. This does NOT replace extractTarball's own checks,
+// which stay as defence in depth for whatever reaches extraction anyway.
 //
-// Review finding 1452: it also tracks, archive-wide and independent of the
-// configured dockerfile, each path's declared kind (directory or regular
-// file), and refuses any entry extraction's os.MkdirAll/os.Create/
-// os.Symlink cannot survive on a real filesystem: a directory and a
-// regular file declared at the SAME path, in EITHER order, and any entry
-// of ANY type (directory, regular file, or symlink - review finding
-// 1452's own symmetric repeats, found searching for every other instance
-// of the same defect: extraction's TypeDir and TypeReg cases call
-// os.MkdirAll on the parent, and even TypeSymlink's os.Symlink fails
-// against a non-directory parent with no MkdirAll fallback of its own)
-// whose ancestor path was already declared a regular file. A repeated
-// directory, a repeated regular file, and a symlink declared over or
-// under anything at the exact same path all extract without error and
-// must keep passing, so a symlink's OWN path is never recorded in kinds.
+// It refuses three things directly, matching extraction's own explicit
+// guards: an entry name that escapes the destination, an absolute symlink
+// target, and a symlink target that escapes the destination. Both escape
+// tests use tarEntryEscapes, which reproduces extraction's
+// filepath.Join arithmetic rather than re-cleaning the name, because
+// path.Clean discards a ".." that follows a leading "/" while the join
+// keeps it (review finding 1456).
+//
+// Everything else is decided by replaying the headers through
+// tarExtractSim, which models the three syscalls extraction uses and so
+// refuses exactly the archives extraction cannot write: a path the archive
+// declares with contradictory kinds in either order, an entry under a path
+// that is not a directory, a symlink at an occupied path, a symlink whose
+// parent does not exist yet, and the cases where a symlink makes two
+// literal names one real path.
 func checkTarballContainment(data []byte) error {
 	gz, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -297,7 +295,7 @@ func checkTarballContainment(data []byte) error {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
-	kinds := make(map[string]dockerfileEntryKind)
+	sim := newTarExtractSim()
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -309,37 +307,26 @@ func checkTarballContainment(data []byte) error {
 		if hdr.Name == "./" || hdr.Name == "." {
 			continue
 		}
-		cleaned := path.Clean(strings.TrimPrefix(hdr.Name, "./"))
-		if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		if tarEntryEscapes(hdr.Name) {
 			return fmt.Errorf("invalid file path in tarball: %s", hdr.Name)
 		}
 		if hdr.Typeflag == tar.TypeSymlink {
 			if path.IsAbs(hdr.Linkname) {
 				return fmt.Errorf("symlink target is absolute: %s -> %s", hdr.Name, hdr.Linkname)
 			}
-			resolved := path.Clean(path.Join(path.Dir(cleaned), hdr.Linkname))
-			if resolved == ".." || strings.HasPrefix(resolved, "../") {
+			// Concatenated, never path.Join-ed: Join cleans, and the
+			// whole point of tarEntryEscapes is to count the ".."
+			// elements a clean would cancel out or discard.
+			parent := path.Dir(normalizeTarEntryName(hdr.Name))
+			if parent == "." {
+				parent = ""
+			}
+			if tarEntryEscapes(parent + "/" + hdr.Linkname) {
 				return fmt.Errorf("symlink escapes destination: %s -> %s", hdr.Name, hdr.Linkname)
 			}
 		}
-
-		normalized := normalizeTarEntryName(hdr.Name)
-		for dir := path.Dir(normalized); dir != "." && dir != "/"; dir = path.Dir(dir) {
-			if kinds[dir] == dockerfileEntryRegular {
-				return fmt.Errorf("entry %q has ancestor %q already declared as a regular file", normalized, dir)
-			}
-		}
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if kinds[normalized] == dockerfileEntryRegular {
-				return fmt.Errorf("entry %q is declared as both a regular file and a directory", normalized)
-			}
-			kinds[normalized] = dockerfileEntryDir
-		case tar.TypeReg:
-			if kinds[normalized] == dockerfileEntryDir {
-				return fmt.Errorf("entry %q is declared as both a directory and a regular file", normalized)
-			}
-			kinds[normalized] = dockerfileEntryRegular
+		if err := sim.apply(hdr.Name, hdr.Typeflag, hdr.Linkname); err != nil {
+			return err
 		}
 	}
 }
