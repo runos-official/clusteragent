@@ -177,6 +177,100 @@ func TestDockerfileTargetParity(t *testing.T) {
 			dockerfile: "target",
 			wantAccept: false,
 		},
+		{
+			// Finding 1451 instance 1 (regression against f39f58c): the
+			// dockerfile's ANCESTOR component is a symlink to a directory.
+			// extraction writes "link/Dockerfile" THROUGH the symlink, so
+			// the real file lands at "real/Dockerfile"; the tar-based
+			// lookup must register the entry under that resolved path too.
+			name: "finding 1451(1) symlinked directory ancestor",
+			entries: []tarEntry{
+				{name: "real", typeflag: tar.TypeDir},
+				{name: "link", typeflag: tar.TypeSymlink, linkname: "real"},
+				{name: "link/Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+			},
+			dockerfile: "link/Dockerfile",
+			wantAccept: true,
+		},
+		{
+			// Finding 1451 instance 2: an absolute tar entry name.
+			// extraction's filepath.Join(destDir, header.Name) absorbs the
+			// leading slash instead of treating it as a jump to the real
+			// filesystem root, so the entry lands at destDir/abs/Dockerfile.
+			name:       "finding 1451(2) absolute tar entry name",
+			entries:    []tarEntry{{name: "/abs/Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"}},
+			dockerfile: "abs/Dockerfile",
+			wantAccept: true,
+		},
+		{
+			// Finding 1452 instance 1: C7's shape declared AWAY from the
+			// configured dockerfile target, so the resolver's own walk
+			// never reaches it; must still refuse archive-wide.
+			name: "finding 1452(1) directory then regular file elsewhere",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "boom", typeflag: tar.TypeDir},
+				{name: "boom", typeflag: tar.TypeReg, body: "x"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			// Finding 1452 instance 2: a regular file with an entry
+			// declared underneath it - extraction's os.MkdirAll on the
+			// parent fails outright ("not a directory").
+			name: "finding 1452(2) regular file with an entry declared underneath it",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "a", typeflag: tar.TypeReg, body: "x"},
+				{name: "a/b", typeflag: tar.TypeReg, body: "y"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			// Finding 1452's must-still-pass repeat: regular over regular
+			// at the same path extracts fine (os.Create just overwrites).
+			name: "finding 1452 repeat: regular over regular must still pass",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "dup", typeflag: tar.TypeReg, body: "first"},
+				{name: "dup", typeflag: tar.TypeReg, body: "second"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: true,
+		},
+		{
+			// Finding 1452's must-still-pass repeat: directory over
+			// directory at the same path extracts fine (os.MkdirAll is
+			// idempotent).
+			name: "finding 1452 repeat: directory over directory must still pass",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "dup", typeflag: tar.TypeDir},
+				{name: "dup", typeflag: tar.TypeDir},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: true,
+		},
+		{
+			// Finding 1452's must-still-pass repeat: a symlink declared
+			// and then a regular entry at the SAME path (os.Create follows
+			// the existing symlink and truncates its target - no error;
+			// the reverse order, regular then symlink, does fail
+			// extraction with EEXIST, but that order is not in the
+			// mandated must-pass list and is left as ordinary last-one-
+			// wins, unaffected by this story's new conflict rule either
+			// way since it never touches dockerfileEntryDir).
+			name: "finding 1452 repeat: symlink over regular must still pass",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "dup", typeflag: tar.TypeSymlink, linkname: "Dockerfile"},
+				{name: "dup", typeflag: tar.TypeReg, body: "first"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: true,
+		},
 	}
 
 	for _, tc := range cases {

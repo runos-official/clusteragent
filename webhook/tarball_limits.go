@@ -128,6 +128,24 @@ type tarDockerfileLookup struct {
 	implicitDirs map[string]bool
 }
 
+// normalizeTarEntryName returns the tarball-root-relative path extraction
+// actually writes an entry to (review finding 1451's instance 2):
+// extractTarball's filepath.Join(destDir, header.Name) absorbs a leading
+// "/" into the join instead of treating it as a jump to the real
+// filesystem root, so an entry named "/abs/Dockerfile" lands at
+// destDir/abs/Dockerfile, not destDir/Dockerfile. This runs the SAME
+// path.Clean(strings.TrimPrefix(name, "./")) a caller's own traversal
+// check (checkTarballContainment) uses, then additionally strips a
+// leading "/". Callers that need to detect a traversing ("..") name must
+// still check their own unstripped path.Clean result: a leading ".." in
+// an absolute name is already collapsed by path.Clean's own rooted-path
+// rule before this function is ever reached, exactly as it always was,
+// and this function does not change that detection either way.
+func normalizeTarEntryName(name string) string {
+	cleaned := path.Clean(strings.TrimPrefix(name, "./"))
+	return strings.TrimPrefix(cleaned, "/")
+}
+
 // newTarDockerfileLookup builds the lookup from the archive's headers, IN
 // ARCHIVE ORDER, mirroring what extraction does to the real filesystem well
 // enough to detect the one conflict that matters here (review finding
@@ -138,12 +156,24 @@ type tarDockerfileLookup struct {
 // (regular-over-regular, symlink-over-anything, dir-over-dir) keeps the
 // simple last-one-wins behavior this map already had, since no instance in
 // review finding 1311's finite list needs more than that.
+//
+// Review finding 1451's instance 1: extraction writes an entry THROUGH any
+// already-contained ancestor symlink transparently (the OS resolves
+// "link/Dockerfile" to "real/Dockerfile" once "link" exists on disk as a
+// symlink to "real"), so an entry's real, on-disk location can differ from
+// its own literal tar name. resolveTarAncestorSymlinks resolves that against
+// what has been registered so far (archive order: an ancestor dir or
+// symlink conventionally precedes its descendants) and the entry is
+// registered under the resolved location instead, matching what
+// fsDockerfileLookup will actually find after real extraction.
 func newTarDockerfileLookup(headers []*tar.Header) *tarDockerfileLookup {
-	entries := make(map[string]dockerfileEntry)
-	implicitDirs := make(map[string]bool)
+	lookup := &tarDockerfileLookup{
+		entries:      make(map[string]dockerfileEntry),
+		implicitDirs: make(map[string]bool),
+	}
 	for _, hdr := range headers {
-		name := path.Clean(strings.TrimPrefix(hdr.Name, "./"))
-		if name == "." {
+		name := normalizeTarEntryName(hdr.Name)
+		if name == "" || name == "." {
 			continue
 		}
 		var next dockerfileEntry
@@ -157,16 +187,68 @@ func newTarDockerfileLookup(headers []*tar.Header) *tarDockerfileLookup {
 		default:
 			next = dockerfileEntry{kind: dockerfileEntryOther}
 		}
-		if existing, ok := entries[name]; ok && existing.kind == dockerfileEntryDir && next.kind == dockerfileEntryRegular {
-			entries[name] = dockerfileEntry{kind: dockerfileEntryConflict}
-		} else {
-			entries[name] = next
+		if resolved, ok := resolveTarAncestorSymlinks(lookup, name); ok {
+			name = resolved
 		}
-		for dir := path.Dir(name); dir != "." && dir != "/"; dir = path.Dir(dir) {
-			implicitDirs[dir] = true
-		}
+		lookup.register(name, next)
 	}
-	return &tarDockerfileLookup{entries: entries, implicitDirs: implicitDirs}
+	return lookup
+}
+
+// register records one entry at a normalized path, applying review
+// finding 1311's C7/1452's directory-then-regular-file conflict rule; see
+// newTarDockerfileLookup's doc comment.
+func (l *tarDockerfileLookup) register(name string, next dockerfileEntry) {
+	if existing, ok := l.entries[name]; ok && existing.kind == dockerfileEntryDir && next.kind == dockerfileEntryRegular {
+		l.entries[name] = dockerfileEntry{kind: dockerfileEntryConflict}
+	} else {
+		l.entries[name] = next
+	}
+	for dir := path.Dir(name); dir != "." && dir != "/"; dir = path.Dir(dir) {
+		l.implicitDirs[dir] = true
+	}
+}
+
+// resolveTarAncestorSymlinks resolves any symlink among name's ANCESTOR
+// directory components (never its final component) against what lookup
+// has registered so far, returning name with every such ancestor replaced
+// by its resolved target. ok is false when no ancestor component is a
+// registered symlink (the common case: the caller keeps name unchanged),
+// or when resolution fails for any reason (an absolute or escaping link
+// target, or the shared hop limit) - in that case the caller also keeps
+// the literal name, which is safe: a failed resolution here only means
+// this entry won't be found under an alias, never that something is
+// wrongly accepted.
+func resolveTarAncestorSymlinks(lookup *tarDockerfileLookup, name string) (string, bool) {
+	components := splitDockerfileComponents(name)
+	if len(components) < 2 {
+		return "", false
+	}
+	built := ""
+	changed := false
+	hops := 0
+	for _, comp := range components[:len(components)-1] {
+		candidate := joinDockerfileComponent(built, comp)
+		entry := lookup.stat(candidate)
+		if entry.kind != dockerfileEntrySymlink {
+			built = candidate
+			continue
+		}
+		hops++
+		if hops > maxDockerfileSymlinkHops {
+			return "", false
+		}
+		resolved, err := resolveDockerfileSymlink(lookup, candidate, entry.linkname, name)
+		if err != nil {
+			return "", false
+		}
+		built = resolved
+		changed = true
+	}
+	if !changed {
+		return "", false
+	}
+	return joinDockerfileComponent(built, components[len(components)-1]), true
 }
 
 func (l *tarDockerfileLookup) stat(relPath string) dockerfileEntry {
@@ -193,6 +275,16 @@ func (l *tarDockerfileLookup) stat(relPath string) dockerfileEntry {
 // NOT replace extractTarball's own copies, which stay as defence in depth
 // for whatever reaches extraction regardless (a direct call, a future
 // caller that skips this preflight).
+//
+// Review finding 1452: it also tracks, archive-wide and independent of the
+// configured dockerfile, each path's declared kind, and refuses the two
+// contradictions extraction's os.MkdirAll/os.Create pair cannot survive on
+// a real filesystem - a regular entry where a directory was already
+// declared at the SAME path, and any entry whose ancestor path was already
+// declared a regular file. These are the only two contradictions that
+// pairing can hit; a repeated directory, a repeated regular file, and a
+// symlink declared over or under anything all extract without error and
+// must keep passing, so only TypeDir and TypeReg are tracked here.
 func checkTarballContainment(data []byte) error {
 	gz, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -200,6 +292,7 @@ func checkTarballContainment(data []byte) error {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	kinds := make(map[string]dockerfileEntryKind)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -222,6 +315,22 @@ func checkTarballContainment(data []byte) error {
 			resolved := path.Clean(path.Join(path.Dir(cleaned), hdr.Linkname))
 			if resolved == ".." || strings.HasPrefix(resolved, "../") {
 				return fmt.Errorf("symlink escapes destination: %s -> %s", hdr.Name, hdr.Linkname)
+			}
+		}
+
+		normalized := normalizeTarEntryName(hdr.Name)
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			kinds[normalized] = dockerfileEntryDir
+		case tar.TypeReg:
+			if kinds[normalized] == dockerfileEntryDir {
+				return fmt.Errorf("entry %q is declared as both a directory and a regular file", normalized)
+			}
+			kinds[normalized] = dockerfileEntryRegular
+			for dir := path.Dir(normalized); dir != "." && dir != "/"; dir = path.Dir(dir) {
+				if kinds[dir] == dockerfileEntryRegular {
+					return fmt.Errorf("entry %q has ancestor %q already declared as a regular file", normalized, dir)
+				}
 			}
 		}
 	}
