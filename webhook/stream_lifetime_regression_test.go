@@ -21,19 +21,24 @@ import (
 )
 
 // TestHandleCLIDeployUpload_StreamLifetime is THE regression for review
-// finding 1313 (repeat of 1270/1240/1169): it drives the real production
-// send, receive, and tag-dispatch path (agentstream.DriveTestStream plus
-// the real, un-faked agentstream.RequestStageRecheck - every other test in
-// this package fakes requestStageRecheck; this one deliberately does not)
-// with the manager's own pendingResponses-drain cleanup held back by a
-// pauseCleanup channel for the whole row, so each row proves the fix holds
-// purely from the stream's own Lifetime, never from how fast - or whether
-// at all - that drain runs.
+// finding 1313 (repeat of 1270/1240/1169) and its follow-up findings
+// 1403/1404/1405: it drives the real production send, receive, and
+// tag-dispatch path (agentstream.DriveTestStream plus the real, un-faked
+// agentstream.RequestStageRecheck - every other test in this package fakes
+// requestStageRecheck; this one deliberately does not) with the manager's
+// own lt.pending-drain cleanup held back by a pauseCleanup channel for the
+// whole row, so each row proves the fix holds purely from the stream's own
+// Lifetime, never from how fast - or whether at all - that drain runs.
 //
-// Rows (a)-(d) must see zero claim/archive/build effects and no HTTP 202.
-// Row (e) proves a delayed, stale invalidation call from an old stream can
-// never affect a live successor's Lifetime. Row (f) is the live, timely
-// control: it must still proceed exactly once.
+// Rows (a), (b), (c), (d), (d2) must see zero claim/archive/build effects
+// and no HTTP 202. Row (g) proves a reply delivered through a DIFFERENT
+// Lifetime than the one its request sent on is never dispatched to that
+// request's waiter. Row (h) proves a delayed old-stream cleanup, run while
+// a successor's own request is pending (and again after it completes),
+// never disrupts that successor. Row (e) proves a delayed, stale
+// invalidation call from an old stream can never affect a live successor's
+// Lifetime. Row (f) is the live, timely control: it must still proceed
+// exactly once.
 func TestHandleCLIDeployUpload_StreamLifetime(t *testing.T) {
 	t.Run("a_closed_before_send", func(t *testing.T) {
 		h := newRegressionHarness(t)
@@ -103,6 +108,109 @@ func TestHandleCLIDeployUpload_StreamLifetime(t *testing.T) {
 		h.assertClaimedButNoArchiveOrBuild(t)
 	})
 
+	t.Run("d2_closed_during_archive_context_setup", func(t *testing.T) {
+		// Review finding 1405: the permit check must be the LAST thing
+		// before pushArchive, with no blocking step (deriving the
+		// archive-push context included) left after it. Fail the stream
+		// at that exact point, before the real context.WithTimeout call.
+		h := newRegressionHarness(t)
+		ts := newRegressionStream(t)
+		prevDerive := deriveArchivePushContext
+		deriveArchivePushContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+			ts.fail(io.ErrClosedPipe)
+			return prevDerive(parent)
+		}
+		t.Cleanup(func() { deriveArchivePushContext = prevDerive })
+
+		resultCh := h.uploadAsync(t, 2*time.Second)
+		req := ts.awaitSent(t)
+		ts.deliver(permitReplyFor(t, req))
+
+		w := <-resultCh
+		if w.Code == http.StatusAccepted {
+			t.Fatalf("status = %d, want a refusal (stream closed during archive-context setup)", w.Code)
+		}
+		h.assertClaimedButNoArchiveOrBuild(t)
+	})
+
+	t.Run("g_reply_on_a_different_lifetime_is_not_dispatched", func(t *testing.T) {
+		// Review finding 1403: a reply is matched only against the
+		// waiter map of the Lifetime it actually sent on. Send request #1
+		// on ts1, then - without ever failing ts1 - start a second,
+		// independently live stream ts2 and deliver a reply carrying
+		// request #1's own tag THROUGH ts2. ts2's own dispatch (lt2.pending)
+		// has no entry for that tag, so it must not reach request #1's
+		// waiter: request #1 must still time out and refuse, with zero
+		// effects, and ts2 must not crash or misbehave either.
+		h := newRegressionHarness(t)
+		ts1 := newRegressionStream(t)
+
+		resultCh := h.uploadAsync(t, 500*time.Millisecond)
+		req := ts1.awaitSent(t)
+
+		ts2 := newRegressionStream(t)
+		ts2.deliver(permitReplyFor(t, req)) // req's tag belongs to ts1's waiter, not ts2's
+
+		w := <-resultCh
+		if w.Code == http.StatusAccepted {
+			t.Fatalf("status = %d, want a refusal (the reply arrived on a different Lifetime than the one the request sent on)", w.Code)
+		}
+		h.assertNoEffects(t)
+	})
+
+	t.Run("h_delayed_old_cleanup_does_not_disrupt_pending_successor_request", func(t *testing.T) {
+		// Review finding 1403: runStream's cleanup must drain only its
+		// OWN Lifetime's waiters. Start request #1 on ts1 and leave it
+		// pending (no reply, no failure) while ts1's own cleanup is still
+		// paused. Start a SEPARATE, successor stream ts2 and run request
+		// #2 to completion on it while ts1's drain remains paused. Then
+		// release ts1's cleanup (the "delayed old cleanup" finally
+		// running) and confirm ts2 still works for one more request
+		// afterward - ts1's drain, even run late, never touched ts2's
+		// pending map.
+		h := newRegressionHarness(t)
+		ts1 := newRegressionStream(t)
+
+		resultCh1 := h.uploadAsync(t, 2*time.Second)
+		_ = ts1.awaitSent(t) // request #1 is now pending on ts1; never resolved here
+
+		ts2 := newRegressionStream(t)
+		resultCh2 := h.uploadAsync(t, 2*time.Second)
+		req2 := ts2.awaitSent(t)
+		ts2.deliver(permitReplyFor(t, req2))
+
+		w2 := <-resultCh2
+		if w2.Code != http.StatusAccepted {
+			t.Fatalf("request #2 status = %d, want 202 (body %q)", w2.Code, w2.Body.String())
+		}
+		h.assertClaimedPushedAndBuilt(t)
+
+		// Now let ts1's cleanup - the delayed old drain - finally run,
+		// while ts2 is still live, and confirm ts2 remains fully usable.
+		ts1.fail(io.ErrClosedPipe)
+		ts1.releaseCleanup(t)
+
+		h.mu.Lock()
+		h.claimed, h.pushed, h.cliStarted = nil, false, false
+		h.mu.Unlock()
+
+		resultCh3 := h.uploadAsync(t, 2*time.Second)
+		req3 := ts2.awaitSent(t)
+		ts2.deliver(permitReplyFor(t, req3))
+		w3 := <-resultCh3
+		if w3.Code != http.StatusAccepted {
+			t.Fatalf("request #3 (after ts1's delayed drain ran) status = %d, want 202 (body %q)", w3.Code, w3.Body.String())
+		}
+		h.assertClaimedPushedAndBuilt(t)
+
+		// request #1 never got a reply; it must time out and refuse,
+		// never silently succeed and never panic the handler goroutine.
+		w1 := <-resultCh1
+		if w1.Code == http.StatusAccepted {
+			t.Error("request #1 status = 202, want a refusal: it never received a reply")
+		}
+	})
+
 	t.Run("e_delayed_old_stream_callback_cannot_touch_successor", func(t *testing.T) {
 		h := newRegressionHarness(t)
 
@@ -167,9 +275,10 @@ type regressionStream struct {
 	replies chan *l2sec.ToClusterAgent
 	failc   chan error
 
-	t          *testing.T
-	done       chan error
-	pauseClean chan struct{}
+	t           *testing.T
+	done        chan error
+	pauseClean  chan struct{}
+	releaseOnce sync.Once
 
 	// lifetime is the Lifetime DriveTestStream published for this exact
 	// stream, captured once right after publication. fail() polls THIS
@@ -195,8 +304,8 @@ func (s *regressionStream) Header() (metadata.MD, error) { return nil, nil }
 func (s *regressionStream) Trailer() metadata.MD         { return nil }
 func (s *regressionStream) CloseSend() error             { return nil }
 func (s *regressionStream) Context() context.Context     { return context.Background() }
-func (s *regressionStream) SendMsg(m any) error           { return nil }
-func (s *regressionStream) RecvMsg(m any) error           { return nil }
+func (s *regressionStream) SendMsg(m any) error          { return nil }
+func (s *regressionStream) RecvMsg(m any) error          { return nil }
 
 // newRegressionStream publishes a fresh stream as the current Lifetime
 // (via agentstream.DriveTestStream, so every goroutine it starts - listen,
@@ -236,14 +345,31 @@ func newRegressionStream(t *testing.T) *regressionStream {
 		case s.failc <- io.ErrClosedPipe:
 		default:
 		}
+		s.releaseCleanup(t)
+	})
+	return s
+}
+
+// releaseCleanup lets runStream's deferred lt.pending drain - held back by
+// pauseClean since newRegressionStream - finally proceed, and waits for
+// DriveTestStream to return. Idempotent (t.Cleanup also calls it), so a
+// row that wants to observe behavior WHILE this drain is still delayed
+// (review finding 1403: row h) can release it explicitly at the exact
+// point it wants to, instead of only at the end of the subtest.
+func (s *regressionStream) releaseCleanup(t *testing.T) {
+	t.Helper()
+	// s.done only ever receives once (DriveTestStream returns exactly
+	// once), so the wait belongs inside the Once too: a second call (row
+	// h calls this explicitly, then t.Cleanup calls it again) must not
+	// block trying to read an already-drained channel.
+	s.releaseOnce.Do(func() {
 		close(s.pauseClean)
 		select {
 		case <-s.done:
 		case <-time.After(2 * time.Second):
-			t.Error("the test stream's DriveTestStream goroutine never returned")
+			t.Error("the test stream's DriveTestStream goroutine never returned after its cleanup was released")
 		}
 	})
-	return s
 }
 
 // fail ends the stream (a Recv failure), simulating a disconnect, and

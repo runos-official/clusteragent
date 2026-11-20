@@ -2,6 +2,7 @@ package agentstream
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,9 +29,17 @@ import (
 // goroutine only ever holds a reference to its own stream's Lifetime, never
 // to "whichever is current", so a delayed callback from an old stream can
 // never affect a successor's Lifetime.
+//
+// pending is THIS stream's own waiter map (tag -> reply channel), owned
+// exclusively by it (review finding 1403: a single package-wide map let a
+// delayed cleanup for one stream close a successor's still-pending
+// waiter). A request registers here only after it has committed to
+// sending on this exact Lifetime, so cleanup draining pending on end can
+// never reach any other Lifetime's waiters.
 type Lifetime struct {
-	stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent]
-	live   atomic.Bool
+	stream  grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent]
+	live    atomic.Bool
+	pending sync.Map
 }
 
 // newLifetime returns a Lifetime that is live for stream.

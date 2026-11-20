@@ -24,8 +24,6 @@ import (
 	"time"
 )
 
-var pendingResponses sync.Map
-
 type streamManager struct {
 	client          l2sec.NodewardClient
 	conn            *grpc.ClientConn
@@ -345,7 +343,7 @@ func (sm *streamManager) establishAndMaintainStream() error {
 // error produced once one of them ends that Lifetime (L5 invalidation).
 //
 // pauseCleanup, if non-nil, is received from right after that error is
-// known and before the deferred pendingResponses drain below, so a test
+// known and before the deferred lt.pending drain below, so a test
 // (review finding 1313's regression) can hold the drain back indefinitely
 // while still observing that every Lifetime-gated behavior - SendToServer,
 // sendAndWait, a recheck permit - already reflects the ended stream, with
@@ -369,7 +367,7 @@ func (sm *streamManager) runStream(streamCtx context.Context, stream grpc.BidiSt
 	}()
 
 	go func() {
-		errChan <- sm.runHeartbeat(streamCtx, stream, lt)
+		errChan <- sm.runHeartbeat(streamCtx, lt)
 	}()
 
 	// Wait for any error
@@ -379,12 +377,15 @@ func (sm *streamManager) runStream(streamCtx context.Context, stream grpc.BidiSt
 		<-pauseCleanup
 	}
 
-	// Clear pending responses on disconnect
-	pendingResponses.Range(func(key, value any) bool {
+	// Clear THIS stream's own pending waiters on disconnect (review
+	// finding 1403: draining a package-wide map here could close a
+	// successor's still-pending waiter if this cleanup ran late; lt.pending
+	// belongs to no other Lifetime, so this can never happen now).
+	lt.pending.Range(func(key, value any) bool {
 		if respChan, ok := value.(chan *l2sec.ToClusterAgent); ok {
 			close(respChan)
 		}
-		pendingResponses.Delete(key)
+		lt.pending.Delete(key)
 		return true
 	})
 
@@ -410,13 +411,18 @@ func (sm *streamManager) listenForInstructions(stream grpc.BidiStreamingClient[l
 
 		// Process the instruction in a separate goroutine, inside a recover
 		// boundary so a panic in any handler can't crash the whole agent pod.
-		go safeHandleInstruction(instruction)
+		// lt is this stream's own Lifetime: a reply is dispatched only
+		// against the waiter map it was registered in (review finding
+		// 1403), never a different stream's.
+		go safeHandleInstruction(instruction, lt)
 	}
 }
 
 // runHeartbeat heartbeats on the stream it was started for until ctx ends or
-// three heartbeats in a row fail. It never sends on a later stream.
-func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent], lt *Lifetime) error {
+// three heartbeats in a row fail. It never sends on a later stream: every
+// send goes through sendOnLifetime(lt, ...), bound to lt.stream, never to
+// whatever agentstream.CurrentLifetime() happens to be at send time.
+func (sm *streamManager) runHeartbeat(ctx context.Context, lt *Lifetime) error {
 	activeHeartbeats.Add(1)
 	defer activeHeartbeats.Add(-1)
 	interval := sm.heartbeatInterval
@@ -428,7 +434,6 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStrea
 
 	consecutiveFailures := 0
 	maxConsecutiveFailures := 3
-	send := func(msg *l2sec.FromClusterAgent) error { return sendOnStream(stream, msg) }
 
 	for {
 		select {
@@ -436,22 +441,31 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStrea
 			return ctx.Err()
 		case <-ticker.C:
 			hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			res, _, err := sendAndWait(hbCtx, send, instructions.ClusterAgentHeartbeatToServer())
+			// sendAndWait takes lt explicitly and sends through
+			// sendOnLifetime(lt, ...) - this stream's own Lifetime, never
+			// "whatever is current" (review finding 1403: heartbeat used
+			// to bypass the liveness check sendOnLifetime now applies to
+			// every sender).
+			res, _, err := sendAndWait(hbCtx, lt, sendOnLifetime, instructions.ClusterAgentHeartbeatToServer())
 			cancel()
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if err != nil {
 				consecutiveFailures++
-				log.Printf("Heartbeat failed (%d/%d): %v", consecutiveFailures, maxConsecutiveFailures, err)
 
 				if consecutiveFailures >= maxConsecutiveFailures {
-					// L5: same reasoning as listenForInstructions - end
-					// this stream's own Lifetime here, at the point this
-					// goroutine decides it is dead, not later.
+					// L5 (review finding 1404): end this stream's own
+					// Lifetime BEFORE logging the terminal failure, not
+					// after. log.Printf can block (a contended log
+					// writer, rotation); ending first means the gap
+					// finding 1270/1313 closed for receive-failure
+					// detection cannot reopen here if that write stalls.
 					lt.end()
+					log.Printf("Heartbeat failed (%d/%d): %v", consecutiveFailures, maxConsecutiveFailures, err)
 					return fmt.Errorf("heartbeat failed %d times consecutively", maxConsecutiveFailures)
 				}
+				log.Printf("Heartbeat failed (%d/%d): %v", consecutiveFailures, maxConsecutiveFailures, err)
 				continue
 			}
 
@@ -462,15 +476,16 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStrea
 }
 
 // SendToServer sends msg on the current control stream (L1 publication, L2
-// send): it refuses rather than select a stream whose Lifetime has ended,
-// even if the manager's own cleanup for that stream has not run yet.
+// send) through sendOnLifetime: it refuses rather than select a stream
+// whose Lifetime has ended, even if the manager's own cleanup for that
+// stream has not run yet.
 func SendToServer(msg *l2sec.FromClusterAgent) error {
 	lt := currentLifetime.Load()
 	if !lt.Live() {
 		return fmt.Errorf("stream not initialized")
 	}
 
-	return sendOnStream(lt.stream, msg)
+	return sendOnLifetime(lt, msg)
 }
 
 // sendMu serializes every Send call on the stream. gRPC does not allow
@@ -482,9 +497,22 @@ func SendToServer(msg *l2sec.FromClusterAgent) error {
 // package is the stream's own serialization point.
 var sendMu sync.Mutex
 
-// sendOnStream sends msg on one given stream.
-func sendOnStream(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent], msg *l2sec.FromClusterAgent) error {
-	if stream == nil {
+// sendOnLifetime sends msg on lt's own stream (L2 send), the single path
+// every sender uses now - SendToServer, the heartbeat (review finding
+// 1403: it used to call stream.Send directly, bypassing any liveness
+// check), and sendAndWait's registered request alike.
+//
+// It checks Live() twice: once before contending for sendMu (a cheap, not
+// strictly necessary short-circuit), and again immediately after
+// acquiring it (review finding 1403: "check the lifetime after waiting
+// for send serialization"). A send queued behind another writer can have
+// its Lifetime end while it waits for the mutex; without the second
+// check, it would still transmit on a now-dead stream once its turn
+// comes. Checking Live() and calling Send() while still holding sendMu
+// closes that gap: nothing between "lt is live" and "the bytes are on the
+// wire" can un-live it, because end() never blocks on sendMu itself.
+func sendOnLifetime(lt *Lifetime, msg *l2sec.FromClusterAgent) error {
+	if !lt.Live() {
 		return fmt.Errorf("stream not initialized")
 	}
 
@@ -493,8 +521,11 @@ func sendOnStream(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.
 	}
 
 	sendMu.Lock()
-	err := stream.Send(msg)
-	sendMu.Unlock()
+	defer sendMu.Unlock()
+	if !lt.Live() {
+		return fmt.Errorf("control stream disconnected before this send could be serialized")
+	}
+	err := lt.stream.Send(msg)
 	if err != nil {
 		log.Printf("Error sending message to server: %v", err)
 		return err
@@ -515,7 +546,7 @@ func validateUUID(id string) (uuid.UUID, error) {
 // and replies with an error for the instruction's tag (so the caller is not left
 // hanging), then returns; the stream loop keeps serving. Mirrors the node
 // agent's stream.go safeHandleInstruction.
-func safeHandleInstruction(instruction *l2sec.ToClusterAgent) {
+func safeHandleInstruction(instruction *l2sec.ToClusterAgent, lt *Lifetime) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Defensive: the panic may itself have come from a nil/garbage
@@ -530,10 +561,18 @@ func safeHandleInstruction(instruction *l2sec.ToClusterAgent) {
 			}
 		}
 	}()
-	handleInstruction(instruction)
+	handleInstruction(instruction, lt)
 }
 
-func handleInstruction(instruction *l2sec.ToClusterAgent) {
+// handleInstruction dispatches one instruction received on lt's stream.
+// lt is this stream's own Lifetime, so a reply is matched only against
+// the waiter that registered under lt.pending (review finding 1403: a
+// package-wide map let a reply arrive, and be dispatched, against a
+// DIFFERENT lifetime than the one the waiter actually sent on - correctly
+// correlated only by tag, which is not enough once more than one
+// Lifetime can exist at once). Nothing routes a reply received on one
+// concrete stream into another stream's waiter map.
+func handleInstruction(instruction *l2sec.ToClusterAgent, lt *Lifetime) {
 	tag := instruction.Tag
 	tagID, err := validateUUID(tag)
 	if err != nil {
@@ -543,7 +582,7 @@ func handleInstruction(instruction *l2sec.ToClusterAgent) {
 
 	log.Printf("Received instruction with tag %s of type: %s", tagID.String(), instruction.Type)
 
-	if respChanValue, exists := pendingResponses.Load(tagID.String()); exists {
+	if respChanValue, exists := lt.pending.Load(tagID.String()); exists {
 		responseChan := respChanValue.(chan *l2sec.ToClusterAgent)
 		select {
 		case responseChan <- instruction:
@@ -551,7 +590,7 @@ func handleInstruction(instruction *l2sec.ToClusterAgent) {
 		default:
 			log.Printf("Warning: Could not deliver response for tag %s", tagID.String())
 		}
-		pendingResponses.Delete(tagID.String())
+		lt.pending.Delete(tagID.String())
 		return
 	}
 
@@ -611,7 +650,7 @@ func respond(jsonB64, replyType string, tagID uuid.UUID) {
 }
 
 func SendAndWaitForResponse(ctx context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
-	resp, _, err := sendAndWait(ctx, SendToServer, msg)
+	resp, _, err := sendAndWaitOnCurrent(ctx, msg)
 	return resp, err
 }
 
@@ -622,26 +661,42 @@ func SendAndWaitForResponse(ctx context.Context, msg *l2sec.FromClusterAgent) (*
 // connection (L4); every other caller uses SendAndWaitForResponse and
 // ignores it.
 func SendAndWaitForResponseWithLifetime(ctx context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
-	return sendAndWait(ctx, SendToServer, msg)
+	return sendAndWaitOnCurrent(ctx, msg)
 }
 
-// sendAndWait sends msg with send and waits for the reply on its tag. It
-// returns the Lifetime the reply was validated against (L3 reply
-// dispatch): the one in effect when send was attempted, accepted only if
-// it is still live at the moment the reply arrives. This replaces the ad
-// hoc generation-sampling that used to live only in deploymentrecheck.go
-// (review findings 1169/1245) with one mechanism every sendAndWait caller
-// gets for free - a reply is delivered only to a waiter that sent on a
-// Lifetime that is still live when it is accepted.
-func sendAndWait(ctx context.Context, send func(*l2sec.FromClusterAgent) error, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
+// sendAndWaitOnCurrent samples currentLifetime exactly once and carries
+// that single value through registration and send (review finding 1403:
+// sendAndWait used to sample it once for registration, then hand off to a
+// goroutine that called SendToServer, which sampled currentLifetime AGAIN
+// - a reconnect in the gap between the two samples could make the second
+// send actually transmit on a brand new successor stream while the first,
+// stale sample still governed whether the reply was accepted, rejecting a
+// reply the successor legitimately delivered). Sampling once here and
+// passing it to sendAndWait closes that gap: whichever Lifetime is
+// current at the moment this call starts is the only one this call will
+// ever register under or send through.
+func sendAndWaitOnCurrent(ctx context.Context, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
+	lt := currentLifetime.Load()
+	if !lt.Live() {
+		return nil, nil, fmt.Errorf("stream not initialized")
+	}
+	return sendAndWait(ctx, lt, sendOnLifetime, msg)
+}
+
+// sendAndWait sends msg on lt via send (sendOnLifetime in production) and
+// waits for the reply on its tag, registered under lt.pending - never a
+// package-wide map (review finding 1403), so this exact Lifetime owns
+// both the registration and the cleanup that can later drain it. It
+// returns lt itself once the reply is accepted, still live: the one
+// Lifetime carried through selection, registration, transport send,
+// receive dispatch, and waiter lookup, with no resampling at any step.
+func sendAndWait(ctx context.Context, lt *Lifetime, send func(*Lifetime, *l2sec.FromClusterAgent) error, msg *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error) {
 	tagID := uuid.New()
 	msg.Tag = tagID.String()
 
 	responseChan := make(chan *l2sec.ToClusterAgent, 1)
-	pendingResponses.Store(tagID.String(), responseChan)
-	defer pendingResponses.Delete(tagID.String())
-
-	lt := currentLifetime.Load()
+	lt.pending.Store(tagID.String(), responseChan)
+	defer lt.pending.Delete(tagID.String())
 
 	// Review finding 1077: send used to run synchronously and unbounded by
 	// ctx. gRPC flow control can stall stream.Send past any caller deadline
@@ -649,11 +704,11 @@ func sendAndWait(ctx context.Context, send func(*l2sec.FromClusterAgent) error, 
 	// sender used to block the whole call well past its own timeout. Run it
 	// in a goroutine and race it against ctx here too, not only in the
 	// reply wait below, so a bounded deadline is actually bounded. If ctx
-	// wins, the deferred pendingResponses.Delete above still runs and the
-	// send goroutine, if it later succeeds, writes into sendDone with
-	// nobody left to read it - a harmless buffered write, not a leak.
+	// wins, the deferred lt.pending.Delete above still runs and the send
+	// goroutine, if it later succeeds, writes into sendDone with nobody
+	// left to read it - a harmless buffered write, not a leak.
 	sendDone := make(chan error, 1)
-	go func() { sendDone <- send(msg) }()
+	go func() { sendDone <- send(lt, msg) }()
 
 	select {
 	case err := <-sendDone:

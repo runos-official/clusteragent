@@ -134,6 +134,15 @@ var (
 	logReceivedCLIUpload = func(n int, osid, uploadID, token string) {
 		log.Printf("Received CLI deploy upload: %d bytes for osid=%s, uploadID=%s, token=%s...", n, osid, uploadID, token[:8])
 	}
+
+	// deriveArchivePushContext builds the bounded context pushArchive uses.
+	// A package var only so a test can observe this exact point -
+	// immediately before the final L6 permit check - and inject a stream
+	// failure there (review finding 1405: closed during context setup,
+	// before that check).
+	deriveArchivePushContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+		return context.WithTimeout(parent, 5*time.Minute)
+	}
 )
 
 // HandleCLIDeployUpload processes CLI deployment tarball uploads with presigned tokens
@@ -372,19 +381,29 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 
 	logReceivedCLIUpload(len(tarballData), osid, uploadID, token)
 
+	// Review finding 1405 (widening L6 further): derive the archive-push
+	// context BEFORE the final permit check, not after. context.WithTimeout
+	// registers the child under the parent context's own cancellation
+	// propagation and can itself block briefly doing so; positioned after
+	// the check, that blocking step - like the log write finding 1313
+	// already closed - would sit between "permit confirmed valid" and the
+	// archive push with no check of its own in between. Deriving it first
+	// means the only thing left between the check and pushArchive is the
+	// call itself.
+	pushCtx, cancel := deriveArchivePushContext(ctx)
+	defer cancel()
+
 	// Review finding 1128, widened by finding 1313 (repeat of
 	// 1270/1240/1169) to L6: check the permit's own deadline AND its
-	// Lifetime again immediately before archive entry - after every
-	// blocking step since the claim, including the log write just above.
-	// That write used to sit between this check and the push with no check
-	// of its own after it, so a disconnect during it slipped through
-	// uncaught. The claim itself is also a datastore round trip and can
-	// take long enough for even the permit's own short deadline to pass
-	// between the pre-claim check above and this point. The token is
-	// ALREADY claimed by now regardless of this outcome, so - unlike the
-	// pre-claim check - this is unconditionally terminal: no retry with
-	// this token is possible any more, and Conductor's poller needs a
-	// recorded reason.
+	// Lifetime immediately before archive entry - after every blocking
+	// step since the claim, including the log write and the context
+	// derivation just above. The claim itself is also a datastore round
+	// trip and can take long enough for even the permit's own short
+	// deadline to pass between the pre-claim check above and this point.
+	// The token is ALREADY claimed by now regardless of this outcome, so -
+	// unlike the pre-claim check - this is unconditionally terminal: no
+	// retry with this token is possible any more, and Conductor's poller
+	// needs a recorded reason.
 	if permit != nil {
 		if refusal := permitStillValid(permit); refusal != nil {
 			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
@@ -393,8 +412,6 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Persist the source archive in Harbor before kicking off the build.
-	pushCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
 	if err := pushArchive(pushCtx, harborclient.Config{
 		URL:      buildkitConfig.HarborURL,
 		Username: buildkitConfig.HarborUsername,
