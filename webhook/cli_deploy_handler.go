@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -241,6 +242,17 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// fixed tarball and the SAME token/uploadID still claims and builds.
 	if err := checkTarballLimits(tarballData); err != nil {
 		failPreClaimUpload(w, token, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err), uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
+		return
+	}
+
+	// Review findings 1311/1315: these three archive-wide refusals mirror
+	// extractTarball's own containment checks (a traversing entry name, an
+	// absolute symlink target, a symlink that escapes the destination) but
+	// run here, header-only, before any claim - independent of the
+	// configured dockerfile, so an archive that would only fail during the
+	// (post-claim) asynchronous extraction is refused here instead.
+	if err := checkTarballContainment(tarballData); err != nil {
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err), uploadToken.AuthorizationClassification, uploadToken.DurableJobID)
 		return
 	}
 
@@ -635,10 +647,17 @@ func processBuildImageDeployment(tarballData []byte, osid, jobID, repo string, t
 // Empty dockerfile returns empty strings (BuildKit's defaults: context
 // root + "Dockerfile"), preserving the pre-monorepo single-app shape.
 //
-// Path-traversal: the resolved path must stay inside tarballRoot. The
-// CLI's pre-flight `ResolveDockerfilePath` already gates this, but
-// validating here too keeps the cluster-agent's trust boundary clear
-// (the tarball could come from a malicious upload token recipient).
+// The target is validated through the SAME shared resolver
+// (resolveDockerfileTarget, webhook/dockerfile_target.go) that
+// validateDockerfileTarget runs the pre-claim tar entry set through, over
+// an fsDockerfileLookup backed by Lstat/Readlink instead of the tar
+// headers (review finding 1311's closure: one resolver, two lookups, so
+// the two boundaries cannot disagree). The CLI's pre-flight
+// `ResolveDockerfilePath` already gates this too, but validating here
+// keeps the cluster-agent's own trust boundary clear (the tarball could
+// come from a malicious upload token recipient). The returned dir/filename
+// are the plain joined path: BuildKit opens it itself, and the OS follows
+// any symlink transparently at that point, exactly as it always has.
 func splitTarballDockerfile(tarballRoot, dockerfile string) (string, string, error) {
 	trimmed := strings.TrimSpace(dockerfile)
 	if trimmed == "" {
@@ -648,38 +667,21 @@ func splitTarballDockerfile(tarballRoot, dockerfile string) (string, string, err
 		return "", "", fmt.Errorf("dockerfile must be relative to the tarball root, got absolute path %q", trimmed)
 	}
 
+	cleaned := path.Clean(filepath.ToSlash(trimmed))
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", "", fmt.Errorf("dockerfile %q escapes tarball root", trimmed)
+	}
+
 	absRoot, err := filepath.Abs(tarballRoot)
 	if err != nil {
 		return "", "", fmt.Errorf("resolving tarball root: %w", err)
 	}
-	joined := filepath.Join(absRoot, trimmed)
-	resolved, err := filepath.Abs(joined)
-	if err != nil {
-		return "", "", fmt.Errorf("resolving dockerfile path: %w", err)
+
+	if err := resolveDockerfileTarget(fsDockerfileLookup{root: absRoot}, cleaned, trimmed); err != nil {
+		return "", "", err
 	}
 
-	// Path-traversal guard: a malicious `../etc/passwd` style path is
-	// rejected even if it happens to exist on disk. Review finding 1272: a
-	// bare strings.HasPrefix(rel, "..") also rejected a perfectly ordinary
-	// filename that merely starts with two dots, such as "..Containerfile"
-	// sitting right inside the root - it is not an ascent, just a name
-	// that happens to begin with the same two characters. Require the
-	// prefix to be followed by a path separator (or be exactly "..") so
-	// only a real ascent is rejected, matching validateDockerfileTarget's
-	// preflight check (tarball_limits.go), which already gets this right.
-	rel, err := filepath.Rel(absRoot, resolved)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", "", fmt.Errorf("dockerfile %q escapes tarball root", trimmed)
-	}
-
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", "", fmt.Errorf("dockerfile %q not found inside tarball: %w", trimmed, err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", "", fmt.Errorf("dockerfile %q is not a regular file", trimmed)
-	}
-
+	resolved := filepath.Join(absRoot, filepath.FromSlash(cleaned))
 	return filepath.Dir(resolved), filepath.Base(resolved), nil
 }
 

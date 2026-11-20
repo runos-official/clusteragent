@@ -175,7 +175,9 @@ func createBuildKitJob(jobID, osid, repo, branch, commitHash, classification, au
 
 // RecordFailedUploadIfUnclaimed writes a failed build row for jobID, UNLESS
 // the upload token identified by the raw token has already been claimed by
-// a concurrent request (review finding 1267).
+// a concurrent request (review finding 1267), or no longer exists at all
+// (review finding 1314: DeleteExpiredUploadTokens can have removed it
+// between this refusal's earlier token load and this call).
 //
 // A terminal PRE-claim refusal (the tarball/Dockerfile/Harbor-identity
 // checks, or a scoped deny) can fire for a request that loaded the token
@@ -189,13 +191,20 @@ func createBuildKitJob(jobID, osid, repo, branch, commitHash, classification, au
 // failed deployment that actually succeeded. A local datastore probe
 // confirmed the upsert does exactly this reset.
 //
-// On PostgreSQL this reads the token's used state under FOR UPDATE and
-// writes the failure row in the SAME transaction, so it cannot race the
+// On PostgreSQL this reads the token's id and used state under FOR UPDATE
+// and writes the failure row in the SAME transaction, so it cannot race the
 // claim's own transaction (datastore.MarkUploadTokenUsed also locks this
 // row via FOR UPDATE before updating it, review finding 1239): whichever
 // transaction reaches the row first simply runs to completion before the
 // other proceeds. SQLite (test-only; production always runs PostgreSQL)
 // keeps a plain read, since it has no row-level locking to join.
+//
+// Both branches decide on the row's id, not on the scanned used column's
+// zero value (review finding 1314): a SELECT that matches zero rows (the
+// token was deleted) scans an all-zero-value struct with no error, so
+// checking "used" alone would read that as an existing, unused token and
+// write the refusal anyway, overwriting whatever real result the job_id
+// already carries.
 //
 // This must be called ONLY for a refusal where the CALLING request has not
 // itself claimed the token - a request that already owns the claim (an
@@ -225,14 +234,22 @@ func recordFailedUploadIfUnclaimedPostgres(gdb *gorm.DB, token, jobID, osid, rea
 	hashed := hashToken(token)
 	table := (UploadTokenModel{}).TableName()
 	return gdb.Transaction(func(tx *gorm.DB) error {
-		var used bool
-		if err := tx.Raw("SELECT used FROM "+table+" WHERE token_hash = ? FOR UPDATE", hashed).Scan(&used).Error; err != nil {
+		var row struct {
+			ID   uint
+			Used bool
+		}
+		if err := tx.Raw("SELECT id, used FROM "+table+" WHERE token_hash = ? FOR UPDATE", hashed).Scan(&row).Error; err != nil {
 			return err
 		}
-		if used {
-			// A concurrent request already claimed this token: it owns
-			// jobID's build row from here. Writing here would overwrite
-			// its result.
+		// Decide on the row being found, not on the scanned bool's zero
+		// value (review finding 1314): once DeleteExpiredUploadTokens has
+		// removed the row - it deletes used and unused rows alike, keyed
+		// only on expiry - this SELECT returns zero rows and Used would
+		// read back false, as if an unused token still existed. Either no
+		// row exists, or a concurrent request already claimed this one:
+		// in both cases jobID's build row (if any) belongs to someone
+		// else, or to nobody, and writing here must not happen.
+		if row.ID == 0 || row.Used {
 			return nil
 		}
 		return writeFailedBuildRow(tx, jobID, osid, reason, classification, authorityJobID)
@@ -243,11 +260,14 @@ func recordFailedUploadIfUnclaimedSQLite(gdb *gorm.DB, token, jobID, osid, reaso
 	hashed := hashToken(token)
 	table := (UploadTokenModel{}).TableName()
 	return gdb.Transaction(func(tx *gorm.DB) error {
-		var used bool
-		if err := tx.Raw("SELECT used FROM "+table+" WHERE token_hash = ?", hashed).Scan(&used).Error; err != nil {
+		var row struct {
+			ID   uint
+			Used bool
+		}
+		if err := tx.Raw("SELECT id, used FROM "+table+" WHERE token_hash = ?", hashed).Scan(&row).Error; err != nil {
 			return err
 		}
-		if used {
+		if row.ID == 0 || row.Used {
 			return nil
 		}
 		return writeFailedBuildRow(tx, jobID, osid, reason, classification, authorityJobID)

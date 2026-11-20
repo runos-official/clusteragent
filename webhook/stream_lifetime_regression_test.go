@@ -493,8 +493,8 @@ func newRegressionHarness(t *testing.T) *regressionHarness {
 	})
 
 	beginWork = func() (func(), error) { return func() {}, nil }
-	recordFailedUpload = func(string, string, string) error { return nil }
-	recordFailedUploadIfUnclaimed = func(string, string, string, string) error { return nil }
+	recordFailedUpload = func(string, string, string, string, string) error { return nil }
+	recordFailedUploadIfUnclaimed = func(string, string, string, string, string, string) error { return nil }
 
 	loadUploadableToken = func(string) (*datastore.UploadToken, error) {
 		return scopedUploadToken(), nil
@@ -517,7 +517,7 @@ func newRegressionHarness(t *testing.T) *regressionHarness {
 		h.mu.Unlock()
 		return nil
 	}
-	startCLIDeploymentAsync = func(_ []byte, _, _, _ string, _ []datastore.BuildArg, _ *agentstream.BuildKitConfig, end func()) {
+	startCLIDeploymentAsync = func(_ []byte, _, _, _ string, _ []datastore.BuildArg, _, _ string, _ *agentstream.BuildKitConfig, end func()) {
 		h.mu.Lock()
 		h.cliStarted = true
 		h.mu.Unlock()
