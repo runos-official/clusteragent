@@ -65,15 +65,9 @@ func (f *fakeStream) Recv() (*l2sec.ToClusterAgent, error) { select {} }
 func withFakeStream(t *testing.T) *fakeStream {
 	t.Helper()
 	f := &fakeStream{}
-	globalStreamMu.Lock()
-	prev := globalStream
-	globalStream = f
-	globalStreamMu.Unlock()
-	t.Cleanup(func() {
-		globalStreamMu.Lock()
-		globalStream = prev
-		globalStreamMu.Unlock()
-	})
+	prev := currentLifetime.Load()
+	currentLifetime.Store(newLifetime(f))
+	t.Cleanup(func() { currentLifetime.Store(prev) })
 	return f
 }
 
@@ -94,7 +88,7 @@ func TestStreamingInstructionProgressTags(t *testing.T) {
 	t.Run("progressTags true numbers each message", func(t *testing.T) {
 		f := withFakeStream(t)
 		tag := uuid.New().String()
-		handleInstruction(&l2sec.ToClusterAgent{Type: testType, Tag: tag, JsonB64: b64(t, map[string]any{"progressTags": true})})
+		handleInstruction(&l2sec.ToClusterAgent{Type: testType, Tag: tag, JsonB64: b64(t, map[string]any{"progressTags": true})}, currentLifetime.Load())
 
 		if len(f.sent) != 4 {
 			t.Fatalf("sent %d messages, want 3 progress and 1 reply", len(f.sent))
@@ -113,7 +107,7 @@ func TestStreamingInstructionProgressTags(t *testing.T) {
 	t.Run("without the field each message gets a fresh tag as today", func(t *testing.T) {
 		f := withFakeStream(t)
 		tag := uuid.New().String()
-		handleInstruction(&l2sec.ToClusterAgent{Type: testType, Tag: tag, JsonB64: b64(t, map[string]any{})})
+		handleInstruction(&l2sec.ToClusterAgent{Type: testType, Tag: tag, JsonB64: b64(t, map[string]any{})}, currentLifetime.Load())
 
 		if len(f.sent) != 4 {
 			t.Fatalf("sent %d messages, want 3 progress and 1 reply", len(f.sent))

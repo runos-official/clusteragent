@@ -26,7 +26,9 @@ func TestSafeHandleInstructionRecoversFromPanic(t *testing.T) {
 		Type: typ,
 	}
 
+	lt := newLifetime(&fakeBidiStream{})
+
 	// If safeHandleInstruction did not recover, these panic and fail the test.
-	safeHandleInstruction(inst) // handler panic
-	safeHandleInstruction(nil)  // nil instruction: the recovery path itself must not re-panic
+	safeHandleInstruction(inst, lt) // handler panic
+	safeHandleInstruction(nil, lt)  // nil instruction: the recovery path itself must not re-panic
 }

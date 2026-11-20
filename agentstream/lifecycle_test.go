@@ -30,7 +30,12 @@ func newLifecycleStream() *lifecycleStream {
 func (s *lifecycleStream) Send(m *l2sec.FromClusterAgent) error {
 	if m.Type == "ClusterAgentHeartbeatToServer" {
 		s.heartbeats.Add(1)
-		go handleInstruction(&l2sec.ToClusterAgent{Tag: m.Tag, Type: "ClusterAgentHeartbeatAck"})
+		// Deliver the ack through whichever Lifetime is current: this test
+		// drives one stream at a time (a phase fully completes - and the
+		// prior stream's heartbeat goroutine with it - before the next
+		// stream's phase begins), so currentLifetime always names this
+		// exact stream's own Lifetime at the moment each ack is sent.
+		go handleInstruction(&l2sec.ToClusterAgent{Tag: m.Tag, Type: "ClusterAgentHeartbeatAck"}, currentLifetime.Load())
 	}
 	return nil
 }

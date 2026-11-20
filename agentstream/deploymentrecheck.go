@@ -255,15 +255,17 @@ type StageResponse struct {
 	IssuedAt      time.Time
 	ExpiresAt     time.Time
 
-	// StreamGeneration is CurrentStreamGeneration() captured at the moment
-	// this response was validated (review finding 1169). The request and
-	// this reply are correlated by tag on whichever stream was current at
-	// send time; a disconnect and reconnect between then and when a caller
-	// acts on the permit would otherwise be invisible, because the
-	// response payload itself carries no connection identity. A caller
-	// that compares this value against a fresh CurrentStreamGeneration()
-	// before acting on the permit detects that gap.
-	StreamGeneration uint64
+	// Lifetime is the Lifetime of the stream that delivered this response
+	// (L4 permit; review finding 1313, repeat of 1270/1240/1169). The
+	// request and this reply are correlated by tag on whichever stream was
+	// current at send time; a disconnect and reconnect between then and
+	// when a caller acts on the permit would otherwise be invisible,
+	// because the response payload itself carries no connection identity.
+	// A caller that checks Lifetime.Live() again immediately before acting
+	// on the permit detects that gap: once a Lifetime goes live-to-ended it
+	// never comes back, regardless of whether a replacement connection is
+	// live again by then.
+	Lifetime *Lifetime
 }
 
 // RequestStageRecheck sends one bounded, correlated recheck request over the
@@ -271,16 +273,17 @@ type StageResponse struct {
 // published contract. It is the production entry point; tests drive
 // requestStageRecheckWith directly with a fake transport.
 func RequestStageRecheck(ctx context.Context, authority RecheckAuthority, stage RecheckStage, retryID string) (*StageResponse, error) {
-	return requestStageRecheckWith(ctx, SendAndWaitForResponse, authority, stage, retryID)
+	return requestStageRecheckWith(ctx, SendAndWaitForResponseWithLifetime, authority, stage, retryID)
 }
 
 // requestStageRecheckWith is RequestStageRecheck with the transport
 // injected, so tests can supply a fake request-response function without a
 // live stream (plan: "Inject the clock and recheck client for deterministic
-// tests"). send must match agentstream.SendAndWaitForResponse's signature.
+// tests"). send must match agentstream.SendAndWaitForResponseWithLifetime's
+// signature.
 func requestStageRecheckWith(
 	ctx context.Context,
-	send func(context.Context, *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error),
+	send func(context.Context, *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, *Lifetime, error),
 	authority RecheckAuthority,
 	stage RecheckStage,
 	retryID string,
@@ -309,18 +312,13 @@ func requestStageRecheckWith(
 	reqCtx, cancel := context.WithTimeout(ctx, recheckTimeout)
 	defer cancel()
 
-	// Review finding 1245 (repeat of 1169): sample the generation BEFORE the
-	// send, not after the reply is decoded. agent.go's reply delivery writes
-	// into a buffered, capacity-one tag channel and returns; a buffered
-	// value stays readable even after establishAndMaintainStream closes that
-	// channel on disconnect, so a reply legitimately sent on generation N
-	// can still be read successfully after the stream has already moved to
-	// generation N+1. Reading the generation only after that point would
-	// record N+1 - the POST-disconnect value - erasing the only signal that
-	// a disconnect happened at all.
-	genAtSend := CurrentStreamGeneration()
-
-	reply, err := send(reqCtx, &l2sec.FromClusterAgent{
+	// L4: send returns the Lifetime the reply was validated against
+	// (sendAndWait's own L3 check: a reply already buffered when the
+	// stream that delivered it ends is refused there, not stamped as
+	// authoritative here). No separate generation-sampling is needed in
+	// this file any more (review finding 1245, repeat of 1169): that
+	// mechanism now lives once, in sendAndWait, for every caller.
+	reply, lt, err := send(reqCtx, &l2sec.FromClusterAgent{
 		Type:    recheckRequestType,
 		JsonB64: base64.StdEncoding.EncodeToString(payload),
 	})
@@ -343,15 +341,7 @@ func requestStageRecheckWith(
 	if err != nil {
 		return nil, err
 	}
-	// If the generation moved at all between send and here, the reply may
-	// have been read from a buffer across a disconnect (or a reconnect)
-	// that happened while it was in flight: refuse rather than stamp a
-	// generation that can no longer prove which connection the decision was
-	// actually made for.
-	if CurrentStreamGeneration() != genAtSend {
-		return nil, fmt.Errorf("deployment stage recheck: control stream disconnected or reconnected while the reply was in flight")
-	}
-	resp.StreamGeneration = genAtSend
+	resp.Lifetime = lt
 	return resp, nil
 }
 
