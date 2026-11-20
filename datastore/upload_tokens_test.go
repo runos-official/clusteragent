@@ -84,10 +84,10 @@ func TestUploadToken_MarkUsedByRawToken(t *testing.T) {
 		t.Fatalf("CreatePullToken: %v", err)
 	}
 
-	if err := MarkUploadTokenUsed(raw); err != nil {
+	if err := MarkUploadTokenUsed(raw, nil); err != nil {
 		t.Fatalf("first MarkUploadTokenUsed: %v", err)
 	}
-	if err := MarkUploadTokenUsed(raw); err == nil {
+	if err := MarkUploadTokenUsed(raw, nil); err == nil {
 		t.Fatalf("second MarkUploadTokenUsed should fail (already used)")
 	}
 
@@ -97,6 +97,89 @@ func TestUploadToken_MarkUsedByRawToken(t *testing.T) {
 	}
 	if !tok.Used {
 		t.Fatalf("token should be marked used")
+	}
+}
+
+// TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically pins review finding
+// 1076: the atomic claim itself must enforce expiry, not just an earlier,
+// separate check. A token already past its expires_at must refuse the
+// claim even though it is otherwise unused - closing the window where body
+// reads, tarball validation, a config read, or a scoped recheck round trip
+// consume enough time for the token to expire between an earlier check and
+// the actual claim. A token that is NOT expired must still claim normally
+// (a legitimate request must still pass).
+func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically(t *testing.T) {
+	setupTestDB(t)
+
+	const expiredRaw = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	past := time.Now().Add(-1 * time.Minute)
+	if err := CreatePullToken(expiredRaw, "osid-1", "upload-exp", past); err != nil {
+		t.Fatalf("create expired token: %v", err)
+	}
+	if err := MarkUploadTokenUsed(expiredRaw, nil); err == nil {
+		t.Fatal("expected MarkUploadTokenUsed to refuse an already-expired token")
+	}
+	tok, err := GetPullToken(expiredRaw)
+	if err != nil {
+		t.Fatalf("GetPullToken: %v", err)
+	}
+	if tok.Used {
+		t.Fatal("an expired token must not be left marked used by the refused claim")
+	}
+
+	const liveRaw = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	future := time.Now().Add(5 * time.Minute)
+	if err := CreatePullToken(liveRaw, "osid-1", "upload-live", future); err != nil {
+		t.Fatalf("create live token: %v", err)
+	}
+	if err := MarkUploadTokenUsed(liveRaw, nil); err != nil {
+		t.Fatalf("a non-expired token must still claim: %v", err)
+	}
+}
+
+// TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically_AcrossTimezones pins
+// review finding 1203: the fix for finding 1128 must give the correct
+// answer regardless of the process's local timezone, not only on a UTC
+// host. Measured in this repository: the prior fix (a bare
+// "expires_at > CURRENT_TIMESTAMP" comparison on SQLite) refused a LIVE
+// token under America/New_York and admitted an EXPIRED token under
+// Europe/Berlin, because GORM stores a local-offset time.Time as text
+// while SQLite's CURRENT_TIMESTAMP is bare UTC text. This test sets
+// time.Local directly (not the TZ environment variable), so it proves the
+// property regardless of the environment it runs in, in both directions
+// (UTC+1 and UTC-5, plus the widest real offsets, UTC+14 and UTC-11).
+func TestMarkUploadTokenUsed_RefusesExpiredTokenAtomically_AcrossTimezones(t *testing.T) {
+	zones := []string{"Europe/Berlin", "America/New_York", "Pacific/Kiritimati", "Pacific/Niue"}
+	for _, zoneName := range zones {
+		t.Run(zoneName, func(t *testing.T) {
+			loc, err := time.LoadLocation(zoneName)
+			if err != nil {
+				t.Fatalf("time.LoadLocation(%q): %v", zoneName, err)
+			}
+			prevLocal := time.Local
+			time.Local = loc
+			t.Cleanup(func() { time.Local = prevLocal })
+
+			setupTestDB(t)
+
+			expiredRaw := "expired-token-" + zoneName
+			past := time.Now().Add(-1 * time.Minute)
+			if err := CreatePullToken(expiredRaw, "osid-1", "upload-exp", past); err != nil {
+				t.Fatalf("create expired token: %v", err)
+			}
+			if err := MarkUploadTokenUsed(expiredRaw, nil); err == nil {
+				t.Fatalf("[%s] expected MarkUploadTokenUsed to refuse an already-expired token", zoneName)
+			}
+
+			liveRaw := "live-token-" + zoneName
+			future := time.Now().Add(5 * time.Minute)
+			if err := CreatePullToken(liveRaw, "osid-1", "upload-live", future); err != nil {
+				t.Fatalf("create live token: %v", err)
+			}
+			if err := MarkUploadTokenUsed(liveRaw, nil); err != nil {
+				t.Fatalf("[%s] a non-expired token must still claim: %v", zoneName, err)
+			}
+		})
 	}
 }
 

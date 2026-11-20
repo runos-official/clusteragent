@@ -53,6 +53,79 @@ var beginWork = drain.Begin
 // agent drains. The restart ends in seconds to minutes, so a short hint is enough.
 const drainRetryAfterSeconds = "30"
 
+// Injected collaborators for the upload admission sequence (story 338).
+// Production wiring matches the pre-story behavior exactly; tests replace
+// these to drive every refusal, ordering, and concurrency path without a
+// live database, control stream, or Kubernetes cluster.
+var (
+	// loadUploadableToken looks a token up by its hash and purpose
+	// allow-list. It does NOT claim the token: claiming moves to
+	// immediately before the first external mutation (see below).
+	loadUploadableToken = datastore.GetUploadableToken
+
+	// claimUploadToken is the atomic single-use claim: an UPDATE ... WHERE
+	// used = false, so of any number of requests that reach this call for
+	// the same token, at most one succeeds. It must be the last call before
+	// an external mutation (archive persist or build start) on every path.
+	// permitDeadline is nil for the build-image and legacy app-upload
+	// paths; the scoped app-upload path passes its fresh recheck permit's
+	// own ExpiresAt, so the claim itself enforces that deadline too
+	// (review findings 1239/1244: the claim must not consume the token
+	// after the permit that authorized it has expired, even if the token's
+	// own, longer-lived expiry has not).
+	claimUploadToken = datastore.MarkUploadTokenUsed
+
+	// readBuildKitConfig loads the BuildKit/Harbor configuration with one
+	// read. Used by the app-deploy path and by a build-image upload with no
+	// bound harborOsid (criterion 6(d)'s explicit legacy branch): neither
+	// compares a locked Harbor identity, so neither needs the stricter,
+	// more fragile double-read (review finding 1269).
+	readBuildKitConfig = func(ctx context.Context) (*agentstream.BuildKitConfig, error) {
+		k8sClient, err := agentstream.NewK8sClient()
+		if err != nil {
+			return nil, fmt.Errorf("create Kubernetes client: %w", err)
+		}
+		return k8sClient.GetBuildKitConfig(ctx)
+	}
+
+	// readBuildKitConfigVerified loads the BuildKit/Harbor configuration
+	// with the double-read, compare-and-refuse check (review finding 1074),
+	// for the one path that actually needs it: a build-image upload whose
+	// token carries a bound, non-empty harborOsid. This is the SAME read
+	// the criterion 6(b) Harbor-identity comparison and the eventual push
+	// both use for that path - no second read between them.
+	readBuildKitConfigVerified = func(ctx context.Context) (*agentstream.BuildKitConfig, error) {
+		k8sClient, err := agentstream.NewK8sClient()
+		if err != nil {
+			return nil, fmt.Errorf("create Kubernetes client: %w", err)
+		}
+		return k8sClient.GetBuildKitConfigVerified(ctx)
+	}
+
+	// pushArchive persists the app-deploy source archive in Harbor.
+	pushArchive = harborclient.PushArchive
+
+	// startCLIDeploymentAsync launches the asynchronous build+deploy for an
+	// app-deploy upload once admission has permitted it and the token is
+	// claimed. end must be called exactly once, on every path out of the
+	// goroutine, matching the pre-story drain-tracking contract.
+	startCLIDeploymentAsync = func(tarballData []byte, osid, jobID, dockerfile string, buildArgs []datastore.BuildArg, buildkitConfig *agentstream.BuildKitConfig, end func()) {
+		go func() {
+			defer end()
+			processCLIDeployment(tarballData, osid, jobID, dockerfile, buildArgs, buildkitConfig)
+		}()
+	}
+
+	// startBuildImageDeploymentAsync is startCLIDeploymentAsync's build-image
+	// (obj-47) counterpart.
+	startBuildImageDeploymentAsync = func(tarballData []byte, osid, jobID, repo string, tags []string, dockerfile string, buildArgs []datastore.BuildArg, buildkitConfig *agentstream.BuildKitConfig, end func()) {
+		go func() {
+			defer end()
+			processBuildImageDeployment(tarballData, osid, jobID, repo, tags, dockerfile, buildArgs, buildkitConfig)
+		}()
+	}
+)
+
 // HandleCLIDeployUpload processes CLI deployment tarball uploads with presigned tokens
 func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -86,9 +159,16 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Validate token. The endpoint serves both app-deploy uploads and
-	// app-less build-image uploads (obj-47); GetUploadableToken matches
+	// app-less build-image uploads (obj-47); loadUploadableToken matches
 	// either purpose and we branch on it below.
-	uploadToken, err := datastore.GetUploadableToken(token)
+	//
+	// The token is NOT claimed here. Story 338: every available
+	// non-mutating check - body, tarball limits, configuration read, and,
+	// for a scoped token, the fresh authority recheck - must run first, so
+	// a later failure never burns a token that was in fact valid. The
+	// atomic claim moves to immediately before each path's first external
+	// mutation.
+	uploadToken, err := loadUploadableToken(token)
 	if err != nil {
 		log.Printf("Token lookup failed: %v", err)
 		http.Error(w, "Invalid token", http.StatusUnauthorized)
@@ -106,13 +186,6 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	if uploadToken.Used {
 		log.Printf("Token already used: %s", token[:8])
 		http.Error(w, "Token already used", http.StatusUnauthorized)
-		return
-	}
-
-	// Mark token as used IMMEDIATELY (before processing) to prevent race conditions
-	if err := datastore.MarkUploadTokenUsed(token); err != nil {
-		log.Printf("Failed to mark token as used: %v", err)
-		http.Error(w, "Token validation failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -139,25 +212,30 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Upload token had no pre-assigned uploadId; minted %s (legacy conductor path)", uploadID)
 	}
 
-	// Refuse a tarball over the extraction limits now, with the reason, instead
-	// of answering 202 and failing the build later (FCR 1631).
+	// Refuse a tarball over the extraction limits now, with the reason,
+	// instead of answering 202 and failing the build later (FCR 1631). Still
+	// before any claim: a tarball refusal must not burn the token. This is a
+	// TERMINAL refusal (review finding 1133): the same tarball will fail
+	// the same way on every retry, so Conductor's deploy job needs a
+	// recorded, pollable reason (FCR 744) rather than waiting out its whole
+	// poll budget. failUpload's row is upsert-safe, so a later retry with a
+	// fixed tarball and the SAME token/uploadID still claims and builds.
 	if err := checkTarballLimits(tarballData); err != nil {
-		failUpload(w, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
 		return
 	}
 
-	// Load BuildKit config (Harbor credentials) used by both flows.
+	// Review finding 1078: the aggregate decompressed-size cap and the
+	// configured Dockerfile target must be checked here too, before claim,
+	// not only during the (post-claim) asynchronous extraction and build.
+	// Scans the same in-memory tarball bytes without extracting to disk.
+	// Also terminal (finding 1133): same reasoning as the tarball check.
+	if err := validateDockerfileTarget(tarballData, uploadToken.Dockerfile); err != nil {
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err))
+		return
+	}
+
 	ctx := r.Context()
-	k8sClient, err := agentstream.NewK8sClient()
-	if err != nil {
-		failUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("Internal error: create Kubernetes client: %v", err))
-		return
-	}
-	buildkitConfig, err := k8sClient.GetBuildKitConfig(ctx)
-	if err != nil {
-		failUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("Internal error: read the build config: %v", err))
-		return
-	}
 
 	// App-less build-image flow (obj-47): the tarball is a generic build
 	// context to be built and pushed to explicit Harbor target ref(s). No
@@ -171,15 +249,129 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		repo := uploadToken.BuildTarget.Repo
 		tags := uploadToken.BuildTarget.Tags
+		boundHarborOsid := uploadToken.BuildTarget.HarborOsid
+
+		// Load BuildKit config (Harbor credentials), the SAME read the
+		// eventual push uses (never a second read of the configuration).
+		// Review finding 1269: only a BOUND token (one that criterion 6(b)
+		// will actually compare) uses the stricter double-read; criterion
+		// 6(d)'s explicit legacy branch (no bound identity) keeps the
+		// plain single read, same as every other caller.
+		var buildkitConfig *agentstream.BuildKitConfig
+		var err error
+		if boundHarborOsid != "" {
+			buildkitConfig, err = readBuildKitConfigVerified(ctx)
+		} else {
+			buildkitConfig, err = readBuildKitConfig(ctx)
+		}
+		if err != nil {
+			refuseUpload(w, repo, uploadID, http.StatusInternalServerError, fmt.Sprintf("load build configuration: %v", err), fmt.Sprintf("Internal error: load build configuration: %v", err))
+			return
+		}
+
+		// Story 338 criteria 6(b)/6(b2): compare the Harbor identity
+		// Conductor locked at mint time, and require a usable registry
+		// endpoint, against the buildkitConfig the push below will use -
+		// before the build starts and before any push.
+		if refusal := verifyBuildImageHarborIdentity(boundHarborOsid, buildkitConfig.HarborOsid, buildkitConfig.HarborURL); refusal != nil {
+			reportUploadRefusal(w, token, repo, uploadID, refusal)
+			return
+		}
+
+		// Every available check has run: claim the token now, immediately
+		// before the first external effect (the build start). No permit
+		// deadline applies to a build-image token.
+		if err := claimUploadToken(token, nil); err != nil {
+			log.Printf("Token claim failed (concurrent consumption or already used): %v", err)
+			http.Error(w, "Token already used", http.StatusUnauthorized)
+			return
+		}
+
 		log.Printf("Received build-image upload: %d bytes for repo=%s, tags=%v, uploadID=%s, token=%s...", len(tarballData), repo, tags, uploadID, token[:8])
 		started = true
-		go func() {
-			defer end()
-			processBuildImageDeployment(tarballData, osid, uploadID, repo, tags, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig)
-		}()
+		startBuildImageDeploymentAsync(tarballData, osid, uploadID, repo, tags, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig, end)
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte("Upload received, processing build-image"))
 		return
+	}
+
+	// App-deploy flow's own configuration read: never compares a Harbor
+	// identity, so the plain single read is correct here too (review
+	// finding 1269).
+	buildkitConfig, err := readBuildKitConfig(ctx)
+	if err != nil {
+		refuseUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("load build configuration: %v", err), fmt.Sprintf("Internal error: load build configuration: %v", err))
+		return
+	}
+
+	// App-deploy flow. A scoped token requires a fresh, current permit
+	// before anything is persisted; an explicit legacy token keeps its
+	// historical authorization (story 338: no scoped-to-legacy fallback,
+	// and a missing binding on a scoped classification fails closed rather
+	// than falling back to legacy).
+	var permit *agentstream.StageResponse
+	switch uploadToken.AuthorizationClassification {
+	case datastore.AuthorizationScoped:
+		var refusal *uploadRefusal
+		permit, refusal = admitScopedUpload(ctx, uploadToken.AuthorizationBinding)
+		if refusal != nil {
+			reportUploadRefusal(w, token, osid, uploadID, refusal)
+			return
+		}
+	case datastore.AuthorizationLegacy:
+		// Explicit legacy compatibility: no recheck, by design.
+	default:
+		refuseUpload(w, osid, uploadID, http.StatusServiceUnavailable, fmt.Sprintf("unknown authorization classification %q", uploadToken.AuthorizationClassification), "Upload temporarily unavailable, retry shortly")
+		return
+	}
+
+	// Review finding 1076: a scoped permit's own five-second deadline is
+	// real and must still hold at the claim boundary, not just at the
+	// moment the decision was received. Body reads, tarball validation, and
+	// the configuration read all happened before the recheck, so the only
+	// gap left before the claim is this one re-check. This is still a
+	// PRE-claim refusal (the token stays unclaimed), so it goes through the
+	// terminal/retryable dispatch like any other (finding 1133: unavailable
+	// outcomes are retryable).
+	if permit != nil {
+		if refusal := permitStillValid(permit); refusal != nil {
+			reportUploadRefusal(w, token, osid, uploadID, refusal)
+			return
+		}
+	}
+
+	// Every available check has run, including the fresh decision for a
+	// scoped token: claim the token now, immediately before the first
+	// external mutation (the archive persist below). This is the
+	// concurrency boundary - of any number of requests that reach here for
+	// the same token, at most one claim succeeds. For a scoped token the
+	// claim also enforces the permit's own deadline (review findings
+	// 1239/1244), evaluated by the database after the claim's row lock is
+	// held, not just by permitStillValid's Go-side checks on either side
+	// of this call; a legacy token carries no permit, so nil applies only
+	// the token's own expiry.
+	var permitDeadline *time.Time
+	if permit != nil {
+		permitDeadline = &permit.ExpiresAt
+	}
+	if err := claimUploadToken(token, permitDeadline); err != nil {
+		log.Printf("Token claim failed (concurrent consumption or already used): %v", err)
+		http.Error(w, "Token already used", http.StatusUnauthorized)
+		return
+	}
+
+	// Review finding 1128: "Check the permit again at the start of archive
+	// persistence." The claim itself is a datastore round trip and can take
+	// long enough for even the permit's own short deadline to pass between
+	// the pre-claim check above and this point. The token is ALREADY
+	// claimed by now regardless of this outcome, so - unlike the pre-claim
+	// check - this is unconditionally terminal: no retry with this token
+	// is possible any more, and Conductor's poller needs a recorded reason.
+	if permit != nil {
+		if refusal := permitStillValid(permit); refusal != nil {
+			failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+			return
+		}
 	}
 
 	log.Printf("Received CLI deploy upload: %d bytes for osid=%s, uploadID=%s, token=%s...", len(tarballData), osid, uploadID, token[:8])
@@ -187,7 +379,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// Persist the source archive in Harbor before kicking off the build.
 	pushCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	if err := harborclient.PushArchive(pushCtx, harborclient.Config{
+	if err := pushArchive(pushCtx, harborclient.Config{
 		URL:      buildkitConfig.HarborURL,
 		Username: buildkitConfig.HarborUsername,
 		Password: buildkitConfig.HarborPassword,
@@ -202,10 +394,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// empty defaults to "Dockerfile" at the tarball root. uploadToken.BuildArgs
 	// carries the effective build args captured when the token was minted.
 	started = true
-	go func() {
-		defer end()
-		processCLIDeployment(tarballData, osid, uploadID, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig)
-	}()
+	startCLIDeploymentAsync(tarballData, osid, uploadID, uploadToken.Dockerfile, uploadToken.BuildArgs, buildkitConfig, end)
 
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte("Upload received, processing CLI deployment"))
@@ -395,9 +584,16 @@ func splitTarballDockerfile(tarballRoot, dockerfile string) (string, string, err
 	}
 
 	// Path-traversal guard: a malicious `../etc/passwd` style path is
-	// rejected even if it happens to exist on disk.
+	// rejected even if it happens to exist on disk. Review finding 1272: a
+	// bare strings.HasPrefix(rel, "..") also rejected a perfectly ordinary
+	// filename that merely starts with two dots, such as "..Containerfile"
+	// sitting right inside the root - it is not an ascent, just a name
+	// that happens to begin with the same two characters. Require the
+	// prefix to be followed by a path separator (or be exactly "..") so
+	// only a real ascent is rejected, matching validateDockerfileTarget's
+	// preflight check (tarball_limits.go), which already gets this right.
 	rel, err := filepath.Rel(absRoot, resolved)
-	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", "", fmt.Errorf("dockerfile %q escapes tarball root", trimmed)
 	}
 
@@ -571,7 +767,7 @@ func ProcessBuildAndDeploy(ctx context.Context, k8sClient *agentstream.K8sClient
 }
 
 // patchDeploymentImage updates the deployment's container image with retry logic
-func patchDeploymentImage(ctx context.Context, clientset *kubernetes.Clientset, osid, imageTag string) error {
+func patchDeploymentImage(ctx context.Context, clientset kubernetes.Interface, osid, imageTag string) error {
 	const (
 		maxRetries    = 60
 		retryInterval = 5 * time.Second

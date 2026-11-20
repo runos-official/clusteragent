@@ -34,13 +34,52 @@ var (
 	// body without failing the liveness probe (see webhook.HandleHealth): a
 	// disconnected agent is still alive and retrying, so it must not be killed.
 	streamConnected atomic.Bool
+
+	// streamGeneration increments on every control-stream transition:
+	// connect, disconnect, and reconnect (review finding 1169). globalStream
+	// is replaced wholesale on each transition and briefly set to nil on a
+	// disconnect, so it cannot itself serve as a stable identity to compare
+	// across time; the generation counter can. A caller that captured a
+	// generation value when it received a response can compare it later: a
+	// different value proves the stream has disconnected, reconnected, or
+	// both since, even if a replacement connection is live again by then.
+	streamGeneration atomic.Uint64
 )
+
+// invalidateStream marks the control stream unusable and advances its
+// generation the moment a failure is DETECTED, in the same goroutine that
+// detects it (review finding 1270, repeat of 1169/1240). Before this, the
+// generation only advanced later, in establishAndMaintainStream's cleanup
+// after its own goroutine was scheduled to dequeue errChan - a gap that can
+// be wide under host load. A reply already buffered for a pending recheck
+// (agent.go's handleInstruction writes it into a capacity-one channel and
+// returns) could be read by sendAndWait during exactly that gap, with
+// CurrentStreamGeneration() still reporting the stale, pre-disconnect
+// value. Calling this at the point of detection closes that gap: the
+// generation is already advanced by the time any reader observes it,
+// regardless of when establishAndMaintainStream's own goroutine runs its
+// cleanup. Safe to call more than once for the same disconnect; callers do
+// not coordinate who calls it first.
+func invalidateStream() {
+	streamConnected.Store(false)
+	streamGeneration.Add(1)
+}
 
 // StreamConnected reports whether the agent currently holds a live gRPC stream
 // to the control plane. Used by the webhook health endpoint to surface
 // connection state without affecting liveness.
 func StreamConnected() bool {
 	return streamConnected.Load()
+}
+
+// CurrentStreamGeneration returns the control stream's current generation.
+// Compare a value captured earlier (for example, when a response was
+// received on the stream) against a later call's result: a difference
+// means the stream has disconnected, reconnected, or both in between
+// (review finding 1169), so anything that response authorized must be
+// treated as no longer bound to a live, unbroken connection.
+func CurrentStreamGeneration() uint64 {
+	return streamGeneration.Load()
 }
 
 type streamManager struct {
@@ -359,6 +398,7 @@ func (sm *streamManager) establishAndMaintainStream() error {
 	globalStream = stream
 	globalStreamMu.Unlock()
 	streamConnected.Store(true)
+	streamGeneration.Add(1)
 
 	// Run onConnect callback once
 	if onConnectCallback != nil {
@@ -385,6 +425,7 @@ func (sm *streamManager) establishAndMaintainStream() error {
 	// buffered errChan.
 	cancelStream()
 	streamConnected.Store(false)
+	streamGeneration.Add(1)
 	globalStreamMu.Lock()
 	globalStream = nil
 	globalStreamMu.Unlock()
@@ -405,6 +446,10 @@ func (sm *streamManager) listenForInstructions(stream grpc.BidiStreamingClient[l
 	for {
 		instruction, err := stream.Recv()
 		if err != nil {
+			// Invalidate now, in this goroutine, at the moment the
+			// closure is actually observed (review finding 1270): do not
+			// wait for establishAndMaintainStream's cleanup to run.
+			invalidateStream()
 			if err == io.EOF {
 				return fmt.Errorf("server closed the stream")
 			}
@@ -452,6 +497,10 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStrea
 				log.Printf("Heartbeat failed (%d/%d): %v", consecutiveFailures, maxConsecutiveFailures, err)
 
 				if consecutiveFailures >= maxConsecutiveFailures {
+					// Same reasoning as listenForInstructions (review
+					// finding 1270): invalidate here, at the point this
+					// goroutine decides the stream is dead, not later.
+					invalidateStream()
 					return fmt.Errorf("heartbeat failed %d times consecutively", maxConsecutiveFailures)
 				}
 				continue
@@ -471,6 +520,15 @@ func SendToServer(msg *l2sec.FromClusterAgent) error {
 	return sendOnStream(stream, msg)
 }
 
+// sendMu serializes every Send call on the stream. gRPC does not allow
+// concurrent Send calls on the same ClientStream; the heartbeat ticker and
+// any instruction reply or outbound request (including a deployment stage
+// recheck) otherwise race here with no ordering guarantee (review finding
+// 1077). The agent has exactly one active bidi stream at a time - a
+// reconnect replaces globalStream wholesale - so one mutex for the whole
+// package is the stream's own serialization point.
+var sendMu sync.Mutex
+
 // sendOnStream sends msg on one given stream.
 func sendOnStream(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.ToClusterAgent], msg *l2sec.FromClusterAgent) error {
 	if stream == nil {
@@ -481,7 +539,9 @@ func sendOnStream(stream grpc.BidiStreamingClient[l2sec.FromClusterAgent, l2sec.
 		msg.Tag = uuid.New().String()
 	}
 
+	sendMu.Lock()
 	err := stream.Send(msg)
+	sendMu.Unlock()
 	if err != nil {
 		log.Printf("Error sending message to server: %v", err)
 		return err
@@ -610,8 +670,25 @@ func sendAndWait(ctx context.Context, send func(*l2sec.FromClusterAgent) error, 
 	pendingResponses.Store(tagID.String(), responseChan)
 	defer pendingResponses.Delete(tagID.String())
 
-	if err := send(msg); err != nil {
-		return nil, fmt.Errorf("failed to send message: %w", err)
+	// Review finding 1077: send used to run synchronously and unbounded by
+	// ctx. gRPC flow control can stall stream.Send past any caller deadline
+	// (RequestStageRecheck's five-second ceiling included), so a stalled
+	// sender used to block the whole call well past its own timeout. Run it
+	// in a goroutine and race it against ctx here too, not only in the
+	// reply wait below, so a bounded deadline is actually bounded. If ctx
+	// wins, the deferred pendingResponses.Delete above still runs and the
+	// send goroutine, if it later succeeds, writes into sendDone with
+	// nobody left to read it - a harmless buffered write, not a leak.
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- send(msg) }()
+
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			return nil, fmt.Errorf("failed to send message: %w", err)
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
 	select {

@@ -80,7 +80,7 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 			t.Fatalf("stored column %s contains a raw token or credential secret", name)
 		}
 	}
-	if err := MarkUploadTokenUsed(raw); err != nil {
+	if err := MarkUploadTokenUsed(raw, nil); err != nil {
 		t.Fatalf("MarkUploadTokenUsed: %v", err)
 	}
 	var after UploadTokenModel
@@ -307,7 +307,7 @@ func TestUploadToken_PurposeIsolationWithExplicitLegacy(t *testing.T) {
 	if err := CreatePullToken("pull-token", "appaa", "upload-b", expires); err != nil {
 		t.Fatalf("create pull token: %v", err)
 	}
-	if err := CreateBuildImageToken("build-token", "upload-c", "fixture-repo", []string{"latest"}, "", nil, expires); err != nil {
+	if err := CreateBuildImageToken("build-token", "upload-c", "fixture-repo", []string{"latest"}, "", "", nil, expires); err != nil {
 		t.Fatalf("create build token: %v", err)
 	}
 
@@ -345,7 +345,7 @@ func TestUploadToken_ConcurrentSingleUse(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results <- MarkUploadTokenUsed(raw)
+			results <- MarkUploadTokenUsed(raw, nil)
 		}()
 	}
 	wg.Wait()

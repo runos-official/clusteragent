@@ -3,6 +3,7 @@ package instructions
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -38,6 +39,15 @@ type CreateCLIDeployTokenRequest struct {
 	// ignored otherwise.
 	Repo string   `json:"repo,omitempty"`
 	Tags []string `json:"tags,omitempty"`
+	// HarborOsid is the Harbor service identity Conductor verified and
+	// locked before minting a build_image token (story 390 criterion 5,
+	// src/util/harborBuildImage/prepareHarborBuildImage.ts). Only meaningful
+	// for Purpose=="build_image". Omitted by a caller that predates this
+	// field (or by any non-build_image request); a plain json.Unmarshal
+	// silently ignores an unrecognised field, so an older agent decoding a
+	// newer Conductor's request tolerates it being absent from its own
+	// struct, and a newer agent decoding an older request simply sees "".
+	HarborOsid string `json:"harborOsid,omitempty"`
 
 	// AuthorizationClassification selects explicit legacy or scoped storage.
 	// Omission without a binding preserves the historical legacy request.
@@ -85,6 +95,26 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 				Success: false,
 				Message: "repo and at least one tag are required for a build_image token",
 			}
+			jsonResponse, _ := commons.JsonB64Encode(response)
+			return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
+		}
+
+		// Review finding 1079: criterion 6(d) reserves the explicit legacy
+		// branch (skip the Harbor-identity check at upload) for a request
+		// that OMITS harborOsid. req.HarborOsid alone cannot tell omission
+		// apart from an explicitly sent null or empty string - Go's
+		// json.Unmarshal maps all three to the same "" zero value - so a
+		// caller that sent an invalid present identity (null or "") would
+		// otherwise silently mint a token that skips the registry check.
+		// harborOsidPresence re-decodes the raw payload to tell them apart.
+		present, err := harborOsidPresence(jsonB64)
+		if err != nil {
+			response := CreateCLIDeployTokenResponse{Success: false, Message: "harborOsid must be a string"}
+			jsonResponse, _ := commons.JsonB64Encode(response)
+			return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
+		}
+		if present && req.HarborOsid == "" {
+			response := CreateCLIDeployTokenResponse{Success: false, Message: "harborOsid must not be null or empty when present"}
 			jsonResponse, _ := commons.JsonB64Encode(response)
 			return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
 		}
@@ -160,7 +190,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 		if uploadID == "" {
 			uploadID = token[:16] // fall back to a stable id derived from the token
 		}
-		storeErr = createBuildImageToken(token, uploadID, req.Repo, req.Tags, req.Dockerfile, req.BuildArgs, expiresAt)
+		storeErr = createBuildImageToken(token, uploadID, req.Repo, req.Tags, req.HarborOsid, req.Dockerfile, req.BuildArgs, expiresAt)
 	} else if authorization == datastore.AuthorizationScoped {
 		storeErr = createScopedUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt, *req.AuthorizationBinding)
 	} else {
@@ -197,6 +227,32 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 	}
 
 	return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
+}
+
+// harborOsidPresence reports whether the raw request payload sent a
+// "harborOsid" key at all, independent of its value. commons.JsonB64Decode
+// uses a plain json.Unmarshal into a typed string field, which maps an
+// absent key, an explicit null, and an empty string all to the same zero
+// value - so the typed decode alone cannot support criterion 6(d)'s
+// "omitted means legacy, present-but-invalid does not" rule (review finding
+// 1079). This re-decodes the same payload into a raw field map to recover
+// that distinction without changing the typed request shape.
+func harborOsidPresence(jsonB64 string) (present bool, err error) {
+	var fields map[string]json.RawMessage
+	if err := commons.JsonB64Decode(jsonB64, &fields); err != nil {
+		return false, err
+	}
+	raw, ok := fields["harborOsid"]
+	if !ok {
+		return false, nil
+	}
+	// Confirm the present value actually decodes as a string or null; any
+	// other JSON type is a malformed request, not a legacy omission.
+	var v *string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func requestAuthorizationClassification(req CreateCLIDeployTokenRequest) (string, error) {

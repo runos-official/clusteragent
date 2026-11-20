@@ -1,6 +1,7 @@
 package instructions
 
 import (
+	"encoding/base64"
 	"testing"
 	"time"
 
@@ -136,6 +137,148 @@ func TestCreateCLIDeployToken_RejectsAmbiguousAuthorization(t *testing.T) {
 		if decoded.Success {
 			t.Fatalf("case %d accepted ambiguous authorization", i)
 		}
+	}
+}
+
+// TestCreateCLIDeployToken_BuildImagePersistsHarborOsid pins story 338
+// criterion 6(a): a build_image request that names harborOsid stores it on
+// the token row so the upload path can compare it later. A request that
+// omits the field (legacy caller) persists an empty identity, which the
+// upload path treats as the explicit legacy branch (criterion 6(d)).
+func TestCreateCLIDeployToken_BuildImagePersistsHarborOsid(t *testing.T) {
+	original := createBuildImageToken
+	t.Cleanup(func() { createBuildImageToken = original })
+
+	var gotHarborOsid string
+	var called bool
+	createBuildImageToken = func(_ string, _ string, _ string, _ []string, harborOsid, _ string, _ []datastore.BuildArg, _ time.Time) error {
+		called = true
+		gotHarborOsid = harborOsid
+		return nil
+	}
+
+	req := CreateCLIDeployTokenRequest{
+		Purpose:    datastore.PurposeBuildImage,
+		Repo:       "fixture-repo",
+		Tags:       []string{"latest"},
+		HarborOsid: "harbor-locked-1",
+	}
+	payload, err := commons.JsonB64Encode(req)
+	if err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	_, response, err := CreateCLIDeployToken(payload)
+	if err != nil {
+		t.Fatalf("CreateCLIDeployToken: %v", err)
+	}
+	var decoded CreateCLIDeployTokenResponse
+	if err := commons.JsonB64Decode(response, &decoded); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !decoded.Success {
+		t.Fatalf("request refused: %s", decoded.Message)
+	}
+	if !called {
+		t.Fatal("createBuildImageToken was not called")
+	}
+	if gotHarborOsid != "harbor-locked-1" {
+		t.Fatalf("harborOsid passed to storage = %q, want harbor-locked-1", gotHarborOsid)
+	}
+
+	// A request with no harborOsid (legacy caller, or any caller that
+	// predates this field) must store an empty identity, not fail and not
+	// invent one.
+	legacyReq := CreateCLIDeployTokenRequest{Purpose: datastore.PurposeBuildImage, Repo: "fixture-repo", Tags: []string{"latest"}}
+	payload, err = commons.JsonB64Encode(legacyReq)
+	if err != nil {
+		t.Fatalf("encode legacy request: %v", err)
+	}
+	if _, _, err := CreateCLIDeployToken(payload); err != nil {
+		t.Fatalf("CreateCLIDeployToken(legacy): %v", err)
+	}
+	if gotHarborOsid != "" {
+		t.Fatalf("legacy request harborOsid = %q, want empty", gotHarborOsid)
+	}
+}
+
+// TestCreateCLIDeployToken_HarborOsidPresenceMatrix pins review finding
+// 1079: criterion 6(d)'s explicit legacy branch belongs ONLY to a request
+// that OMITS harborOsid. A request that sends it as JSON null or as an
+// empty string is present-but-invalid and must be refused, never silently
+// treated as legacy. encoding/json's omitempty tag cannot produce null or
+// ""-valued JSON from the typed struct, so these payloads are built by
+// hand to exercise the raw decode path a real caller's JSON would take.
+func TestCreateCLIDeployToken_HarborOsidPresenceMatrix(t *testing.T) {
+	original := createBuildImageToken
+	t.Cleanup(func() { createBuildImageToken = original })
+
+	var called bool
+	var gotHarborOsid string
+	createBuildImageToken = func(_ string, _ string, _ string, _ []string, harborOsid, _ string, _ []datastore.BuildArg, _ time.Time) error {
+		called = true
+		gotHarborOsid = harborOsid
+		return nil
+	}
+
+	cases := []struct {
+		name        string
+		rawJSON     string
+		wantSuccess bool
+		wantCalled  bool
+		wantOsid    string
+	}{
+		{
+			name:        "omitted key is the explicit legacy branch",
+			rawJSON:     `{"purpose":"build_image","repo":"fixture-repo","tags":["latest"]}`,
+			wantSuccess: true,
+			wantCalled:  true,
+			wantOsid:    "",
+		},
+		{
+			name:        "explicit null is refused, not legacy",
+			rawJSON:     `{"purpose":"build_image","repo":"fixture-repo","tags":["latest"],"harborOsid":null}`,
+			wantSuccess: false,
+			wantCalled:  false,
+		},
+		{
+			name:        "explicit empty string is refused, not legacy",
+			rawJSON:     `{"purpose":"build_image","repo":"fixture-repo","tags":["latest"],"harborOsid":""}`,
+			wantSuccess: false,
+			wantCalled:  false,
+		},
+		{
+			name:        "a valid present identity is accepted and stored",
+			rawJSON:     `{"purpose":"build_image","repo":"fixture-repo","tags":["latest"],"harborOsid":"harbor-locked-1"}`,
+			wantSuccess: true,
+			wantCalled:  true,
+			wantOsid:    "harbor-locked-1",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			called = false
+			gotHarborOsid = ""
+			payload := base64.StdEncoding.EncodeToString([]byte(c.rawJSON))
+
+			_, response, err := CreateCLIDeployToken(payload)
+			if err != nil {
+				t.Fatalf("CreateCLIDeployToken: %v", err)
+			}
+			var decoded CreateCLIDeployTokenResponse
+			if err := commons.JsonB64Decode(response, &decoded); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if decoded.Success != c.wantSuccess {
+				t.Fatalf("Success = %v, want %v (message %q)", decoded.Success, c.wantSuccess, decoded.Message)
+			}
+			if called != c.wantCalled {
+				t.Fatalf("createBuildImageToken called = %v, want %v", called, c.wantCalled)
+			}
+			if c.wantCalled && gotHarborOsid != c.wantOsid {
+				t.Fatalf("stored harborOsid = %q, want %q", gotHarborOsid, c.wantOsid)
+			}
+		})
 	}
 }
 

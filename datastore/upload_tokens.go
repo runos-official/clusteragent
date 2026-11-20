@@ -28,6 +28,12 @@ const (
 type BuildTargetSpec struct {
 	Repo string   `json:"repo"`
 	Tags []string `json:"tags"`
+	// HarborOsid is the Harbor service identity Conductor verified and
+	// locked before minting this token (story 390's criterion 5; FCR 2487).
+	// Empty for tokens minted before this field existed, or for any
+	// caller that still omits it: the upload path then keeps today's
+	// behavior (no Harbor-identity comparison), per criterion 6(d).
+	HarborOsid string `json:"harborOsid,omitempty"`
 }
 
 // UploadToken represents a single-use upload or pull token record.
@@ -146,16 +152,20 @@ func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildA
 // build-and-push (obj-47). uploadID is the conductor-assigned upload
 // identity that doubles as the BuildKit jobID. repo + tags are the explicit
 // Harbor target under the fixed `runos-apps` project; the same built image is
-// pushed to every tag. dockerfile is the path inside the tarball (relative to
-// the context root, empty => "Dockerfile"). buildArgs are the effective args
+// pushed to every tag. harborOsid is the Harbor service identity Conductor
+// verified and locked before minting the token (story 390 criterion 5); empty
+// for a legacy caller that does not send it (criterion 6(d) explicit legacy
+// branch). dockerfile is the path inside the tarball (relative to the
+// context root, empty => "Dockerfile"). buildArgs are the effective args
 // resolved by conductor.
 //
 // deploy_config is stored as "<repo>:<uploadID>" so the shared upload handler's
 // existing `osid:uploadID` split yields a synthetic, app-less build identity
-// (osid = repo). The tag list lives in the build_target JSON column.
+// (osid = repo). The tag list and Harbor identity live in the build_target
+// JSON column.
 //
 // The raw token is hashed (sha256 hex) before storage; it is never persisted.
-func CreateBuildImageToken(token, uploadID, repo string, tags []string, dockerfile string, buildArgs []BuildArg, expiresAt time.Time) error {
+func CreateBuildImageToken(token, uploadID, repo string, tags []string, harborOsid, dockerfile string, buildArgs []BuildArg, expiresAt time.Time) error {
 	gdb, err := activeDB()
 	if err != nil {
 		return err
@@ -166,7 +176,7 @@ func CreateBuildImageToken(token, uploadID, repo string, tags []string, dockerfi
 	if err != nil {
 		return err
 	}
-	targetJSON, err := json.Marshal(BuildTargetSpec{Repo: repo, Tags: tags})
+	targetJSON, err := json.Marshal(BuildTargetSpec{Repo: repo, Tags: tags, HarborOsid: harborOsid})
 	if err != nil {
 		return fmt.Errorf("marshal build target: %w", err)
 	}
@@ -334,22 +344,146 @@ func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error 
 	}
 }
 
+// errTokenUnusable is returned by MarkUploadTokenUsed whenever the token
+// cannot be claimed, for any reason (not found, already used, token
+// expired, or permit expired): the caller-visible message deliberately
+// does not distinguish these, matching the generic refusal the HTTP layer
+// already builds around this call.
+var errTokenUnusable = fmt.Errorf("token not found, already used, or expired")
+
 // MarkUploadTokenUsed atomically marks a token (any purpose) as used, looked up
 // by the hash of the presented raw token. Returns error if the token doesn't
-// exist or is already used.
-func MarkUploadTokenUsed(token string) error {
+// exist, is already used, has expired, or - when the caller supplies one -
+// if permitDeadline has passed. permitDeadline is nil for every claim caller
+// with no separate, shorter-lived permit to enforce (the build-image upload,
+// the pull download, and an explicit legacy app upload); the scoped app
+// upload caller passes its fresh recheck permit's own ExpiresAt. There are
+// exactly three production claim callers (review finding 1239's derived
+// list, pinned by TestMarkUploadTokenUsedClaimCallSites_MatchExpectedShape):
+// webhook/cli_deploy_handler.go's claimUploadToken for the build-image
+// purpose (no permit), the same claimUploadToken for the scoped/legacy app
+// upload purpose (a permit only for the scoped classification), and
+// webhook/cli_pull_handler.go's direct call (no permit).
+//
+// The expiry check runs in the SAME atomic claim as the used-state check
+// (review finding 1076): an earlier, separate expiry check (the kind the
+// upload handler does before reading the body) only proves the token was
+// valid AT THAT MOMENT. Body reads, tarball validation, the BuildKit
+// configuration read, and - for a scoped token - a network round trip to
+// Conductor/Roid can all take long enough for the token (or, for a scoped
+// upload, the fresh permit) to expire before the claim actually runs.
+// Folding both deadlines into this one claim closes that window for every
+// purpose and every classification, legacy included, with no second query
+// and no extra round trip.
+//
+// Review finding 1128 (repeat of 1076): a bound Go time.Now() parameter
+// captured before the statement is sent lets a delay between that capture
+// and the claim actually executing (lock wait, a slow write, a stalled
+// connection) commit the claim after the real deadline. The comparison must
+// instead be evaluated by the database AT the moment the claim executes.
+//
+// Review finding 1168 (repeat of 1128) and its repeats 1239/1244: on
+// PostgreSQL, folding clock_timestamp() into a single UPDATE's own WHERE
+// clause is still not "at the moment the claim executes". A plain UPDATE's
+// quals can be evaluated during the initial table scan, BEFORE the
+// statement blocks waiting for a conflicting row lock; if that lock is
+// released without the row's content actually changing (a lock held and
+// released, not a competing UPDATE - review finding 1239's "row locks that
+// leave the token row unchanged"), the executor has nothing to re-evaluate
+// once the wait ends and proceeds with the qual result computed BEFORE the
+// wait: a stale "not yet expired" clock_timestamp() value, even though real
+// wall-clock time has since passed the deadline. The fix separates locking
+// from evaluating: acquire the row lock in its own statement first
+// (SELECT ... FOR UPDATE, which blocks until the lock is granted and only
+// then returns the row), then read the database's wall clock in a second
+// statement, so both happen strictly after the wait - all inside one
+// transaction, so nothing else can touch the row in between. Finding 1244's
+// permit deadline is folded into that same post-lock comparison.
+//
+// SQLite has no row-level locking: a write blocks at the whole-database
+// level before it can even begin, so there is no pre-wait qual to go stale,
+// and it keeps the simpler single-statement form. Review finding 1203:
+// SQLite has no clock_timestamp(), and mixing its CURRENT_TIMESTAMP (bare
+// UTC text) with a stored time.Time that carries a non-UTC local offset
+// (what a caller's un-normalized time.Now() produces) compares as TEXT and
+// is skewed by the host's UTC offset - measured in this repository to fail
+// in both directions off UTC. julianday() parses either an offset-qualified
+// or a bare timestamp into a real, comparable instant, so wrapping both
+// sides in julianday() compares actual instants regardless of either
+// side's textual timezone. SQLite is test-only here; production always
+// runs PostgreSQL (datastore/database.go).
+func MarkUploadTokenUsed(token string, permitDeadline *time.Time) error {
 	gdb, err := activeDB()
 	if err != nil {
 		return err
 	}
-	res := gdb.Model(&UploadTokenModel{}).
-		Where("token_hash = ? AND used = ?", hashToken(token), false).
-		Update("used", true)
+	if gdb.Name() == "postgres" {
+		return markUploadTokenUsedPostgres(gdb, token, permitDeadline)
+	}
+	return markUploadTokenUsedSQLite(gdb, token, permitDeadline)
+}
+
+// markUploadTokenUsedPostgres implements the lock-then-evaluate claim
+// described above. table is read once per call rather than cached,
+// matching UploadTokenModel's own TableName() (always the fixed
+// cluster_agent_upload_tokens, never request-dependent).
+func markUploadTokenUsedPostgres(gdb *gorm.DB, token string, permitDeadline *time.Time) error {
+	hashed := hashToken(token)
+	table := (UploadTokenModel{}).TableName()
+	txErr := gdb.Transaction(func(tx *gorm.DB) error {
+		var row struct {
+			ID        uint
+			Used      bool
+			ExpiresAt time.Time
+		}
+		// Blocks here until any existing lock on this row is released -
+		// whether or not the holder actually changed the row - and only
+		// returns the row once the lock is granted: the read below is
+		// strictly after that wait, not before it.
+		if err := tx.Raw(
+			"SELECT id, used, expires_at FROM "+table+" WHERE token_hash = ? FOR UPDATE",
+			hashed,
+		).Scan(&row).Error; err != nil {
+			return err
+		}
+		if row.ID == 0 {
+			return errTokenUnusable
+		}
+		var now time.Time
+		if err := tx.Raw("SELECT clock_timestamp()").Scan(&now).Error; err != nil {
+			return err
+		}
+		if row.Used || !now.Before(row.ExpiresAt) {
+			return errTokenUnusable
+		}
+		if permitDeadline != nil && !now.Before(*permitDeadline) {
+			return errTokenUnusable
+		}
+		return tx.Exec("UPDATE "+table+" SET used = true WHERE id = ?", row.ID).Error
+	})
+	if txErr != nil {
+		return errTokenUnusable
+	}
+	return nil
+}
+
+// markUploadTokenUsedSQLite implements the claim with one statement:
+// SQLite's single-writer semantics mean a concurrent write blocks before it
+// can even start, so there is no pre-wait qual evaluation to go stale here
+// (see the function doc above).
+func markUploadTokenUsedSQLite(gdb *gorm.DB, token string, permitDeadline *time.Time) error {
+	clause := "token_hash = ? AND used = ? AND julianday(expires_at) > julianday('now')"
+	args := []any{hashToken(token), false}
+	if permitDeadline != nil {
+		clause += " AND julianday(?) > julianday('now')"
+		args = append(args, *permitDeadline)
+	}
+	res := gdb.Model(&UploadTokenModel{}).Where(clause, args...).Update("used", true)
 	if res.Error != nil {
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
-		return fmt.Errorf("token not found or already used")
+		return errTokenUnusable
 	}
 	return nil
 }

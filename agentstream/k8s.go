@@ -24,9 +24,13 @@ const (
 	NodeAgentTLSSecret    = "node-agent-tls"
 )
 
-// K8sClient provides a wrapper for Kubernetes client operations
+// K8sClient provides a wrapper for Kubernetes client operations. The field
+// is the kubernetes.Interface a real *kubernetes.Clientset satisfies, not
+// the concrete type, so tests can substitute client-go's fake Clientset
+// (review finding 1074's regression needs this to exercise a torn
+// ConfigMap/Secret read without a live cluster).
 type K8sClient struct {
-	clientset *kubernetes.Clientset
+	clientset kubernetes.Interface
 }
 
 // NewK8sClient creates a new Kubernetes client using in-cluster config
@@ -243,34 +247,88 @@ type BuildKitConfig struct {
 	ClusterDomain  string
 	HarborUsername string
 	HarborPassword string
+	// HarborOsid is the Harbor service's osid, read from the buildkit
+	// Secret's harbor-osid key (story 390, src/util/builds/ensureBuildConfig.ts
+	// in Conductor). Conductor locks this identity before minting a
+	// build_image token and sends it back as harborOsid on the token; the
+	// upload path compares the two so a Harbor retarget between mint and
+	// upload cannot silently redirect the push (FCR 2487, finding 1029/1030).
+	// Empty when the Secret predates that key or names no Harbor.
+	HarborOsid string
 }
 
-// GetBuildKitConfig retrieves configuration from buildkit ConfigMap and Secret
+// GetBuildKitConfig retrieves configuration from the buildkit ConfigMap and
+// Secret with one read. Every caller except the one bound build-image
+// upload path uses this: pull, legacy build-image uploads, VCS builds, and
+// image-existence checks (review finding 1269 - see GetBuildKitConfigVerified
+// for why those callers must NOT get the double-read-and-compare behavior).
 func (c *K8sClient) GetBuildKitConfig(ctx context.Context) (*BuildKitConfig, error) {
-	// Get ConfigMap
+	return c.readBuildKitConfigOnce(ctx)
+}
+
+// GetBuildKitConfigVerified is GetBuildKitConfig's double-read,
+// compare-and-refuse variant (review finding 1074).
+//
+// Conductor writes the ConfigMap and Secret as two separate, non-atomic
+// Kubernetes API calls (ensureBuildConfig.ts: ensureConfigMap, then
+// ensureSecret) whenever it provisions or repairs the build config,
+// including a Harbor retarget. A single pass of two independent Get calls
+// can therefore observe a torn pairing mid-write: the endpoint (ConfigMap's
+// harbor-url/harbor-core-url) already naming the replacement Harbor while
+// the identity and credentials (Secret's harbor-osid/harbor-username/
+// harbor-password) still name the original one, or vice versa. Reading
+// twice and requiring every field to agree detects that in-flight write and
+// refuses rather than silently trusting an inconsistent pairing - the
+// Harbor identity comparison at upload (criterion 6(b)) is only as
+// trustworthy as the single coherent configuration revision it is compared
+// against.
+//
+// Review finding 1269: applying this to every GetBuildKitConfig caller was
+// too broad. A pull request calls this AFTER consuming its single-use
+// token, so an unrelated field changing between the two reads (a harbor-
+// osid rotation pull never looks at) burned the token and answered 500 for
+// something pull never needed to check. A legacy build-image upload
+// (criterion 6(d): no locked identity to verify) hit the same refusal
+// before ever reaching its explicit legacy branch. Use this ONLY for a
+// build-image upload whose token carries a bound, non-empty harborOsid;
+// every other caller keeps GetBuildKitConfig's plain single read.
+func (c *K8sClient) GetBuildKitConfigVerified(ctx context.Context) (*BuildKitConfig, error) {
+	first, err := c.readBuildKitConfigOnce(ctx)
+	if err != nil {
+		return nil, err
+	}
+	second, err := c.readBuildKitConfigOnce(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if *first != *second {
+		return nil, fmt.Errorf("buildkit configuration changed between reads; refusing an inconsistent ConfigMap/Secret pairing")
+	}
+	return second, nil
+}
+
+func (c *K8sClient) readBuildKitConfigOnce(ctx context.Context) (*BuildKitConfig, error) {
 	cm, err := c.clientset.CoreV1().ConfigMaps(Namespace).Get(ctx, "buildkit", metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ConfigMap buildkit: %w", err)
 	}
 
-	// Get Secret
 	secret, err := c.clientset.CoreV1().Secrets(Namespace).Get(ctx, "buildkit", metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Secret buildkit: %w", err)
 	}
 
-	config := &BuildKitConfig{
+	return &BuildKitConfig{
 		HarborURL:      cm.Data["harbor-url"],
 		HarborCoreURL:  cm.Data["harbor-core-url"],
 		ClusterDomain:  cm.Data["cluster-domain"],
 		HarborUsername: string(secret.Data["harbor-username"]),
 		HarborPassword: string(secret.Data["harbor-password"]),
-	}
-
-	return config, nil
+		HarborOsid:     string(secret.Data["harbor-osid"]),
+	}, nil
 }
 
 // GetClientset returns the underlying Kubernetes clientset
-func (c *K8sClient) GetClientset() *kubernetes.Clientset {
+func (c *K8sClient) GetClientset() kubernetes.Interface {
 	return c.clientset
 }

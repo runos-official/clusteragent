@@ -17,7 +17,7 @@ func TestBuildImageToken_RoundTrip(t *testing.T) {
 	}
 	expires := time.Now().Add(5 * time.Minute)
 	tags := []string{"latest", "v1"}
-	if err := CreateBuildImageToken("tok-build", "upload-xyz", "xgmi-vm-workspace", tags, "docker/Dockerfile", args, expires); err != nil {
+	if err := CreateBuildImageToken("tok-build", "upload-xyz", "xgmi-vm-workspace", tags, "", "docker/Dockerfile", args, expires); err != nil {
 		t.Fatalf("CreateBuildImageToken: %v", err)
 	}
 
@@ -57,7 +57,7 @@ func TestBuildImageToken_PurposeIsolation(t *testing.T) {
 	setupTestDB(t)
 
 	expires := time.Now().Add(5 * time.Minute)
-	if err := CreateBuildImageToken("tok-bi", "up-1", "tool", []string{"latest"}, "", nil, expires); err != nil {
+	if err := CreateBuildImageToken("tok-bi", "up-1", "tool", []string{"latest"}, "", "", nil, expires); err != nil {
 		t.Fatalf("CreateBuildImageToken: %v", err)
 	}
 	if _, err := GetUploadToken("tok-bi"); err == nil {
@@ -80,5 +80,36 @@ func TestBuildImageToken_PurposeIsolation(t *testing.T) {
 	}
 	if app.BuildTarget != nil {
 		t.Fatalf("app token BuildTarget = %+v, want nil", app.BuildTarget)
+	}
+}
+
+// TestBuildImageToken_HarborOsidRoundTrip pins story 338 criterion 6(a): the
+// Harbor identity Conductor locked before minting the token travels with the
+// build target and reads back unchanged. An empty harborOsid (a caller that
+// predates the field) round-trips as empty, not as a zero-value mismatch.
+func TestBuildImageToken_HarborOsidRoundTrip(t *testing.T) {
+	setupTestDB(t)
+
+	expires := time.Now().Add(5 * time.Minute)
+	if err := CreateBuildImageToken("tok-osid", "upload-1", "repo-a", []string{"latest"}, "harbor-locked-1", "", nil, expires); err != nil {
+		t.Fatalf("CreateBuildImageToken: %v", err)
+	}
+	tok, err := GetUploadableToken("tok-osid")
+	if err != nil {
+		t.Fatalf("GetUploadableToken: %v", err)
+	}
+	if tok.BuildTarget == nil || tok.BuildTarget.HarborOsid != "harbor-locked-1" {
+		t.Fatalf("BuildTarget = %+v, want HarborOsid=harbor-locked-1", tok.BuildTarget)
+	}
+
+	if err := CreateBuildImageToken("tok-legacy", "upload-2", "repo-b", []string{"latest"}, "", "", nil, expires); err != nil {
+		t.Fatalf("CreateBuildImageToken: %v", err)
+	}
+	legacy, err := GetUploadableToken("tok-legacy")
+	if err != nil {
+		t.Fatalf("GetUploadableToken: %v", err)
+	}
+	if legacy.BuildTarget == nil || legacy.BuildTarget.HarborOsid != "" {
+		t.Fatalf("legacy BuildTarget = %+v, want empty HarborOsid", legacy.BuildTarget)
 	}
 }

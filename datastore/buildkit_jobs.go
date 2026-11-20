@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // BuildKitJob represents a build job record returned to callers. The JSON tags
@@ -46,7 +47,18 @@ func (m BuildKitJobModel) toDTO() BuildKitJob {
 	}
 }
 
-// CreateBuildKitJob creates a new build job record
+// CreateBuildKitJob creates a new build job record, or re-opens an existing
+// one under the same job_id as a fresh pending row (review finding 1133).
+//
+// job_id carries a unique index, and the webhook upload handler now calls
+// this (via recordFailedUpload/failUpload) for a TERMINAL pre-claim refusal
+// - one where the token stays unclaimed and a legitimate retry with the
+// same token (and so the same uploadID/job_id) is expected. A plain INSERT
+// would fail that retry's own CreateBuildKitJob call with a duplicate-key
+// error once a build actually starts. Upserting resets status, clears
+// completed_at, and bumps updated_at, so the retry's row looks exactly like
+// a fresh pending job; created_at is left untouched so the row's original
+// first-seen time survives.
 func CreateBuildKitJob(jobID, osid, repo, branch, commitHash string) error {
 	gdb, err := activeDB()
 	if err != nil {
@@ -60,7 +72,127 @@ func CreateBuildKitJob(jobID, osid, repo, branch, commitHash string) error {
 		CommitHash: commitHash,
 		Status:     JobStatusPending,
 	}
-	return gdb.Create(&job).Error
+	return gdb.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "job_id"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"osid":         osid,
+			"repo":         repo,
+			"branch":       branch,
+			"commit_hash":  commitHash,
+			"status":       JobStatusPending,
+			"completed_at": nil,
+			"updated_at":   gorm.Expr("CURRENT_TIMESTAMP"),
+		}),
+	}).Create(&job).Error
+}
+
+// RecordFailedUploadIfUnclaimed writes a failed build row for jobID, UNLESS
+// the upload token identified by the raw token has already been claimed by
+// a concurrent request (review finding 1267).
+//
+// A terminal PRE-claim refusal (the tarball/Dockerfile/Harbor-identity
+// checks, or a scoped deny) can fire for a request that loaded the token
+// early but took a while to decide, while a DIFFERENT concurrent request
+// for the SAME token ran its own checks faster, claimed the token, and
+// started or finished its build under the same job_id (job_id is always the
+// token's own uploadID). CreateBuildKitJob's upsert (review finding 1133)
+// unconditionally resets that row to pending and clears completed_at, so
+// the slower request's refusal would overwrite the winner's success (or
+// in-progress state) with a bogus failure - Conductor could then report a
+// failed deployment that actually succeeded. A local datastore probe
+// confirmed the upsert does exactly this reset.
+//
+// On PostgreSQL this reads the token's used state under FOR UPDATE and
+// writes the failure row in the SAME transaction, so it cannot race the
+// claim's own transaction (datastore.MarkUploadTokenUsed also locks this
+// row via FOR UPDATE before updating it, review finding 1239): whichever
+// transaction reaches the row first simply runs to completion before the
+// other proceeds. SQLite (test-only; production always runs PostgreSQL)
+// keeps a plain read, since it has no row-level locking to join.
+//
+// This must be called ONLY for a refusal where the CALLING request has not
+// itself claimed the token - a request that already owns the claim (an
+// archive-push failure, or a permit that expired between claim and push)
+// must always record its failure and should keep calling CreateBuildKitJob
+// directly instead.
+func RecordFailedUploadIfUnclaimed(token, jobID, osid, reason string) error {
+	gdb, err := activeDB()
+	if err != nil {
+		return err
+	}
+	if gdb.Name() == "postgres" {
+		return recordFailedUploadIfUnclaimedPostgres(gdb, token, jobID, osid, reason)
+	}
+	return recordFailedUploadIfUnclaimedSQLite(gdb, token, jobID, osid, reason)
+}
+
+func recordFailedUploadIfUnclaimedPostgres(gdb *gorm.DB, token, jobID, osid, reason string) error {
+	hashed := hashToken(token)
+	table := (UploadTokenModel{}).TableName()
+	return gdb.Transaction(func(tx *gorm.DB) error {
+		var used bool
+		if err := tx.Raw("SELECT used FROM "+table+" WHERE token_hash = ? FOR UPDATE", hashed).Scan(&used).Error; err != nil {
+			return err
+		}
+		if used {
+			// A concurrent request already claimed this token: it owns
+			// jobID's build row from here. Writing here would overwrite
+			// its result.
+			return nil
+		}
+		return writeFailedBuildRow(tx, jobID, osid, reason)
+	})
+}
+
+func recordFailedUploadIfUnclaimedSQLite(gdb *gorm.DB, token, jobID, osid, reason string) error {
+	hashed := hashToken(token)
+	table := (UploadTokenModel{}).TableName()
+	return gdb.Transaction(func(tx *gorm.DB) error {
+		var used bool
+		if err := tx.Raw("SELECT used FROM "+table+" WHERE token_hash = ?", hashed).Scan(&used).Error; err != nil {
+			return err
+		}
+		if used {
+			return nil
+		}
+		return writeFailedBuildRow(tx, jobID, osid, reason)
+	})
+}
+
+// writeFailedBuildRow is CreateBuildKitJob + InsertBuildKitLog +
+// UpdateBuildKitJobStatus's combined effect, run against the given
+// transaction handle instead of a fresh activeDB() connection, so a caller
+// can fold it into a larger transaction (RecordFailedUploadIfUnclaimed
+// above).
+func writeFailedBuildRow(tx *gorm.DB, jobID, osid, reason string) error {
+	job := BuildKitJobModel{
+		JobID:      jobID,
+		OSID:       osid,
+		CommitHash: jobID,
+		Status:     JobStatusPending,
+	}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "job_id"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"osid":         osid,
+			"repo":         "",
+			"branch":       "",
+			"commit_hash":  jobID,
+			"status":       JobStatusPending,
+			"completed_at": nil,
+			"updated_at":   gorm.Expr("CURRENT_TIMESTAMP"),
+		}),
+	}).Create(&job).Error; err != nil {
+		return err
+	}
+	if err := tx.Create(&BuildKitLogModel{JobID: jobID, LogEntry: "ERROR: " + reason}).Error; err != nil {
+		return err
+	}
+	return tx.Model(&BuildKitJobModel{}).Where("job_id = ?", jobID).Updates(map[string]any{
+		"status":       JobStatusFailed,
+		"updated_at":   gorm.Expr("CURRENT_TIMESTAMP"),
+		"completed_at": gorm.Expr("CURRENT_TIMESTAMP"),
+	}).Error
 }
 
 // UpdateBuildKitJobStatus updates the status of a build job
