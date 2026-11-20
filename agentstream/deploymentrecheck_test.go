@@ -118,6 +118,39 @@ func TestRequestStageRecheck_RefusesWhenGenerationMovesDuringSend(t *testing.T) 
 	}
 }
 
+// TestRequestStageRecheck_RefusesWhenRecheckDeadlinePassedBeforeAcceptingReply
+// pins review finding 1271: a Go select with both a ready reply and a
+// ready ctx.Done() can pick either case, so the transport can return a
+// valid, correctly-correlated reply with a nil error even though the
+// recheck's own five-second deadline already passed (the caller's wider
+// HTTP context can still be live). This models that exact race: the
+// injected send waits for its context to actually expire, then returns
+// the reply anyway with a nil error, exactly like sendAndWait's second
+// select choosing the response case despite ctx also being ready.
+func TestRequestStageRecheck_RefusesWhenRecheckDeadlinePassedBeforeAcceptingReply(t *testing.T) {
+	authority := UploadAuthority(testBindingID, testUploadID)
+	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))
+	reply := wrapResponse(b64, "whatever")
+
+	send := func(ctx context.Context, _ *l2sec.FromClusterAgent) (*l2sec.ToClusterAgent, error) {
+		<-ctx.Done() // the recheck's own deadline passes before the reply is "accepted"
+		return reply, nil
+	}
+
+	// A short parent context, so reqCtx (a child bounded by recheckTimeout
+	// too) expires quickly instead of the test waiting a full 5s.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	resp, err := requestStageRecheckWith(ctx, send, authority, StageArchivePersist, testRetryID)
+	if err == nil {
+		t.Fatalf("expected a refusal once the recheck's own deadline passed before the reply was accepted, got permit %+v", resp)
+	}
+	if resp != nil {
+		t.Error("expected no response alongside the refusal")
+	}
+}
+
 func TestRequestStageRecheck_SendsExactEnvelope(t *testing.T) {
 	authority := UploadAuthority(testBindingID, testUploadID)
 	b64 := validStageResponseJSON(t, authority, StageArchivePersist, testRetryID, string(OutcomePermit))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -141,15 +142,23 @@ func permitStillValid(resp *agentstream.StageResponse) *uploadRefusal {
 	return nil
 }
 
-// verifyBuildImageHarborIdentity implements story 338 criterion 6(b): before
-// any build or push, compare the Harbor identity Conductor verified and
-// locked before minting the token (persisted on the token row) with the
-// Harbor the shared BuildKit configuration names right now, from the SAME
-// read the caller will push to - never a second read. A token minted before
-// this field existed (tokenHarborOsid empty) keeps today's behavior
-// unchanged and skips the comparison (criterion 6(d)'s explicit legacy
-// branch).
-func verifyBuildImageHarborIdentity(tokenHarborOsid, configHarborOsid string) *uploadRefusal {
+// verifyBuildImageHarborIdentity implements story 338 criteria 6(b) and
+// 6(b2): before any build or push, compare the Harbor identity Conductor
+// verified and locked before minting the token (persisted on the token row)
+// with the Harbor the shared BuildKit configuration names right now, from
+// the SAME read the caller will push to - never a second read. A token
+// minted before this field existed (tokenHarborOsid empty) keeps today's
+// behavior unchanged and skips the comparison (criterion 6(d)'s explicit
+// legacy branch).
+//
+// Review finding 1268: a matching, non-empty identity alone is not enough.
+// The ConfigMap and Secret are independent objects, and a configuration can
+// name a Harbor identity (criterion 6(b)'s comparison) while its endpoint
+// (harborURL) is absent or empty - predating full provisioning, or torn by
+// an in-flight repair. Criterion 6(b2) requires a named refusal for that
+// case too, before claim and before BuildKit starts a pod against an
+// unusable image reference.
+func verifyBuildImageHarborIdentity(tokenHarborOsid, configHarborOsid, configHarborURL string) *uploadRefusal {
 	if tokenHarborOsid == "" {
 		return nil
 	}
@@ -158,6 +167,9 @@ func verifyBuildImageHarborIdentity(tokenHarborOsid, configHarborOsid string) *u
 	}
 	if tokenHarborOsid != configHarborOsid {
 		return forbiddenUpload("buildkit configuration names a different Harbor than the one locked at mint time")
+	}
+	if strings.TrimSpace(configHarborURL) == "" {
+		return forbiddenUpload("buildkit configuration names the locked Harbor identity but no registry endpoint")
 	}
 	return nil
 }

@@ -258,21 +258,41 @@ type BuildKitConfig struct {
 }
 
 // GetBuildKitConfig retrieves configuration from the buildkit ConfigMap and
-// Secret.
-//
-// Conductor writes them as two separate, non-atomic Kubernetes API calls
-// (ensureBuildConfig.ts: ensureConfigMap, then ensureSecret) whenever it
-// provisions or repairs the build config, including a Harbor retarget. A
-// single pass of two independent Get calls can therefore observe a torn
-// pairing mid-write: the endpoint (ConfigMap's harbor-url/harbor-core-url)
-// already naming the replacement Harbor while the identity and credentials
-// (Secret's harbor-osid/harbor-username/harbor-password) still name the
-// original one, or vice versa (review finding 1074). Reading twice and
-// requiring every field to agree detects that in-flight write and refuses
-// rather than silently trusting an inconsistent pairing - the Harbor
-// identity comparison at upload (criterion 6(b)) is only as trustworthy as
-// the single coherent configuration revision it is compared against.
+// Secret with one read. Every caller except the one bound build-image
+// upload path uses this: pull, legacy build-image uploads, VCS builds, and
+// image-existence checks (review finding 1269 - see GetBuildKitConfigVerified
+// for why those callers must NOT get the double-read-and-compare behavior).
 func (c *K8sClient) GetBuildKitConfig(ctx context.Context) (*BuildKitConfig, error) {
+	return c.readBuildKitConfigOnce(ctx)
+}
+
+// GetBuildKitConfigVerified is GetBuildKitConfig's double-read,
+// compare-and-refuse variant (review finding 1074).
+//
+// Conductor writes the ConfigMap and Secret as two separate, non-atomic
+// Kubernetes API calls (ensureBuildConfig.ts: ensureConfigMap, then
+// ensureSecret) whenever it provisions or repairs the build config,
+// including a Harbor retarget. A single pass of two independent Get calls
+// can therefore observe a torn pairing mid-write: the endpoint (ConfigMap's
+// harbor-url/harbor-core-url) already naming the replacement Harbor while
+// the identity and credentials (Secret's harbor-osid/harbor-username/
+// harbor-password) still name the original one, or vice versa. Reading
+// twice and requiring every field to agree detects that in-flight write and
+// refuses rather than silently trusting an inconsistent pairing - the
+// Harbor identity comparison at upload (criterion 6(b)) is only as
+// trustworthy as the single coherent configuration revision it is compared
+// against.
+//
+// Review finding 1269: applying this to every GetBuildKitConfig caller was
+// too broad. A pull request calls this AFTER consuming its single-use
+// token, so an unrelated field changing between the two reads (a harbor-
+// osid rotation pull never looks at) burned the token and answered 500 for
+// something pull never needed to check. A legacy build-image upload
+// (criterion 6(d): no locked identity to verify) hit the same refusal
+// before ever reaching its explicit legacy branch. Use this ONLY for a
+// build-image upload whose token carries a bound, non-empty harborOsid;
+// every other caller keeps GetBuildKitConfig's plain single read.
+func (c *K8sClient) GetBuildKitConfigVerified(ctx context.Context) (*BuildKitConfig, error) {
 	first, err := c.readBuildKitConfigOnce(ctx)
 	if err != nil {
 		return nil, err

@@ -66,12 +66,21 @@ func checkTarballLimits(data []byte) error {
 }
 
 // validateDockerfileTarget checks that a configured (non-default) Dockerfile
-// target exists in the tarball as a regular file and stays inside the
-// tarball root, without extracting anything to disk. It mirrors
-// splitTarballDockerfile's traversal rules on the tar entry names instead
-// of real files (review finding 1078): that disk-backed check still runs
-// during the asynchronous build on the same dockerfile value, so the two
-// must agree.
+// target exists in the tarball as a regular file, or a symlink that
+// resolves to one, and stays inside the tarball root, without extracting
+// anything to disk. It mirrors splitTarballDockerfile's traversal rules on
+// the tar entry names instead of real files (review finding 1078): that
+// disk-backed check still runs during the asynchronous build on the same
+// dockerfile value, so the two must agree.
+//
+// Review finding 1272: a bare "reject anything that is not tar.TypeReg"
+// disagreed with extraction in both directions. extractTarball creates a
+// contained symlink on disk (with its own containment check on the link
+// target), and splitTarballDockerfile's os.Stat follows it transparently
+// to whatever it ultimately points to - so a configured Dockerfile that is
+// a symlink to a regular file was accepted by the build but refused here,
+// before claim. Resolving the same symlink chain in memory (bounded, so a
+// cycle cannot hang this check) brings the two back into agreement.
 //
 // Empty dockerfile is BuildKit's default ("Dockerfile" at the context root,
 // resolved by BuildKit itself) and is not validated here, matching
@@ -96,21 +105,53 @@ func validateDockerfileTarget(data []byte, dockerfile string) error {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	entries := make(map[string]*tar.Header)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			return fmt.Errorf("dockerfile %q not found inside tarball", trimmed)
+			break
 		}
 		if err != nil {
 			return fmt.Errorf("tar read error: %w", err)
 		}
 		name := path.Clean(strings.TrimPrefix(hdr.Name, "./"))
-		if name != cleaned {
-			continue
-		}
-		if hdr.Typeflag != tar.TypeReg {
-			return fmt.Errorf("dockerfile %q is not a regular file", trimmed)
-		}
+		entries[name] = hdr
+	}
+
+	return resolveDockerfileTarget(entries, cleaned, trimmed, 0)
+}
+
+// maxDockerfileSymlinkHops bounds the in-memory symlink resolution below so
+// a cyclical chain refuses instead of looping forever. Real Dockerfile
+// configurations need at most one or two hops; this is generous headroom.
+const maxDockerfileSymlinkHops = 10
+
+// resolveDockerfileTarget follows a chain of tar-entry symlinks (within the
+// same in-memory entry set validateDockerfileTarget built) to the regular
+// file they ultimately name, applying the SAME containment and
+// absolute-target rules extractTarball's own symlink handling enforces
+// before it ever creates a symlink on disk.
+func resolveDockerfileTarget(entries map[string]*tar.Header, name, original string, depth int) error {
+	if depth > maxDockerfileSymlinkHops {
+		return fmt.Errorf("dockerfile %q has too many nested symlinks", original)
+	}
+	hdr, ok := entries[name]
+	if !ok {
+		return fmt.Errorf("dockerfile %q not found inside tarball", original)
+	}
+	switch hdr.Typeflag {
+	case tar.TypeReg:
 		return nil
+	case tar.TypeSymlink:
+		if path.IsAbs(hdr.Linkname) {
+			return fmt.Errorf("dockerfile %q resolves through an absolute symlink target %q", original, hdr.Linkname)
+		}
+		resolved := path.Clean(path.Join(path.Dir(name), hdr.Linkname))
+		if resolved == ".." || strings.HasPrefix(resolved, "../") {
+			return fmt.Errorf("dockerfile %q resolves through a symlink that escapes the tarball root", original)
+		}
+		return resolveDockerfileTarget(entries, resolved, original, depth+1)
+	default:
+		return fmt.Errorf("dockerfile %q is not a regular file", original)
 	}
 }

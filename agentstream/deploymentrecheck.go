@@ -327,6 +327,17 @@ func requestStageRecheckWith(
 	if err != nil {
 		return nil, fmt.Errorf("deployment stage recheck unavailable: %w", err)
 	}
+	// Review finding 1271: a Go select with both the reply channel and
+	// reqCtx.Done() ready at once can pick either case, so send can return
+	// a reply with a nil error even though reqCtx's own five-second
+	// deadline has already passed. The caller's HTTP context is still
+	// live, so without this check a stale-by-the-agent's-own-budget reply
+	// would still authorize the claim and archive persist that follow.
+	// Require the recheck's own deadline to still be unexpired before
+	// accepting the reply at all.
+	if reqCtx.Err() != nil {
+		return nil, fmt.Errorf("deployment stage recheck unavailable: the recheck's own deadline passed before the reply was accepted: %w", reqCtx.Err())
+	}
 
 	resp, err := decodeStageResponse(reply, authority, stage, retryID)
 	if err != nil {

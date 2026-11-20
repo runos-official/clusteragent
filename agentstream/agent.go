@@ -46,6 +46,25 @@ var (
 	streamGeneration atomic.Uint64
 )
 
+// invalidateStream marks the control stream unusable and advances its
+// generation the moment a failure is DETECTED, in the same goroutine that
+// detects it (review finding 1270, repeat of 1169/1240). Before this, the
+// generation only advanced later, in establishAndMaintainStream's cleanup
+// after its own goroutine was scheduled to dequeue errChan - a gap that can
+// be wide under host load. A reply already buffered for a pending recheck
+// (agent.go's handleInstruction writes it into a capacity-one channel and
+// returns) could be read by sendAndWait during exactly that gap, with
+// CurrentStreamGeneration() still reporting the stale, pre-disconnect
+// value. Calling this at the point of detection closes that gap: the
+// generation is already advanced by the time any reader observes it,
+// regardless of when establishAndMaintainStream's own goroutine runs its
+// cleanup. Safe to call more than once for the same disconnect; callers do
+// not coordinate who calls it first.
+func invalidateStream() {
+	streamConnected.Store(false)
+	streamGeneration.Add(1)
+}
+
 // StreamConnected reports whether the agent currently holds a live gRPC stream
 // to the control plane. Used by the webhook health endpoint to surface
 // connection state without affecting liveness.
@@ -427,6 +446,10 @@ func (sm *streamManager) listenForInstructions(stream grpc.BidiStreamingClient[l
 	for {
 		instruction, err := stream.Recv()
 		if err != nil {
+			// Invalidate now, in this goroutine, at the moment the
+			// closure is actually observed (review finding 1270): do not
+			// wait for establishAndMaintainStream's cleanup to run.
+			invalidateStream()
 			if err == io.EOF {
 				return fmt.Errorf("server closed the stream")
 			}
@@ -474,6 +497,10 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, stream grpc.BidiStrea
 				log.Printf("Heartbeat failed (%d/%d): %v", consecutiveFailures, maxConsecutiveFailures, err)
 
 				if consecutiveFailures >= maxConsecutiveFailures {
+					// Same reasoning as listenForInstructions (review
+					// finding 1270): invalidate here, at the point this
+					// goroutine decides the stream is dead, not later.
+					invalidateStream()
 					return fmt.Errorf("heartbeat failed %d times consecutively", maxConsecutiveFailures)
 				}
 				continue

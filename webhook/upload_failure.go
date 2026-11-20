@@ -24,6 +24,14 @@ var recordFailedUpload = func(jobID, osid, message string) error {
 	return datastore.UpdateBuildKitJobStatus(jobID, datastore.JobStatusFailed)
 }
 
+// recordFailedUploadIfUnclaimed is recordFailedUpload's PRE-claim-safe
+// counterpart (review finding 1267): it writes the failure row only if the
+// token has not already been claimed by a concurrent, faster request for
+// the SAME token. A variable so tests can replace the datastore.
+var recordFailedUploadIfUnclaimed = func(token, jobID, osid, message string) error {
+	return datastore.RecordFailedUploadIfUnclaimed(token, jobID, osid, message)
+}
+
 // archiveStoreFailure names why the source archive could not be stored. It
 // keeps the historical "Failed to store archive" prefix and adds the cause,
 // which is the registry address and the transport or TLS error.
@@ -78,14 +86,40 @@ func refuseUpload(w http.ResponseWriter, osid, uploadID string, status int, reas
 	http.Error(w, message, status)
 }
 
+// failPreClaimUploadWithReason is failUploadWithReason's PRE-claim-safe
+// counterpart (review finding 1267): the calling request has NOT itself
+// claimed token, so before writing the failure row, it must check whether
+// a concurrent, faster request for the SAME token already claimed it - if
+// so, that request owns uploadID's build row from here, and writing here
+// would overwrite its result. Never call this for a refusal that follows
+// this request's OWN successful claim (an archive-push failure, or a
+// permit that expired between claim and push): those always own the row
+// and must use failUploadWithReason instead.
+func failPreClaimUploadWithReason(w http.ResponseWriter, token, osid, uploadID string, status int, reason, message string) {
+	log.Printf("Upload refused before token claim (osid=%s, uploadID=%s): %s", osid, uploadID, reason)
+	if err := recordFailedUploadIfUnclaimed(token, uploadID, osid, reason); err != nil {
+		log.Printf("Failed to record the failed upload (uploadID=%s): %v", uploadID, err)
+	}
+	http.Error(w, message, status)
+}
+
+// failPreClaimUpload is failPreClaimUploadWithReason with the logged/
+// recorded reason and the caller-visible message the same string.
+func failPreClaimUpload(w http.ResponseWriter, token, osid, uploadID string, status int, message string) {
+	failPreClaimUploadWithReason(w, token, osid, uploadID, status, message, message)
+}
+
 // reportUploadRefusal answers a pre-claim *uploadRefusal from the Harbor
-// identity check or the scoped admission decision, choosing failUpload (a
-// terminal refusal: record a pollable row) or refuseUpload (a retryable
-// refusal: no row, token stays retryable) by refusal.terminal (review
-// finding 1133).
-func reportUploadRefusal(w http.ResponseWriter, osid, uploadID string, refusal *uploadRefusal) {
+// identity check or the scoped admission decision, choosing
+// failPreClaimUploadWithReason (a terminal refusal: record a pollable row,
+// but only if a concurrent request has not already claimed the token) or
+// refuseUpload (a retryable refusal: no row, token stays retryable) by
+// refusal.terminal (review finding 1133). Every call site of this function
+// runs before this request's own claim, so the ownership check is always
+// correct here (review finding 1267).
+func reportUploadRefusal(w http.ResponseWriter, token, osid, uploadID string, refusal *uploadRefusal) {
 	if refusal.terminal {
-		failUploadWithReason(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)
+		failPreClaimUploadWithReason(w, token, osid, uploadID, refusal.status, refusal.reason, refusal.message)
 		return
 	}
 	refuseUpload(w, osid, uploadID, refusal.status, refusal.reason, refusal.message)

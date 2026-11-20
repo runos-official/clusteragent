@@ -127,6 +127,7 @@ func countPendingResponses() int {
 // test that uses this fake.
 type fakeBidiStream struct {
 	sendDelay time.Duration
+	sendErr   error
 	inFlight  atomic.Int32
 	overlap   atomic.Bool
 }
@@ -137,7 +138,7 @@ func (f *fakeBidiStream) Send(*l2sec.FromClusterAgent) error {
 	}
 	time.Sleep(f.sendDelay)
 	f.inFlight.Add(-1)
-	return nil
+	return f.sendErr
 }
 func (f *fakeBidiStream) Recv() (*l2sec.ToClusterAgent, error) { return nil, io.EOF }
 func (f *fakeBidiStream) Header() (metadata.MD, error)         { return nil, nil }
@@ -177,5 +178,45 @@ func TestSendOnStream_SerializesConcurrentSends(t *testing.T) {
 
 	if fake.overlap.Load() {
 		t.Fatal("two Send calls were in flight on the stream at once; sends must be serialized")
+	}
+}
+
+// TestListenForInstructions_InvalidatesStreamGenerationAtDetection pins
+// review finding 1270 (repeat of 1169/1240): the stream generation must
+// advance the moment listenForInstructions itself observes the stream has
+// failed, not later when establishAndMaintainStream's own goroutine is
+// scheduled to dequeue errChan and run its cleanup. That scheduling gap is
+// exactly where a reply already buffered for a pending recheck could be
+// read as still belonging to a live connection, because the generation
+// had not advanced yet. fakeBidiStream.Recv always returns io.EOF, so one
+// call reproduces the failure deterministically with no real stream.
+func TestListenForInstructions_InvalidatesStreamGenerationAtDetection(t *testing.T) {
+	genBefore := CurrentStreamGeneration()
+	sm := &streamManager{}
+	if err := sm.listenForInstructions(&fakeBidiStream{}); err == nil {
+		t.Fatal("expected an error once Recv() fails")
+	}
+	if CurrentStreamGeneration() == genBefore {
+		t.Fatal("expected streamGeneration to advance synchronously inside listenForInstructions, not later")
+	}
+}
+
+// TestRunHeartbeat_InvalidatesStreamGenerationAtDetection is
+// listenForInstructions' sibling case: three consecutive heartbeat
+// failures must also advance the generation at the point runHeartbeat
+// itself gives up, not later.
+func TestRunHeartbeat_InvalidatesStreamGenerationAtDetection(t *testing.T) {
+	genBefore := CurrentStreamGeneration()
+	sm := &streamManager{heartbeatInterval: 1 * time.Millisecond}
+	fake := &fakeBidiStream{sendErr: errors.New("send boom")}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := sm.runHeartbeat(ctx, fake)
+	if err == nil {
+		t.Fatal("expected an error after three consecutive heartbeat failures")
+	}
+	if CurrentStreamGeneration() == genBefore {
+		t.Fatal("expected streamGeneration to advance synchronously inside runHeartbeat, not later")
 	}
 }

@@ -57,28 +57,36 @@ type uploadHarness struct {
 	recheckErr     error
 	pushErr        error
 
-	mu                    sync.Mutex
-	claimed               []string
-	claimedPermitDeadline []*time.Time
-	claimErr              error
-	pushed                bool
-	cliStarted            bool
-	buildImgRun           bool
-	failedUploadJobIDs    []string
+	mu                          sync.Mutex
+	claimed                     []string
+	claimedPermitDeadline       []*time.Time
+	claimErr                    error
+	pushed                      bool
+	cliStarted                  bool
+	buildImgRun                 bool
+	failedUploadJobIDs          []string
+	skipFailedUploadIfUnclaimed bool
+	skippedFailedUploadJobIDs   []string
+	configReads                 int
+	configVerifiedReads         int
 }
 
 func (h *uploadHarness) install() {
 	h.t.Helper()
 
 	prevLoad, prevClaim, prevConfig, prevRecheck, prevPush := loadUploadableToken, claimUploadToken, readBuildKitConfig, requestStageRecheck, pushArchive
+	prevConfigVerified := readBuildKitConfigVerified
 	prevCLI, prevBuildImg := startCLIDeploymentAsync, startBuildImageDeploymentAsync
 	prevBegin := beginWork
 	prevRecordFailed := recordFailedUpload
+	prevRecordFailedIfUnclaimed := recordFailedUploadIfUnclaimed
 	h.t.Cleanup(func() {
 		loadUploadableToken, claimUploadToken, readBuildKitConfig, requestStageRecheck, pushArchive = prevLoad, prevClaim, prevConfig, prevRecheck, prevPush
+		readBuildKitConfigVerified = prevConfigVerified
 		startCLIDeploymentAsync, startBuildImageDeploymentAsync = prevCLI, prevBuildImg
 		beginWork = prevBegin
 		recordFailedUpload = prevRecordFailed
+		recordFailedUploadIfUnclaimed = prevRecordFailedIfUnclaimed
 	})
 
 	// Review findings 1075/1086/1133: a RETRYABLE pre-claim refusal must
@@ -89,6 +97,22 @@ func (h *uploadHarness) install() {
 		h.mu.Lock()
 		h.failedUploadJobIDs = append(h.failedUploadJobIDs, jobID)
 		h.mu.Unlock()
+		return nil
+	}
+
+	// Review finding 1267: the pre-claim-safe recorder. Defaults to the
+	// same tracking as recordFailedUpload and "not claimed by someone
+	// else", so every existing test's assumptions keep holding; a test for
+	// finding 1267 itself overrides h.unclaimedCheck to simulate a
+	// concurrent winner.
+	recordFailedUploadIfUnclaimed = func(_, jobID, _, _ string) error {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.skipFailedUploadIfUnclaimed {
+			h.skippedFailedUploadJobIDs = append(h.skippedFailedUploadJobIDs, jobID)
+			return nil
+		}
+		h.failedUploadJobIDs = append(h.failedUploadJobIDs, jobID)
 		return nil
 	}
 
@@ -111,6 +135,18 @@ func (h *uploadHarness) install() {
 		return nil
 	}
 	readBuildKitConfig = func(context.Context) (*agentstream.BuildKitConfig, error) {
+		h.mu.Lock()
+		h.configReads++
+		h.mu.Unlock()
+		if h.configErr != nil {
+			return nil, h.configErr
+		}
+		return h.buildkitConfig, nil
+	}
+	readBuildKitConfigVerified = func(context.Context) (*agentstream.BuildKitConfig, error) {
+		h.mu.Lock()
+		h.configVerifiedReads++
+		h.mu.Unlock()
 		if h.configErr != nil {
 			return nil, h.configErr
 		}
@@ -664,6 +700,49 @@ func TestHandleCLIDeployUpload_TerminalRefusalThenFixedRetrySucceeds(t *testing.
 	}
 }
 
+// TestHandleCLIDeployUpload_TerminalRefusalNeverOverwritesAConcurrentWinner
+// pins review finding 1267: a terminal PRE-claim refusal must route
+// through the ownership-safe recorder (recordFailedUploadIfUnclaimed), not
+// the unconditional one, so a request whose token a concurrent, faster
+// request already claimed never overwrites that winner's build row. The
+// mock here stands in for "a concurrent winner already claimed this
+// token": it is the ownership-safe path's own job (proven for real against
+// PostgreSQL by
+// TestRecordFailedUploadIfUnclaimed_PostgresLosesRaceToRealClaim in the
+// datastore package) to decide whether to skip; this test only pins that
+// the HANDLER calls that path, with the right token, for every terminal
+// pre-claim refusal.
+func TestHandleCLIDeployUpload_TerminalRefusalNeverOverwritesAConcurrentWinner(t *testing.T) {
+	h := &uploadHarness{
+		t:                           t,
+		token:                       legacyUploadToken(),
+		buildkitConfig:              &agentstream.BuildKitConfig{},
+		skipFailedUploadIfUnclaimed: true,
+	}
+	h.install()
+
+	origMaxFile := MaxFileSize
+	MaxFileSize = 1
+	w := doUpload(t, validTarGz(t))
+	MaxFileSize = origMaxFile
+	if w.Code == http.StatusAccepted {
+		t.Fatalf("expected the refusal, got 202")
+	}
+
+	h.assertNoClaimPushOrBuild(t)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.failedUploadJobIDs) != 0 {
+		t.Errorf("the unconditional recorder must not be used for a pre-claim refusal, got %v", h.failedUploadJobIDs)
+	}
+	if len(h.skippedFailedUploadJobIDs) != 1 {
+		t.Fatalf("expected the ownership-safe recorder to run exactly once, got %v", h.skippedFailedUploadJobIDs)
+	}
+	if h.skippedFailedUploadJobIDs[0] != "00000000-0000-4000-8000-000000000002" {
+		t.Errorf("recorded uploadID = %q, want the token's own uploadID", h.skippedFailedUploadJobIDs[0])
+	}
+}
+
 // TestHandleCLIDeployUpload_ConcurrentClaimRaceOnlyOnePersists pins AC5:
 // "Concurrent consumption cannot bypass single-use binding." Both requests
 // pass every check and receive a permit; only the first claim may succeed,
@@ -757,13 +836,35 @@ func TestHandleCLIDeployUpload_BuildImageHarborConfigMissingRefuses(t *testing.T
 	h.assertTerminalRefusal(t)
 }
 
+// TestHandleCLIDeployUpload_BuildImageHarborEndpointMissingRefuses pins
+// criterion 6(b2) (review finding 1268): a matching, non-empty Harbor
+// identity is not enough. The configuration must also name a usable
+// registry endpoint before a bound build-image upload may claim and
+// build, or BuildKit can start a pod against an unusable image reference.
+func TestHandleCLIDeployUpload_BuildImageHarborEndpointMissingRefuses(t *testing.T) {
+	h := &uploadHarness{
+		t:              t,
+		token:          buildImageToken("harbor-locked-1"),
+		buildkitConfig: &agentstream.BuildKitConfig{HarborOsid: "harbor-locked-1", HarborURL: ""},
+	}
+	h.install()
+
+	w := doUpload(t, validTarGz(t))
+	if w.Code == http.StatusAccepted {
+		t.Fatalf("expected a refusal, got 202")
+	}
+	// Terminal (review finding 1133): an incomplete configuration fails
+	// the same way on every retry against it.
+	h.assertTerminalRefusal(t)
+}
+
 // TestHandleCLIDeployUpload_BuildImageHarborMatchProceeds: the configuration
 // is unchanged, so the push goes to the persisted Harbor and the build runs.
 func TestHandleCLIDeployUpload_BuildImageHarborMatchProceeds(t *testing.T) {
 	h := &uploadHarness{
 		t:              t,
 		token:          buildImageToken("harbor-locked-1"),
-		buildkitConfig: &agentstream.BuildKitConfig{HarborOsid: "harbor-locked-1"},
+		buildkitConfig: &agentstream.BuildKitConfig{HarborOsid: "harbor-locked-1", HarborURL: "harbor.example.test"},
 	}
 	h.install()
 

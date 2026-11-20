@@ -75,16 +75,31 @@ var (
 	// own, longer-lived expiry has not).
 	claimUploadToken = datastore.MarkUploadTokenUsed
 
-	// readBuildKitConfig loads the BuildKit/Harbor configuration. A single
-	// seam (Kubernetes client creation + the ConfigMap/Secret read) so the
-	// SAME read feeds both the criterion 6(b) Harbor-identity comparison and
-	// the eventual push: no second read of the configuration between them.
+	// readBuildKitConfig loads the BuildKit/Harbor configuration with one
+	// read. Used by the app-deploy path and by a build-image upload with no
+	// bound harborOsid (criterion 6(d)'s explicit legacy branch): neither
+	// compares a locked Harbor identity, so neither needs the stricter,
+	// more fragile double-read (review finding 1269).
 	readBuildKitConfig = func(ctx context.Context) (*agentstream.BuildKitConfig, error) {
 		k8sClient, err := agentstream.NewK8sClient()
 		if err != nil {
 			return nil, fmt.Errorf("create Kubernetes client: %w", err)
 		}
 		return k8sClient.GetBuildKitConfig(ctx)
+	}
+
+	// readBuildKitConfigVerified loads the BuildKit/Harbor configuration
+	// with the double-read, compare-and-refuse check (review finding 1074),
+	// for the one path that actually needs it: a build-image upload whose
+	// token carries a bound, non-empty harborOsid. This is the SAME read
+	// the criterion 6(b) Harbor-identity comparison and the eventual push
+	// both use for that path - no second read between them.
+	readBuildKitConfigVerified = func(ctx context.Context) (*agentstream.BuildKitConfig, error) {
+		k8sClient, err := agentstream.NewK8sClient()
+		if err != nil {
+			return nil, fmt.Errorf("create Kubernetes client: %w", err)
+		}
+		return k8sClient.GetBuildKitConfigVerified(ctx)
 	}
 
 	// pushArchive persists the app-deploy source archive in Harbor.
@@ -206,7 +221,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// poll budget. failUpload's row is upsert-safe, so a later retry with a
 	// fixed tarball and the SAME token/uploadID still claims and builds.
 	if err := checkTarballLimits(tarballData); err != nil {
-		failUpload(w, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusRequestEntityTooLarge, fmt.Sprintf("Upload refused: %v", err))
 		return
 	}
 
@@ -216,19 +231,11 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// Scans the same in-memory tarball bytes without extracting to disk.
 	// Also terminal (finding 1133): same reasoning as the tarball check.
 	if err := validateDockerfileTarget(tarballData, uploadToken.Dockerfile); err != nil {
-		failUpload(w, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err))
+		failPreClaimUpload(w, token, osid, uploadID, http.StatusBadRequest, fmt.Sprintf("Upload refused: %v", err))
 		return
 	}
 
-	// Load BuildKit config (Harbor credentials) used by both flows. Still
-	// before any claim, and the SAME read criterion 6(b)'s comparison and
-	// the eventual push both use (never a second read of the configuration).
 	ctx := r.Context()
-	buildkitConfig, err := readBuildKitConfig(ctx)
-	if err != nil {
-		refuseUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("load build configuration: %v", err), fmt.Sprintf("Internal error: load build configuration: %v", err))
-		return
-	}
 
 	// App-less build-image flow (obj-47): the tarball is a generic build
 	// context to be built and pushed to explicit Harbor target ref(s). No
@@ -242,13 +249,32 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		repo := uploadToken.BuildTarget.Repo
 		tags := uploadToken.BuildTarget.Tags
+		boundHarborOsid := uploadToken.BuildTarget.HarborOsid
 
-		// Story 338 criterion 6(b): compare the Harbor identity Conductor
-		// locked at mint time against the Harbor buildkitConfig names right
-		// now - the same read the push below will use, not a second one -
+		// Load BuildKit config (Harbor credentials), the SAME read the
+		// eventual push uses (never a second read of the configuration).
+		// Review finding 1269: only a BOUND token (one that criterion 6(b)
+		// will actually compare) uses the stricter double-read; criterion
+		// 6(d)'s explicit legacy branch (no bound identity) keeps the
+		// plain single read, same as every other caller.
+		var buildkitConfig *agentstream.BuildKitConfig
+		var err error
+		if boundHarborOsid != "" {
+			buildkitConfig, err = readBuildKitConfigVerified(ctx)
+		} else {
+			buildkitConfig, err = readBuildKitConfig(ctx)
+		}
+		if err != nil {
+			refuseUpload(w, repo, uploadID, http.StatusInternalServerError, fmt.Sprintf("load build configuration: %v", err), fmt.Sprintf("Internal error: load build configuration: %v", err))
+			return
+		}
+
+		// Story 338 criteria 6(b)/6(b2): compare the Harbor identity
+		// Conductor locked at mint time, and require a usable registry
+		// endpoint, against the buildkitConfig the push below will use -
 		// before the build starts and before any push.
-		if refusal := verifyBuildImageHarborIdentity(uploadToken.BuildTarget.HarborOsid, buildkitConfig.HarborOsid); refusal != nil {
-			reportUploadRefusal(w, repo, uploadID, refusal)
+		if refusal := verifyBuildImageHarborIdentity(boundHarborOsid, buildkitConfig.HarborOsid, buildkitConfig.HarborURL); refusal != nil {
+			reportUploadRefusal(w, token, repo, uploadID, refusal)
 			return
 		}
 
@@ -269,6 +295,15 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// App-deploy flow's own configuration read: never compares a Harbor
+	// identity, so the plain single read is correct here too (review
+	// finding 1269).
+	buildkitConfig, err := readBuildKitConfig(ctx)
+	if err != nil {
+		refuseUpload(w, osid, uploadID, http.StatusInternalServerError, fmt.Sprintf("load build configuration: %v", err), fmt.Sprintf("Internal error: load build configuration: %v", err))
+		return
+	}
+
 	// App-deploy flow. A scoped token requires a fresh, current permit
 	// before anything is persisted; an explicit legacy token keeps its
 	// historical authorization (story 338: no scoped-to-legacy fallback,
@@ -280,7 +315,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 		var refusal *uploadRefusal
 		permit, refusal = admitScopedUpload(ctx, uploadToken.AuthorizationBinding)
 		if refusal != nil {
-			reportUploadRefusal(w, osid, uploadID, refusal)
+			reportUploadRefusal(w, token, osid, uploadID, refusal)
 			return
 		}
 	case datastore.AuthorizationLegacy:
@@ -300,7 +335,7 @@ func HandleCLIDeployUpload(w http.ResponseWriter, r *http.Request) {
 	// outcomes are retryable).
 	if permit != nil {
 		if refusal := permitStillValid(permit); refusal != nil {
-			reportUploadRefusal(w, osid, uploadID, refusal)
+			reportUploadRefusal(w, token, osid, uploadID, refusal)
 			return
 		}
 	}
@@ -549,9 +584,16 @@ func splitTarballDockerfile(tarballRoot, dockerfile string) (string, string, err
 	}
 
 	// Path-traversal guard: a malicious `../etc/passwd` style path is
-	// rejected even if it happens to exist on disk.
+	// rejected even if it happens to exist on disk. Review finding 1272: a
+	// bare strings.HasPrefix(rel, "..") also rejected a perfectly ordinary
+	// filename that merely starts with two dots, such as "..Containerfile"
+	// sitting right inside the root - it is not an ascent, just a name
+	// that happens to begin with the same two characters. Require the
+	// prefix to be followed by a path separator (or be exactly "..") so
+	// only a real ascent is rejected, matching validateDockerfileTarget's
+	// preflight check (tarball_limits.go), which already gets this right.
 	rel, err := filepath.Rel(absRoot, resolved)
-	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", "", fmt.Errorf("dockerfile %q escapes tarball root", trimmed)
 	}
 

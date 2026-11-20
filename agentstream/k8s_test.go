@@ -33,16 +33,17 @@ func buildkitSecretFixture(osid string) *corev1.Secret {
 	}
 }
 
-// TestGetBuildKitConfig_RefusesTornConfigMapSecretPairing pins review
-// finding 1074: Conductor writes the buildkit ConfigMap and Secret as two
-// separate, non-atomic API calls during a Harbor retarget
+// TestGetBuildKitConfigVerified_RefusesTornConfigMapSecretPairing pins
+// review finding 1074: Conductor writes the buildkit ConfigMap and Secret
+// as two separate, non-atomic API calls during a Harbor retarget
 // (ensureBuildConfig.ts: ensureConfigMap, then ensureSecret). A read that
 // observes the ConfigMap already naming the new Harbor's URL while the
 // Secret still names the old Harbor's identity (or vice versa) must be
 // refused as an inconsistent pairing, not silently trusted - the criterion
 // 6(b) identity comparison is only as good as the single coherent
-// configuration it is compared against.
-func TestGetBuildKitConfig_RefusesTornConfigMapSecretPairing(t *testing.T) {
+// configuration it is compared against. Review finding 1269 moved this
+// double-read behavior from GetBuildKitConfig to this narrower method.
+func TestGetBuildKitConfigVerified_RefusesTornConfigMapSecretPairing(t *testing.T) {
 	clientset := kubefake.NewSimpleClientset(
 		buildkitConfigMapFixture("harbor-old.example.test"),
 		buildkitSecretFixture("harbor-old-osid"),
@@ -61,14 +62,15 @@ func TestGetBuildKitConfig_RefusesTornConfigMapSecretPairing(t *testing.T) {
 	})
 
 	client := &K8sClient{clientset: clientset}
-	if _, err := client.GetBuildKitConfig(context.Background()); err == nil {
+	if _, err := client.GetBuildKitConfigVerified(context.Background()); err == nil {
 		t.Fatal("expected a refusal for a configuration that changed between reads")
 	}
 }
 
-// TestGetBuildKitConfig_RefusesTornSecretIdentity is the Secret-side mirror:
-// the osid changes between the two reads while the ConfigMap stays put.
-func TestGetBuildKitConfig_RefusesTornSecretIdentity(t *testing.T) {
+// TestGetBuildKitConfigVerified_RefusesTornSecretIdentity is the
+// Secret-side mirror: the osid changes between the two reads while the
+// ConfigMap stays put.
+func TestGetBuildKitConfigVerified_RefusesTornSecretIdentity(t *testing.T) {
 	clientset := kubefake.NewSimpleClientset(
 		buildkitConfigMapFixture("harbor.example.test"),
 		buildkitSecretFixture("harbor-old-osid"),
@@ -84,25 +86,59 @@ func TestGetBuildKitConfig_RefusesTornSecretIdentity(t *testing.T) {
 	})
 
 	client := &K8sClient{clientset: clientset}
-	if _, err := client.GetBuildKitConfig(context.Background()); err == nil {
+	if _, err := client.GetBuildKitConfigVerified(context.Background()); err == nil {
 		t.Fatal("expected a refusal for an identity that changed between reads")
 	}
 }
 
-// TestGetBuildKitConfig_ConsistentReadSucceeds proves the common,
+// TestGetBuildKitConfigVerified_ConsistentReadSucceeds proves the common,
 // legitimate case - no retarget in flight, both reads agree - still works.
-func TestGetBuildKitConfig_ConsistentReadSucceeds(t *testing.T) {
+func TestGetBuildKitConfigVerified_ConsistentReadSucceeds(t *testing.T) {
 	clientset := kubefake.NewSimpleClientset(
 		buildkitConfigMapFixture("harbor.example.test"),
 		buildkitSecretFixture("harbor-osid-1"),
 	)
 	client := &K8sClient{clientset: clientset}
 
-	cfg, err := client.GetBuildKitConfig(context.Background())
+	cfg, err := client.GetBuildKitConfigVerified(context.Background())
 	if err != nil {
 		t.Fatalf("a stable configuration must succeed: %v", err)
 	}
 	if cfg.HarborOsid != "harbor-osid-1" || cfg.HarborCoreURL != "harbor.example.test" {
 		t.Fatalf("config = %+v, want the stable fixture values", cfg)
+	}
+}
+
+// TestGetBuildKitConfig_ReadsOnlyOnce pins review finding 1269: the plain
+// GetBuildKitConfig - used by pull, legacy build-image uploads, VCS
+// builds, image-existence checks, and app-deploy uploads - must read the
+// ConfigMap and Secret exactly once each, so a configuration change that
+// those callers never look at (for example a harbor-osid rotation) cannot
+// refuse them. Only GetBuildKitConfigVerified, used solely for a
+// build-image upload with a bound harborOsid, reads twice.
+func TestGetBuildKitConfig_ReadsOnlyOnce(t *testing.T) {
+	clientset := kubefake.NewSimpleClientset(
+		buildkitConfigMapFixture("harbor.example.test"),
+		buildkitSecretFixture("harbor-osid-1"),
+	)
+	var cmGets, secretGets int
+	clientset.PrependReactor("get", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		cmGets++
+		return false, nil, nil
+	})
+	clientset.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		secretGets++
+		return false, nil, nil
+	})
+
+	client := &K8sClient{clientset: clientset}
+	if _, err := client.GetBuildKitConfig(context.Background()); err != nil {
+		t.Fatalf("GetBuildKitConfig: %v", err)
+	}
+	if cmGets != 1 {
+		t.Errorf("configmap Get calls = %d, want exactly 1", cmGets)
+	}
+	if secretGets != 1 {
+		t.Errorf("secret Get calls = %d, want exactly 1", secretGets)
 	}
 }

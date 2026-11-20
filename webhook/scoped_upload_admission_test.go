@@ -121,26 +121,30 @@ func TestAdmitScopedUpload_RefusesEveryNonPermitOutcome(t *testing.T) {
 	}
 }
 
-// TestVerifyBuildImageHarborIdentity pins story 338 criterion 6(b)/(d): the
-// comparison only runs when the token carries a locked identity, and only an
-// exact match of a non-empty configured Harbor continues.
+// TestVerifyBuildImageHarborIdentity pins story 338 criteria 6(b)/(b2)/(d):
+// the comparison only runs when the token carries a locked identity, and
+// only an exact match of a non-empty configured Harbor identity AND a
+// non-empty registry endpoint continues.
 func TestVerifyBuildImageHarborIdentity(t *testing.T) {
 	cases := []struct {
 		name         string
 		tokenOsid    string
 		configOsid   string
+		configURL    string
 		wantRefused  bool
 		wantStatusIf int
 	}{
-		{name: "legacy token with no locked identity always proceeds", tokenOsid: "", configOsid: "anything-or-empty"},
-		{name: "legacy token with no locked identity proceeds even with empty config", tokenOsid: "", configOsid: ""},
-		{name: "match proceeds", tokenOsid: "harbor-1", configOsid: "harbor-1"},
-		{name: "mismatch refuses", tokenOsid: "harbor-1", configOsid: "harbor-2", wantRefused: true, wantStatusIf: http.StatusForbidden},
-		{name: "config names no Harbor refuses", tokenOsid: "harbor-1", configOsid: "", wantRefused: true, wantStatusIf: http.StatusForbidden},
+		{name: "legacy token with no locked identity always proceeds", tokenOsid: "", configOsid: "anything-or-empty", configURL: ""},
+		{name: "legacy token with no locked identity proceeds even with empty config", tokenOsid: "", configOsid: "", configURL: ""},
+		{name: "match with endpoint proceeds", tokenOsid: "harbor-1", configOsid: "harbor-1", configURL: "harbor.example.test"},
+		{name: "mismatch refuses", tokenOsid: "harbor-1", configOsid: "harbor-2", configURL: "harbor.example.test", wantRefused: true, wantStatusIf: http.StatusForbidden},
+		{name: "config names no Harbor identity refuses", tokenOsid: "harbor-1", configOsid: "", configURL: "harbor.example.test", wantRefused: true, wantStatusIf: http.StatusForbidden},
+		{name: "matching identity but no registry endpoint refuses", tokenOsid: "harbor-1", configOsid: "harbor-1", configURL: "", wantRefused: true, wantStatusIf: http.StatusForbidden},
+		{name: "matching identity but blank registry endpoint refuses", tokenOsid: "harbor-1", configOsid: "harbor-1", configURL: "   ", wantRefused: true, wantStatusIf: http.StatusForbidden},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			refusal := verifyBuildImageHarborIdentity(c.tokenOsid, c.configOsid)
+			refusal := verifyBuildImageHarborIdentity(c.tokenOsid, c.configOsid, c.configURL)
 			if c.wantRefused {
 				if refusal == nil {
 					t.Fatal("expected a refusal")

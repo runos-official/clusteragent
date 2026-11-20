@@ -382,6 +382,93 @@ func TestMarkUploadTokenUsed_PostgresClockTimestampSurvivesLockWait(t *testing.T
 	}
 }
 
+// TestRecordFailedUploadIfUnclaimed_PostgresLosesRaceToRealClaim pins
+// review finding 1267 with real row-lock ordering, not just a sequential
+// proof: when a terminal pre-claim refusal's ownership check and a
+// concurrent request's real claim both reach the SAME token row, whichever
+// gets the lock first determines the outcome, and the claim winning must
+// never let the refusal overwrite its build row. An external lock holds
+// the row first and queues both operations behind it in a controlled
+// order (the claim queues first), then releases; PostgreSQL grants FOR
+// UPDATE requests in request order, so this deterministically exercises
+// "the claim wins the race" rather than hoping an unforced race lands that
+// way.
+func TestRecordFailedUploadIfUnclaimed_PostgresLosesRaceToRealClaim(t *testing.T) {
+	dsn := os.Getenv("CLUSTERAGENT_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("CLUSTERAGENT_TEST_POSTGRES_DSN not set; skipping the PostgreSQL-backed race test for review finding 1267")
+	}
+	setupPostgresTestDB(t, dsn)
+
+	const raw = "pg-1267-race-token"
+	const jobID = "upload-1267-race"
+	if err := CreatePullToken(raw, "osid-1", jobID, time.Now().Add(5*time.Minute)); err != nil {
+		t.Fatalf("CreatePullToken: %v", err)
+	}
+
+	lockDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		t.Fatalf("open second postgres connection: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := lockDB.DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+	tx := lockDB.Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin lock tx: %v", tx.Error)
+	}
+	var locked struct{ ID uint }
+	if err := tx.Raw(
+		"SELECT id FROM "+tablePrefix+"upload_tokens WHERE token_hash = ? FOR UPDATE",
+		hashToken(raw),
+	).Scan(&locked).Error; err != nil {
+		t.Fatalf("take the row lock: %v", err)
+	}
+
+	claimDone := make(chan error, 1)
+	recordDone := make(chan error, 1)
+	// Start the claim first and give it time to queue behind the lock
+	// before starting the refusal's check, so PostgreSQL's FIFO lock
+	// queue grants the claim first once the lock is released.
+	go func() { claimDone <- MarkUploadTokenUsed(raw, nil) }()
+	time.Sleep(200 * time.Millisecond)
+	go func() { recordDone <- RecordFailedUploadIfUnclaimed(raw, jobID, "osid-1", "lost the race") }()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := tx.Commit().Error; err != nil {
+		t.Fatalf("release the row lock: %v", err)
+	}
+
+	if err := <-claimDone; err != nil {
+		t.Fatalf("the claim must win and succeed: %v", err)
+	}
+	if err := <-recordDone; err != nil {
+		t.Fatalf("RecordFailedUploadIfUnclaimed must not itself error when it loses the race: %v", err)
+	}
+
+	// The claim won: RecordFailedUploadIfUnclaimed must have written
+	// nothing. Simulate the claim owner's own successful completion (as
+	// the real async build path would) and confirm it.
+	if _, err := GetBuildKitJob(jobID); err == nil {
+		t.Fatal("RecordFailedUploadIfUnclaimed must not have written a job row once the claim won the race")
+	}
+	if err := CreateBuildKitJob(jobID, "osid-1", "", "", jobID); err != nil {
+		t.Fatalf("CreateBuildKitJob (the winner's row): %v", err)
+	}
+	if err := UpdateBuildKitJobStatus(jobID, JobStatusSuccess); err != nil {
+		t.Fatalf("UpdateBuildKitJobStatus(success): %v", err)
+	}
+	job, err := GetBuildKitJob(jobID)
+	if err != nil {
+		t.Fatalf("GetBuildKitJob: %v", err)
+	}
+	if job.Status != JobStatusSuccess {
+		t.Fatalf("job = %+v, want success", job)
+	}
+}
+
 // setupPostgresTestDB installs a real PostgreSQL connection as the active
 // datastore handle for the duration of one test, auto-migrates the schema,
 // and restores the previous handle on cleanup. It returns the installed
