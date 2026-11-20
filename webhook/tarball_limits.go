@@ -277,14 +277,19 @@ func (l *tarDockerfileLookup) stat(relPath string) dockerfileEntry {
 // caller that skips this preflight).
 //
 // Review finding 1452: it also tracks, archive-wide and independent of the
-// configured dockerfile, each path's declared kind, and refuses the two
-// contradictions extraction's os.MkdirAll/os.Create pair cannot survive on
-// a real filesystem - a regular entry where a directory was already
-// declared at the SAME path, and any entry whose ancestor path was already
-// declared a regular file. These are the only two contradictions that
-// pairing can hit; a repeated directory, a repeated regular file, and a
-// symlink declared over or under anything all extract without error and
-// must keep passing, so only TypeDir and TypeReg are tracked here.
+// configured dockerfile, each path's declared kind (directory or regular
+// file), and refuses any entry extraction's os.MkdirAll/os.Create/
+// os.Symlink cannot survive on a real filesystem: a directory and a
+// regular file declared at the SAME path, in EITHER order, and any entry
+// of ANY type (directory, regular file, or symlink - review finding
+// 1452's own symmetric repeats, found searching for every other instance
+// of the same defect: extraction's TypeDir and TypeReg cases call
+// os.MkdirAll on the parent, and even TypeSymlink's os.Symlink fails
+// against a non-directory parent with no MkdirAll fallback of its own)
+// whose ancestor path was already declared a regular file. A repeated
+// directory, a repeated regular file, and a symlink declared over or
+// under anything at the exact same path all extract without error and
+// must keep passing, so a symlink's OWN path is never recorded in kinds.
 func checkTarballContainment(data []byte) error {
 	gz, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -319,19 +324,22 @@ func checkTarballContainment(data []byte) error {
 		}
 
 		normalized := normalizeTarEntryName(hdr.Name)
+		for dir := path.Dir(normalized); dir != "." && dir != "/"; dir = path.Dir(dir) {
+			if kinds[dir] == dockerfileEntryRegular {
+				return fmt.Errorf("entry %q has ancestor %q already declared as a regular file", normalized, dir)
+			}
+		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
+			if kinds[normalized] == dockerfileEntryRegular {
+				return fmt.Errorf("entry %q is declared as both a regular file and a directory", normalized)
+			}
 			kinds[normalized] = dockerfileEntryDir
 		case tar.TypeReg:
 			if kinds[normalized] == dockerfileEntryDir {
 				return fmt.Errorf("entry %q is declared as both a directory and a regular file", normalized)
 			}
 			kinds[normalized] = dockerfileEntryRegular
-			for dir := path.Dir(normalized); dir != "." && dir != "/"; dir = path.Dir(dir) {
-				if kinds[dir] == dockerfileEntryRegular {
-					return fmt.Errorf("entry %q has ancestor %q already declared as a regular file", normalized, dir)
-				}
-			}
 		}
 	}
 }

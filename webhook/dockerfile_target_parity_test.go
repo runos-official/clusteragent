@@ -271,6 +271,54 @@ func TestDockerfileTargetParity(t *testing.T) {
 			dockerfile: "Dockerfile",
 			wantAccept: true,
 		},
+		// The following three rows were not named by findings 1451/1452;
+		// found while searching for every other instance of the same kind
+		// of defect (archive declares a kind contradiction extraction's
+		// os.MkdirAll/os.Create pair cannot survive, uncaught pre-claim).
+		// Each is the symmetric counterpart of an instance findings
+		// 1451/1452 did name: the same contradiction, reverse order or a
+		// different entry type. Verified empirically (os.MkdirAll/
+		// os.Symlink against a real temp dir) before trusting the row.
+		{
+			// Reverse of finding 1452(1): regular declared, then a
+			// directory at the SAME path (os.MkdirAll on an existing
+			// regular file fails "not a directory").
+			name: "reg then dir at the same path (symmetric to 1452(1))",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "boom", typeflag: tar.TypeReg, body: "x"},
+				{name: "boom", typeflag: tar.TypeDir},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			// Reverse of finding 1452(2): a DIRECTORY entry (not a
+			// regular file) declared under a regular-file ancestor -
+			// os.MkdirAll on the ancestor still fails "not a directory".
+			name: "directory entry with a regular-file ancestor (symmetric to 1452(2))",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "a", typeflag: tar.TypeReg, body: "x"},
+				{name: "a/b", typeflag: tar.TypeDir},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
+		{
+			// A SYMLINK entry declared under a regular-file ancestor:
+			// extractTarball's TypeSymlink case calls no MkdirAll of its
+			// own, so os.Symlink itself fails "not a directory" against
+			// the existing regular-file ancestor.
+			name: "symlink entry with a regular-file ancestor (symmetric to 1452(2))",
+			entries: []tarEntry{
+				{name: "Dockerfile", typeflag: tar.TypeReg, body: "FROM alpine"},
+				{name: "a", typeflag: tar.TypeReg, body: "x"},
+				{name: "a/link", typeflag: tar.TypeSymlink, linkname: "Dockerfile"},
+			},
+			dockerfile: "Dockerfile",
+			wantAccept: false,
+		},
 	}
 
 	for _, tc := range cases {
