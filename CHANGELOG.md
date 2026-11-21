@@ -7,6 +7,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## Unreleased
+
+### Security
+- **The public-repo secret gates now recognise the Account API Key and Roid's OAuth client-secret shape.** `make leakcheck` and the release sensitivity scan both flag `runos_key_<id>.<secret>` and `cs_<43-char-secret>`, alongside the existing `runos_pat_<id>.<secret>`. The `runos_pat_`/`runos_key_` pattern also widens to match the new canonical-UUID credential id, which the previous pattern could not cross.
+
 ## v1.2.5
 
 No change to the agent's behaviour. This release carries the release tooling into the published history, so the prod record (main) matches dev. The same commit shipped as the hidden release candidate v1.2.5-rc.1.

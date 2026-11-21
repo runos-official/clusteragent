@@ -53,3 +53,8 @@ jobs:
       # The checker's own tests: what it must catch and what it must not.
       - name: Test the checker itself
         run: python3 scripts/leakcheck_test.py
+
+      # The OTHER copy of the credential patterns, the sensitivity-scan filter
+      # scripts/release.sh embeds, kept in step with the checker above.
+      - name: Test the release.sh sensitivity-scan filter
+        run: python3 scripts/release_filter_test.py

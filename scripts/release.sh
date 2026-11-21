@@ -152,7 +152,8 @@ import re, sys
 CREDENTIAL = re.compile(
     r"(gh[pousr]_[A-Za-z0-9]{20,})"
     r"|(github_pat_[A-Za-z0-9_]{20,})"
-    r"|(runos_pat_[A-Za-z0-9]{6,}\.[A-Za-z0-9]{20,})"
+    r"|(runos_(?:pat|key)_[A-Za-z0-9-]{6,}\.[A-Za-z0-9_-]{20,})"
+    r"|((?<![A-Za-z0-9_-])cs_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-]))"
     r"|(xox[baprs]-[A-Za-z0-9-]{10,})"
     r"|(AKIA[0-9A-Z]{16})"
     r"|(-----BEGIN [A-Z ]*PRIVATE KEY-----)"

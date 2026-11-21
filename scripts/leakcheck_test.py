@@ -56,6 +56,21 @@ RUNOS_TOKEN_PREFIX = "runos" + "_pat_"
 RUNOS_TOKEN = RUNOS_TOKEN_PREFIX + "AbCdEfGhJk.MnPqRsTuVwXyZ23456789AbCdEfGhJkMn"
 RUNOS_TOKEN_2 = RUNOS_TOKEN_PREFIX + "Zz9Yy8Xx7W.QqWwEeRrTtYyUuIiOoPpAaSsDdFfGg"
 
+# 1.3.0: the second typed RunOS credential, the Account API Key, and its real
+# shape: a canonical lowercase UUID id (hyphens included) dotted with a
+# 43-character base64url secret. Split the same way as RUNOS_TOKEN above.
+RUNOS_KEY_PREFIX = "runos" + "_key_"
+RUNOS_KEY_UUID_ID = "a1b2c3d4-e5f6-47a8-91bc-" + "ef1234567890"
+RUNOS_KEY_SECRET = ("Ab3xK9zQ7mN2pR5tV8wY-Cd1Ef4Gh7" + "Jk0Mn_Pq2x1Yz")[:43]
+RUNOS_KEY_TOKEN = RUNOS_KEY_PREFIX + RUNOS_KEY_UUID_ID + "." + RUNOS_KEY_SECRET
+
+# 1.3.0: Roid's bare OAuth client-secret shape, `cs_` plus EXACTLY 43
+# characters of the base64url alphabet (roid/internal/secretshape/
+# secretshape.go). Split so the fixed-length secret itself is not a literal.
+CS_PREFIX = "c" + "s_"
+CS_SECRET = ("Qw7e-Rt9y_Ui2o" + "Pa5s-Df8g_Hj1k" + "Lz4x-Cv6b_Nm3q" + "Zx")[:43]
+CS_TOKEN = CS_PREFIX + CS_SECRET
+
 # The SHAPE of the pasted terminal output that shipped in
 # cmd/preflight/tls_failure_kind_test.go: a private source address dialling a
 # public destination. Both are stand-ins, not the addresses from the incident,
@@ -192,6 +207,23 @@ def main() -> int:
         "export RUNOS_API_KEY=%s\n" % RUNOS_TOKEN_2,
         RUNOS_TOKEN_2[:22],
     )
+
+    # 1.3.0: the Account API Key, runos_key_<uuid-id>.<43-char-secret>. The
+    # widened id/secret character classes also prove the pattern now crosses
+    # the hyphens in a canonical UUID, which the 1.2.0 shape could not.
+    expect_catch(
+        "RunOS Account API Key",
+        "runos account api-keys preview --token %s\n" % RUNOS_KEY_TOKEN,
+        RUNOS_KEY_TOKEN[:22],
+    )
+
+    # 1.3.0: Roid's bare OAuth client-secret shape, cs_<exactly 43 chars>.
+    expect_catch(
+        "Roid OAuth client secret",
+        "Authorization: Bearer %s\n" % CS_TOKEN,
+        CS_TOKEN,
+    )
+
     # The already-shipped pasted output, both addresses in one line.
     expect_catch("pasted source address in a shipped test comment", '// "the secure handshake FAILED: %s",\n' % PASTED_ERROR, PASTED_SRC)
     expect_catch("pasted destination address in the same line", '// "the secure handshake FAILED: %s",\n' % PASTED_ERROR, PASTED_DST)
@@ -277,6 +309,23 @@ def main() -> int:
     expect_clean(
         "RunOS token placeholder in documentation",
         "runos login --api-key %s<id>.<secret>\n" % RUNOS_TOKEN_PREFIX,
+    )
+    # 1.3.0: the bare prefix in prose, with no id.secret shape after it.
+    expect_clean(
+        "RunOS Account API Key prefix named in prose",
+        "New Account API Keys use the %s prefix.\n" % RUNOS_KEY_PREFIX,
+    )
+    expect_clean(
+        "RunOS Account API Key placeholder in documentation",
+        "%s<credentialId>.<secret>\n" % RUNOS_KEY_PREFIX,
+    )
+    expect_clean(
+        "Roid cs_ prefix named in prose, no secret after it",
+        "the %s prefix identifies an OAuth client secret\n" % CS_PREFIX,
+    )
+    expect_clean(
+        "Roid cs_ prefix followed by too few characters",
+        "token %s%s\n" % (CS_PREFIX, CS_SECRET[:20]),
     )
     expect_clean("RFC 5737 TEST-NET-1", "gateway %s\n" % dotted(192, 0, 2, 1))
     expect_clean("RFC 5737 TEST-NET-2", "peer %s\n" % dotted(198, 51, 100, 7))

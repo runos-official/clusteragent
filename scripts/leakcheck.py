@@ -60,7 +60,7 @@ import re
 import subprocess
 import sys
 
-LEAKCHECK_VERSION = "1.2.1"
+LEAKCHECK_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Credential shapes. Kept in step with CREDENTIAL in scripts/release.sh.
@@ -76,11 +76,32 @@ LEAKCHECK_VERSION = "1.2.1"
 # id-dot-secret shape, so a doc placeholder like `runos_pat_<id>.<secret>` does
 # not trip it. No public repo contained the string at all when this was added,
 # so it introduced no false positive.
+#
+# 1.3.0: Objective 109 added a second typed RunOS credential,
+# `runos_key_<id>.<secret>` (the Account API Key), and the id for both typed
+# credentials is now a canonical lowercase UUID, not the old legacy
+# alphanumeric-only id the 1.2.0 pattern assumed. Measured: a real-shaped
+# `runos_pat_<uuid>.<43-char-secret>` token passed this gate clean before this
+# change, because `[A-Za-z0-9]{6,}` cannot cross the hyphens in a UUID. The id
+# and secret character classes below widen to `-` (id) and `_-` (secret, the
+# base64url alphabet) so both the legacy shape and the new UUID-keyed shape
+# match, for both `pat` and `key`. This is a strict superset of the 1.2.0
+# charset, so every token that matched before still matches.
+#
+# Also 1.3.0: Roid's own bare OAuth client-secret shape, `cs_<43 b64url
+# chars>` (roid/internal/secretshape/secretshape.go, commit
+# 1a970c8edd96e7d057420409689586106750a24b), had no match anywhere in this
+# repo's public gates. The fixed 43-character tail is exact, not a minimum, so
+# the pattern requires it exactly, bounded on both sides by a non-identifier
+# character, the same boundary rule secretshape.go itself enforces. Three
+# letters is not enough entropy on its own, so this alternative leans on the
+# fixed length rather than the prefix to stay precise.
 # ---------------------------------------------------------------------------
 CREDENTIAL_RE = re.compile(
     r"(gh[pousr]_[A-Za-z0-9]{20,})"
     r"|(github_pat_[A-Za-z0-9_]{20,})"
-    r"|(runos_pat_[A-Za-z0-9]{6,}\.[A-Za-z0-9]{20,})"
+    r"|(runos_(?:pat|key)_[A-Za-z0-9-]{6,}\.[A-Za-z0-9_-]{20,})"
+    r"|((?<![A-Za-z0-9_-])cs_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-]))"
     r"|(xox[baprs]-[A-Za-z0-9-]{10,})"
     r"|(AKIA[0-9A-Z]{16})"
     r"|(-----BEGIN [A-Z ]*PRIVATE KEY-----)"
