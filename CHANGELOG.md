@@ -23,6 +23,10 @@ This hidden release candidate adds the cluster agent's part of scoped machine cr
 
 ### Known limit
 - When the shared build configuration names one registry and its credentials name another, and both stay that way, the agent cannot tell. A build-image upload could then push to a registry that was not the one verified. This needs a change on the control plane and is tracked for a later release.
+## Unreleased
+
+### Security
+- **The public-repo secret gates now recognise the Account API Key and Roid's OAuth client-secret shape.** `make leakcheck` and the release sensitivity scan both flag `runos_key_<id>.<secret>` and `cs_<43-char-secret>`, alongside the existing `runos_pat_<id>.<secret>`. The `runos_pat_`/`runos_key_` pattern also widens to match the new canonical-UUID credential id, which the previous pattern could not cross.
 
 ## v1.2.5
 
