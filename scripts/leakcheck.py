@@ -60,7 +60,7 @@ import re
 import subprocess
 import sys
 
-LEAKCHECK_VERSION = "1.3.0"
+LEAKCHECK_VERSION = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # Credential shapes. Kept in step with CREDENTIAL in scripts/release.sh.
@@ -77,7 +77,7 @@ LEAKCHECK_VERSION = "1.3.0"
 # not trip it. No public repo contained the string at all when this was added,
 # so it introduced no false positive.
 #
-# 1.3.0: Objective 109 added a second typed RunOS credential,
+# 1.4.0: Objective 109 added a second typed RunOS credential,
 # `runos_key_<id>.<secret>` (the Account API Key), and the id for both typed
 # credentials is now a canonical lowercase UUID, not the old legacy
 # alphanumeric-only id the 1.2.0 pattern assumed. Measured: a real-shaped
@@ -88,7 +88,7 @@ LEAKCHECK_VERSION = "1.3.0"
 # match, for both `pat` and `key`. This is a strict superset of the 1.2.0
 # charset, so every token that matched before still matches.
 #
-# Also 1.3.0: Roid's own bare OAuth client-secret shape, `cs_<43 b64url
+# Also 1.4.0: Roid's own bare OAuth client-secret shape, `cs_<43 b64url
 # chars>` (roid/internal/secretshape/secretshape.go, commit
 # 1a970c8edd96e7d057420409689586106750a24b), had no match anywhere in this
 # repo's public gates. The fixed 43-character tail is exact, not a minimum, so

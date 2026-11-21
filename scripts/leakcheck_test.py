@@ -56,7 +56,7 @@ RUNOS_TOKEN_PREFIX = "runos" + "_pat_"
 RUNOS_TOKEN = RUNOS_TOKEN_PREFIX + "AbCdEfGhJk.MnPqRsTuVwXyZ23456789AbCdEfGhJkMn"
 RUNOS_TOKEN_2 = RUNOS_TOKEN_PREFIX + "Zz9Yy8Xx7W.QqWwEeRrTtYyUuIiOoPpAaSsDdFfGg"
 
-# 1.3.0: the second typed RunOS credential, the Account API Key, and its real
+# 1.4.0: the second typed RunOS credential, the Account API Key, and its real
 # shape: a canonical lowercase UUID id (hyphens included) dotted with a
 # 43-character base64url secret. Split the same way as RUNOS_TOKEN above.
 RUNOS_KEY_PREFIX = "runos" + "_key_"
@@ -64,7 +64,7 @@ RUNOS_KEY_UUID_ID = "a1b2c3d4-e5f6-47a8-91bc-" + "ef1234567890"
 RUNOS_KEY_SECRET = ("Ab3xK9zQ7mN2pR5tV8wY-Cd1Ef4Gh7" + "Jk0Mn_Pq2x1Yz")[:43]
 RUNOS_KEY_TOKEN = RUNOS_KEY_PREFIX + RUNOS_KEY_UUID_ID + "." + RUNOS_KEY_SECRET
 
-# 1.3.0: Roid's bare OAuth client-secret shape, `cs_` plus EXACTLY 43
+# 1.4.0: Roid's bare OAuth client-secret shape, `cs_` plus EXACTLY 43
 # characters of the base64url alphabet (roid/internal/secretshape/
 # secretshape.go). Split so the fixed-length secret itself is not a literal.
 CS_PREFIX = "c" + "s_"
@@ -208,7 +208,7 @@ def main() -> int:
         RUNOS_TOKEN_2[:22],
     )
 
-    # 1.3.0: the Account API Key, runos_key_<uuid-id>.<43-char-secret>. The
+    # 1.4.0: the Account API Key, runos_key_<uuid-id>.<43-char-secret>. The
     # widened id/secret character classes also prove the pattern now crosses
     # the hyphens in a canonical UUID, which the 1.2.0 shape could not.
     expect_catch(
@@ -217,7 +217,7 @@ def main() -> int:
         RUNOS_KEY_TOKEN[:22],
     )
 
-    # 1.3.0: Roid's bare OAuth client-secret shape, cs_<exactly 43 chars>.
+    # 1.4.0: Roid's bare OAuth client-secret shape, cs_<exactly 43 chars>.
     expect_catch(
         "Roid OAuth client secret",
         "Authorization: Bearer %s\n" % CS_TOKEN,
@@ -310,7 +310,7 @@ def main() -> int:
         "RunOS token placeholder in documentation",
         "runos login --api-key %s<id>.<secret>\n" % RUNOS_TOKEN_PREFIX,
     )
-    # 1.3.0: the bare prefix in prose, with no id.secret shape after it.
+    # 1.4.0: the bare prefix in prose, with no id.secret shape after it.
     expect_clean(
         "RunOS Account API Key prefix named in prose",
         "New Account API Keys use the %s prefix.\n" % RUNOS_KEY_PREFIX,
