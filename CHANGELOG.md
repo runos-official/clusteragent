@@ -7,7 +7,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
-## v1.3.0-rc.3
+## v1.3.0-rc.4
 
 ### Changed
 - No code change from v1.3.0-rc.2. This candidate exists because the release pipeline recorded the v1.3.0-rc.2 run as failed although its release workflow succeeded, and the pipeline does not reuse a version.
