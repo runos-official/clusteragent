@@ -51,3 +51,7 @@ tmp/
 temp/
 *.tmp
 *.log
+
+# Python bytecode from the scripts under scripts/ (the release gates run them).
+__pycache__/
+*.pyc
