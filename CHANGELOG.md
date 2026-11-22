@@ -7,6 +7,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.3.0-rc.2
+
+### Security
+- **The public-repo secret gates now recognise the Account API Key and Roid's OAuth client-secret shape.** `make leakcheck` and the release sensitivity scan both flag `runos_key_<id>.<secret>` and `cs_<43-char-secret>`, alongside the existing `runos_pat_<id>.<secret>`. The `runos_pat_`/`runos_key_` pattern also widens to match the new canonical-UUID credential id, which the previous pattern could not cross.
+
 ## v1.3.0-rc.1
 
 This hidden release candidate adds the cluster agent's part of scoped machine credentials. A deployment that starts with a scoped credential is now bound to that credential's authority for its whole life, and the agent asks again before each later stage. It needs the Conductor and Nodeward releases of the same work.
@@ -23,10 +28,6 @@ This hidden release candidate adds the cluster agent's part of scoped machine cr
 
 ### Known limit
 - When the shared build configuration names one registry and its credentials name another, and both stay that way, the agent cannot tell. A build-image upload could then push to a registry that was not the one verified. This needs a change on the control plane and is tracked for a later release.
-## Unreleased
-
-### Security
-- **The public-repo secret gates now recognise the Account API Key and Roid's OAuth client-secret shape.** `make leakcheck` and the release sensitivity scan both flag `runos_key_<id>.<secret>` and `cs_<43-char-secret>`, alongside the existing `runos_pat_<id>.<secret>`. The `runos_pat_`/`runos_key_` pattern also widens to match the new canonical-UUID credential id, which the previous pattern could not cross.
 
 ## v1.2.5
 
