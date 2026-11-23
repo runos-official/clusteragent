@@ -7,6 +7,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.3.0-rc.6
+
+This hidden release candidate corrects the order of scoped rollout checks.
+
+### Changed
+
+- Scoped deployments report success after Kubernetes accepts the authorized image update.
+- Each retry obtains a fresh deployment permit. The control connection advertises the corrected capability generation.
+
 ## v1.3.0-rc.5
 
 This hidden release candidate prepares the cluster agent for scoped deployments.
