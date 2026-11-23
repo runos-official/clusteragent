@@ -166,21 +166,29 @@ func permitStillValid(resp *agentstream.StageResponse) *uploadRefusal {
 // interposed round trip (no atomic claim) that could let the permit's own
 // short deadline or a disconnect pass unnoticed in between.
 func requireJobStagePermit(ctx context.Context, authorityJobID string, stage agentstream.RecheckStage) *uploadRefusal {
+	_, refusal := jobStagePermit(ctx, authorityJobID, stage)
+	return refusal
+}
+
+func jobStagePermit(ctx context.Context, authorityJobID string, stage agentstream.RecheckStage) (*agentstream.StageResponse, *uploadRefusal) {
 	if !jobAuthorityIDPattern.MatchString(authorityJobID) {
-		return unavailableUpload("missing or invalid durable job authority")
+		return nil, unavailableUpload("missing or invalid durable job authority")
 	}
 	retryID := uuid.New().String()
 	resp, err := requestStageRecheck(ctx, agentstream.JobAuthority(authorityJobID), stage, retryID)
 	if err != nil {
-		return unavailableUpload(fmt.Sprintf("deployment stage recheck unavailable: %v", err))
+		return nil, unavailableUpload(fmt.Sprintf("deployment stage recheck unavailable: %v", err))
+	}
+	if resp == nil {
+		return nil, unavailableUpload("empty stage response")
 	}
 	switch resp.Outcome {
 	case agentstream.OutcomePermit:
-		return nil
+		return resp, nil
 	case agentstream.OutcomeDeny, agentstream.OutcomeNeeds:
-		return forbiddenUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
+		return nil, forbiddenUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
 	default:
-		return unavailableUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
+		return nil, unavailableUpload(fmt.Sprintf("deployment stage recheck outcome %q (code %q)", resp.Outcome, resp.Code))
 	}
 }
 

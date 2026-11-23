@@ -169,3 +169,7 @@ func queryJobArgs(t *testing.T, jobID string) []BuildArg {
 	}
 	return out
 }
+
+// SetupBuildTestDB gives the external build lifecycle test the same temporary
+// datastore as the internal job tests, without exporting a production DB hook.
+func SetupBuildTestDB(t *testing.T) { setupTestDB(t) }

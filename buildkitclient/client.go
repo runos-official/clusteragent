@@ -169,6 +169,9 @@ type BuildConfig struct {
 	// single app-image ref derived from OSID + Commit, so app deploy / run
 	// / apps-build / CLI-deploy behaviour is unchanged.
 	TargetImages []string
+	// AwaitDeploymentPatch leaves the job busy after the image push. Its
+	// caller publishes success after Kubernetes accepts the scoped rollout.
+	AwaitDeploymentPatch bool
 }
 
 // Build executes a Docker build using BuildKit via buildctl CLI against an
@@ -427,8 +430,9 @@ func Build(ctx context.Context, clientset kubernetes.Interface, config BuildConf
 		return fmt.Errorf("build failed: %w", err)
 	}
 
-	// Update job status to success
-	datastore.UpdateBuildKitJobStatus(config.JobID, datastore.JobStatusSuccess)
+	if !config.AwaitDeploymentPatch {
+		datastore.UpdateBuildKitJobStatus(config.JobID, datastore.JobStatusSuccess)
+	}
 	datastore.InsertBuildKitLog(config.JobID, fmt.Sprintf("Build completed successfully. Image: %s", imageTag))
 
 	log.Printf("Build succeeded: job_id=%s, image=%s", config.JobID, imageTag)

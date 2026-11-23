@@ -743,6 +743,12 @@ type BuildAndDeployInput struct {
 	AuthorityJobID              string
 }
 
+func (in BuildAndDeployInput) awaitDeploymentPatch() bool { return in.scoped() && !in.BuildOnly }
+
+func (in BuildAndDeployInput) scoped() bool {
+	return in.AuthorityJobID != "" || in.AuthorizationClassification == datastore.AuthorizationScoped
+}
+
 // ProcessBuildAndDeploy runs the shared build+push+patch tail used by both the
 // CLI-deploy and VCS-deploy flows. Caller is responsible for:
 //   - Creating the BuildKitJob row in the datastore (so this function can write
@@ -793,21 +799,22 @@ func ProcessBuildAndDeploy(ctx context.Context, k8sClient *agentstream.K8sClient
 	}
 
 	buildConfig := buildkitclient.BuildConfig{
-		JobID:              in.JobID,
-		OSID:               in.OSID,
-		Commit:             tag,
-		CommitShort:        commitShort,
-		LocalContextPath:   in.Workdir,
-		ContextPath:        in.ContextPath,
-		DockerfileDir:      in.DockerfileDir,
-		DockerfileFilename: in.DockerfileFilename,
-		BuildArgs:          in.BuildArgs,
-		TargetImages:       targetImages,
-		Repo:               in.Repo,
-		Branch:             in.Branch,
-		HarborURL:          buildkitConfig.HarborURL,
-		HarborUsername:     buildkitConfig.HarborUsername,
-		HarborPassword:     buildkitConfig.HarborPassword,
+		JobID:                in.JobID,
+		OSID:                 in.OSID,
+		Commit:               tag,
+		CommitShort:          commitShort,
+		LocalContextPath:     in.Workdir,
+		ContextPath:          in.ContextPath,
+		DockerfileDir:        in.DockerfileDir,
+		DockerfileFilename:   in.DockerfileFilename,
+		BuildArgs:            in.BuildArgs,
+		TargetImages:         targetImages,
+		AwaitDeploymentPatch: in.awaitDeploymentPatch(),
+		Repo:                 in.Repo,
+		Branch:               in.Branch,
+		HarborURL:            buildkitConfig.HarborURL,
+		HarborUsername:       buildkitConfig.HarborUsername,
+		HarborPassword:       buildkitConfig.HarborPassword,
 	}
 
 	// Story 339: a scoped job requires a fresh build_start permit
@@ -818,7 +825,7 @@ func ProcessBuildAndDeploy(ctx context.Context, k8sClient *agentstream.K8sClient
 	// the refused stage."). The job row already exists by this point
 	// (queue_admission already succeeded), so - unlike a pre-admission
 	// refusal - this is unconditionally terminal for this attempt.
-	if in.AuthorityJobID != "" {
+	if in.scoped() {
 		if refusal := requireJobStagePermit(ctx, in.AuthorityJobID, agentstream.StageBuildStart); refusal != nil {
 			log.Printf("build_start stage recheck refused for job %s: %s", in.JobID, refusal.reason)
 			datastore.InsertBuildKitLog(in.JobID, "ERROR: build refused")
@@ -841,43 +848,29 @@ func ProcessBuildAndDeploy(ctx context.Context, k8sClient *agentstream.K8sClient
 		imageTag = strings.Join(targetImages, ", ")
 	}
 
-	// Build-only path (standalone `apps build`): the image is built and
-	// pushed to Harbor, and the build_kit row is already JobStatusSuccess
-	// from Build(). Stop here without patching the deployment — no rollout.
-	// The push is byte-identical to a deploy build at the same SHA + args,
-	// so a later run/deploy at this SHA reuses it from Harbor.
+	finishPushedImage(ctx, k8sClient.GetClientset(), in, imageTag, datastore.UpdateBuildKitJobStatus)
+}
+
+func finishPushedImage(ctx context.Context, clientset kubernetes.Interface, in BuildAndDeployInput, imageTag string, setStatus func(string, string) error) {
 	if in.BuildOnly {
 		log.Printf("Build-only complete for job %s, osid=%s, image=%s (no rollout)", in.JobID, in.OSID, imageTag)
 		datastore.InsertBuildKitLog(in.JobID, fmt.Sprintf("Image built and pushed: %s (build-only, deployment not patched)", imageTag))
 		return
 	}
 
-	// Story 339: a scoped job requires a fresh deployment_patch permit
-	// immediately before the first Kubernetes deployment update. Never
-	// reached for BuildOnly (returned above), matching the stage model's
-	// own rule ("A standalone build stops after the build stage. It never
-	// requests a deployment-patch permit.").
-	if in.AuthorityJobID != "" {
-		if refusal := requireJobStagePermit(ctx, in.AuthorityJobID, agentstream.StageDeploymentPatch); refusal != nil {
-			log.Printf("deployment_patch stage recheck refused for job %s: %s", in.JobID, refusal.reason)
-			datastore.InsertBuildKitLog(in.JobID, "ERROR: deployment patch refused")
-			datastore.UpdateBuildKitJobStatus(in.JobID, datastore.JobStatusFailed)
-			return
-		}
-	}
-
-	if err := patchDeploymentImage(ctx, k8sClient.GetClientset(), in.OSID, imageTag); err != nil {
+	if err := patchDeploymentImage(ctx, clientset, in, imageTag); err != nil {
 		log.Printf("Failed to patch deployment for job %s: %v", in.JobID, err)
 		datastore.InsertBuildKitLog(in.JobID, fmt.Sprintf("ERROR: Failed to patch deployment: %v", err))
-		// BuildKit's Build() already flipped status to "success" when the
-		// image push completed. Without this overwrite the build_kit row
-		// would claim success for the whole pipeline even though the
-		// deployment never received the new image, leaving the conductor's
-		// poller (and any operator looking at the row) blind to the
-		// failure. Re-status as failed so the wait-for-build step in
-		// deploy.cli surfaces a clean error to the CLI.
-		datastore.UpdateBuildKitJobStatus(in.JobID, datastore.JobStatusFailed)
+		if statusErr := setStatus(in.JobID, datastore.JobStatusFailed); statusErr != nil {
+			log.Printf("Failed to record deployment failure for job %s: %v", in.JobID, statusErr)
+		}
 		return
+	}
+	if in.scoped() {
+		if err := setStatus(in.JobID, datastore.JobStatusSuccess); err != nil {
+			log.Printf("Deployment patched but failed to record success for job %s: %v", in.JobID, err)
+			return
+		}
 	}
 
 	log.Printf("Deployment succeeded for job %s, osid=%s, image=%s", in.JobID, in.OSID, imageTag)
@@ -885,7 +878,8 @@ func ProcessBuildAndDeploy(ctx context.Context, k8sClient *agentstream.K8sClient
 }
 
 // patchDeploymentImage updates the deployment's container image with retry logic
-func patchDeploymentImage(ctx context.Context, clientset kubernetes.Interface, osid, imageTag string) error {
+func patchDeploymentImage(ctx context.Context, clientset kubernetes.Interface, in BuildAndDeployInput, imageTag string) error {
+	osid := in.OSID
 	const (
 		maxRetries    = 60
 		retryInterval = 5 * time.Second
@@ -893,12 +887,21 @@ func patchDeploymentImage(ctx context.Context, clientset kubernetes.Interface, o
 
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(retryInterval):
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// Get the deployment (name and namespace are both osid)
 		deployment, err := clientset.AppsV1().Deployments(osid).Get(ctx, osid, metav1.GetOptions{})
 		if err != nil {
 			lastErr = fmt.Errorf("deployment not found: %w", err)
 			log.Printf("Attempt %d/%d: deployment %s not found, retrying in %v...", attempt, maxRetries, osid, retryInterval)
-			time.Sleep(retryInterval)
 			continue
 		}
 
@@ -908,12 +911,28 @@ func patchDeploymentImage(ctx context.Context, clientset kubernetes.Interface, o
 		}
 		deployment.Spec.Template.Spec.Containers[0].Image = imageTag
 
-		// Update the deployment
-		_, err = clientset.AppsV1().Deployments(osid).Update(ctx, deployment, metav1.UpdateOptions{})
+		// The read or retry delay can outlive a permit. Authorize each actual
+		// write after the read and bound that API request by its own permit.
+		updateCtx := ctx
+		var cancel context.CancelFunc
+		if in.scoped() {
+			permit, refusal := jobStagePermit(ctx, in.AuthorityJobID, agentstream.StageDeploymentPatch)
+			if refusal == nil {
+				refusal = permitStillValid(permit)
+			}
+			if refusal != nil {
+				log.Printf("deployment_patch stage recheck refused for job %s: %s", in.JobID, refusal.reason)
+				return fmt.Errorf("deployment patch refused")
+			}
+			updateCtx, cancel = context.WithDeadline(ctx, permit.ExpiresAt)
+		}
+		_, err = clientset.AppsV1().Deployments(osid).Update(updateCtx, deployment, metav1.UpdateOptions{})
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
 			lastErr = fmt.Errorf("failed to update deployment: %w", err)
 			log.Printf("Attempt %d/%d: failed to update deployment %s, retrying in %v...", attempt, maxRetries, osid, retryInterval)
-			time.Sleep(retryInterval)
 			continue
 		}
 
