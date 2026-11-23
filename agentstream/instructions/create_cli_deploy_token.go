@@ -68,7 +68,7 @@ type CreateCLIDeployTokenRequest struct {
 	DurableJobID string `json:"durableJobId,omitempty"`
 }
 
-const ScopedUploadAckVersion = "runos.scoped-upload-ack.v1"
+const ScopedUploadAckVersion = "runos.scoped-upload-ack.v2"
 
 // ScopedUploadAck identifies the immutable authority and target saved for a scoped upload.
 type ScopedUploadAck struct {

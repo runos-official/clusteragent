@@ -73,6 +73,9 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	if err := testDB(t).Where("token_hash = ?", hashToken(raw)).First(&before).Error; err != nil {
 		t.Fatalf("read row before use: %v", err)
 	}
+	if before.AuthorizationBindingVersion != "runos.scoped-upload-storage.v2" || got.AuthorizationBinding.Version != "runos.upload-authority-binding.v1" {
+		t.Fatalf("stored decoder %q, inner binding %q", before.AuthorizationBindingVersion, got.AuthorizationBinding.Version)
+	}
 	for name, value := range map[string]string{
 		"token_hash":                   before.TokenHash,
 		"deploy_config":                before.DeployConfig,
@@ -228,7 +231,8 @@ func TestUploadToken_RejectsInconsistentAuthorizationRows(t *testing.T) {
 		version        string
 		binding        string
 	}{
-		{name: "scoped without binding", classification: AuthorizationScoped, version: UploadAuthorityBindingVersion},
+		{name: "scoped without binding", classification: AuthorizationScoped, version: "runos.scoped-upload-storage.v2"},
+		{name: "previous scoped generation", classification: AuthorizationScoped, version: UploadAuthorityBindingVersion, binding: string(bindingJSON)},
 		{name: "legacy with binding", classification: AuthorizationLegacy, version: UploadAuthorityBindingVersion, binding: string(bindingJSON)},
 		{name: "unknown classification", classification: "implicit", version: UploadAuthorityBindingVersion, binding: string(bindingJSON)},
 		{name: "unsupported stored version", classification: AuthorizationScoped, version: "runos.upload-authority-binding.v99", binding: string(bindingJSON)},

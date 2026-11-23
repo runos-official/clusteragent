@@ -59,7 +59,7 @@ func TestScopedUploadAcknowledgement(t *testing.T) {
 		return decoded.ScopedAck
 	}
 	got := mint(request, true)
-	want := map[string]string{"version": "runos.scoped-upload-ack.v1", "bindingId": saved.BindingID, "aid": saved.AccountID, "cid": saved.ClusterID, "appId": saved.AppID, "uploadId": saved.UploadID}
+	want := map[string]string{"version": "runos.scoped-upload-ack.v2", "bindingId": saved.BindingID, "aid": saved.AccountID, "cid": saved.ClusterID, "appId": saved.AppID, "uploadId": saved.UploadID}
 	if !maps.Equal(got, want) {
 		t.Fatalf("scoped acknowledgement = %v, want %v", got, want)
 	}

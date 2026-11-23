@@ -10,6 +10,9 @@ import (
 	"gorm.io/gorm"
 )
 
+// Scoped rows carry a receiver generation independently of the signed binding schema.
+const scopedUploadStorageVersion = "runos.scoped-upload-storage.v2"
+
 const (
 	PurposeUpload = "upload"
 	PurposePull   = "pull"
@@ -156,7 +159,7 @@ func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildA
 		ExpiresAt:                   expiresAt,
 		Purpose:                     PurposeUpload,
 		AuthorizationClassification: AuthorizationScoped,
-		AuthorizationBindingVersion: binding.Version,
+		AuthorizationBindingVersion: scopedUploadStorageVersion,
 		AuthorizationBinding:        string(bindingJSON),
 		DurableJobID:                durableJobID,
 	}
@@ -332,7 +335,7 @@ func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error 
 		}
 		return nil
 	case AuthorizationScoped:
-		if model.AuthorizationBindingVersion != UploadAuthorityBindingVersion {
+		if model.AuthorizationBindingVersion != scopedUploadStorageVersion {
 			return fmt.Errorf("unsupported stored authorization binding version %q", model.AuthorizationBindingVersion)
 		}
 		if strings.TrimSpace(model.AuthorizationBinding) == "" {

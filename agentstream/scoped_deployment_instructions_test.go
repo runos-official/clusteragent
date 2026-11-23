@@ -38,11 +38,11 @@ func TestScopedDeploymentInstructions(t *testing.T) {
 	if err := commons.JsonB64Decode(answer.JsonB64, &caps); err != nil {
 		t.Fatal(err)
 	}
-	if answer.Type != get+"_RESPONSE" || caps.Version != "runos.scoped-deployment-capabilities.v2" || !caps.StageRecheck || caps.ScopedUploadAck != "runos.scoped-upload-ack.v1" {
+	if answer.Type != get+"_RESPONSE" || caps.Version != "runos.scoped-deployment-capabilities.v3" || !caps.StageRecheck || caps.ScopedUploadAck != "runos.scoped-upload-ack.v2" {
 		t.Fatalf("unexpected capabilities: %v %+v", answer.Type, caps)
 	}
 	for kind, response := range map[string]string{
-		"CREATE_SCOPED_CLI_DEPLOY_TOKEN": "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", "SCOPED_VCS_FETCH_SOURCE": "VCS_FETCH_SOURCE_RESPONSE", "SCOPED_VCS_BUILD": "VCS_BUILD_RESPONSE",
+		"CREATE_SCOPED_CLI_DEPLOY_TOKEN_V2": "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", "SCOPED_VCS_FETCH_SOURCE_V2": "VCS_FETCH_SOURCE_RESPONSE", "SCOPED_VCS_BUILD_V2": "VCS_BUILD_RESPONSE",
 	} {
 		for _, fields := range []map[string]any{{}, {"authorizationClassification": "legacy"}, {"authorizationClassification": "unsupported"}} {
 			reply := call(kind, fields)
@@ -64,6 +64,18 @@ func TestScopedDeploymentInstructions(t *testing.T) {
 		}
 		if reply.Type != response || status.Success || status.Message == "" {
 			t.Fatalf("%s did not retain normal target validation", kind)
+		}
+	}
+	for _, name := range []string{"CREATE_SCOPED_CLI_DEPLOY_TOKEN", "SCOPED_VCS_FETCH_SOURCE", "SCOPED_VCS_BUILD", "CREATE_CLI_DEPLOY_TOKEN", "VCS_FETCH_SOURCE", "VCS_BUILD"} {
+		if reply := call(name, map[string]any{"authorizationClassification": "scoped"}); reply.Type != "ERROR" {
+			t.Fatalf("%s accepted a scoped request without the receiver generation", name)
+		}
+	}
+	for _, name := range []string{"CREATE_CLI_DEPLOY_TOKEN", "VCS_FETCH_SOURCE", "VCS_BUILD"} {
+		for _, fields := range []map[string]any{{}, {"authorizationClassification": "legacy"}} {
+			if reply := call(name, fields); reply.Type != name+"_RESPONSE" {
+				t.Fatalf("%s no longer routes unscoped requests to its handler: %s", name, reply.Type)
+			}
 		}
 	}
 	instructions.RequestJobStagePermit = nil
