@@ -7,6 +7,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.3.0-rc.5
+
+This hidden release candidate prepares the cluster agent for scoped deployments.
+
+### Changed
+
+- The agent confirms the exact scope and expiry it saved for a scoped upload.
+- The active control connection reports which scoped deployment instructions it supports.
+- The agent refuses unknown authorization classes and scoped instructions with missing bindings.
+
 ## v1.3.0-rc.4
 
 ### Changed
