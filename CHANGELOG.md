@@ -7,6 +7,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.3.0-rc.8
+
+This hidden release candidate makes scoped upload validation match Conductor's app identity.
+
+### Fixed
+
+- The agent verifies the Kubernetes app name against its canonical app ID and namespace at upload token creation and consumption.
+
 ## v1.3.0-rc.7
 
 This hidden release candidate binds scoped deployments to the corrected agent generation.
