@@ -19,6 +19,7 @@ const (
 )
 
 var (
+	appOSIDPattern    = regexp.MustCompile(`^app-[a-z0-9]{5}$`)
 	resourceIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 	publicIDPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]*$`)
 	uuidPattern       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -122,6 +123,24 @@ func (b UploadAuthorityBinding) MatchTarget(target UploadAuthorityTarget) error 
 		}
 	}
 	return nil
+}
+
+// ValidateScopedUploadTarget compares the Kubernetes app OSID with the bare app ID
+// in the authority binding. The runtime continues to use the original OSID.
+func ValidateScopedUploadTarget(binding UploadAuthorityBinding, osid, uploadID string, expiresAt time.Time) error {
+	if !appOSIDPattern.MatchString(osid) {
+		return fmt.Errorf("invalid scoped app OSID")
+	}
+	if uploadID == "" {
+		return fmt.Errorf("missing scoped upload ID")
+	}
+	appID := strings.TrimPrefix(osid, "app-")
+	if binding.Scope != fmt.Sprintf("acct/%s/cluster/%s/ns/%s/app/%s", binding.AccountID, binding.ClusterID, osid, appID) {
+		return fmt.Errorf("authorization binding scope does not match scoped app target")
+	}
+	return ValidateUploadAuthorityBinding(binding, UploadAuthorityTarget{
+		AppID: appID, UploadID: uploadID, Purpose: PurposeUpload,
+	}, expiresAt)
 }
 
 // ValidateUploadAuthorityBinding applies the shared schema and semantic rules.

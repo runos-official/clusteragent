@@ -64,6 +64,8 @@ func TestHandleCLIDeployUpload_QueueAdmissionRefusalRecordsPollableFailure(t *te
 // authority union).
 func TestHandleCLIDeployUpload_ScopedPermitForwardsAuthorityToAsyncBuild(t *testing.T) {
 	token := scopedUploadToken()
+	token.AuthorizationBinding.AppID = "m95nx"
+	token.DeployConfig = "app-m95nx:" + token.AuthorizationBinding.UploadID
 	h := &uploadHarness{
 		t:              t,
 		token:          token,
@@ -71,6 +73,23 @@ func TestHandleCLIDeployUpload_ScopedPermitForwardsAuthorityToAsyncBuild(t *test
 		recheckResp:    &agentstream.StageResponse{Outcome: agentstream.OutcomePermit, Code: "ok", ExpiresAt: time.Now().Add(5 * time.Second), Lifetime: agentstream.NewTestLifetime(true)},
 	}
 	h.install()
+	var stages []agentstream.RecheckStage
+	requestStageRecheck = func(_ context.Context, auth agentstream.RecheckAuthority, stage agentstream.RecheckStage, _ string) (*agentstream.StageResponse, error) {
+		stages = append(stages, stage)
+		switch stage {
+		case agentstream.StageArchivePersist:
+			if auth != agentstream.UploadAuthority(token.AuthorizationBinding.BindingID, token.AuthorizationBinding.UploadID) {
+				t.Fatal("archive used wrong authority")
+			}
+		case agentstream.StageQueueAdmission:
+			if auth != agentstream.JobAuthority(token.DurableJobID) {
+				t.Fatal("queue used wrong authority")
+			}
+		default:
+			t.Fatalf("unexpected stage %s", stage)
+		}
+		return h.recheckResp, nil
+	}
 
 	w := doUpload(t, validTarGz(t))
 	if w.Code != http.StatusAccepted {
@@ -78,6 +97,9 @@ func TestHandleCLIDeployUpload_ScopedPermitForwardsAuthorityToAsyncBuild(t *test
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if len(stages) != 2 || stages[0] != agentstream.StageArchivePersist || stages[1] != agentstream.StageQueueAdmission || h.cliStartedOSID != "app-m95nx" {
+		t.Fatalf("stages %v, build OSID %q", stages, h.cliStartedOSID)
+	}
 	if !h.cliStarted {
 		t.Fatal("expected the CLI deployment build to start")
 	}

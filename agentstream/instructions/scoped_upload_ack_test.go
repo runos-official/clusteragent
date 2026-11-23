@@ -15,7 +15,7 @@ func TestScopedUploadAcknowledgement(t *testing.T) {
 	t.Cleanup(func() { createScopedUploadToken, createUploadToken = previousScoped, previousLegacy })
 	binding := instructionBinding()
 	request := CreateCLIDeployTokenRequest{
-		OSID: binding.AppID, CliUploadID: binding.UploadID, DurableJobID: "00000000-0000-4000-8000-000000000005",
+		OSID: "app-" + binding.AppID, CliUploadID: binding.UploadID, DurableJobID: "00000000-0000-4000-8000-000000000005",
 		AuthorizationClassification: datastore.AuthorizationScoped, AuthorizationBinding: &binding,
 	}
 	var saved datastore.UploadAuthorityBinding
@@ -67,9 +67,17 @@ func TestScopedUploadAcknowledgement(t *testing.T) {
 	if mint(request, false) != nil {
 		t.Fatal("failed insert returned an acknowledgement")
 	}
-	request.OSID = "other"
+	saveErr = nil
+	for _, osid := range []string{binding.AppID, "svc-" + binding.AppID, "app-other", "app-app-" + binding.AppID, "app-", "app-APPAA"} {
+		request.OSID = osid
+		if mint(request, false) != nil {
+			t.Fatalf("invalid OSID %q returned an acknowledgement", osid)
+		}
+	}
+	request.OSID = "app-" + binding.AppID
+	binding.Scope = "acct/accta/cluster/abc/ns/app-other/app/" + binding.AppID
 	if mint(request, false) != nil {
-		t.Fatal("invalid target returned an acknowledgement")
+		t.Fatal("foreign namespace returned an acknowledgement")
 	}
 	if mint(CreateCLIDeployTokenRequest{OSID: binding.AppID}, true) != nil {
 		t.Fatal("legacy mint returned a scoped acknowledgement")

@@ -132,11 +132,7 @@ func CreateUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []
 // independent signals, and a scoped upload that can never reach its later
 // stage rechecks is not a supported shape.
 func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildArgs []BuildArg, expiresAt time.Time, binding UploadAuthorityBinding, durableJobID string) error {
-	if err := ValidateUploadAuthorityBinding(binding, UploadAuthorityTarget{
-		AppID:    osid,
-		UploadID: cliUploadID,
-		Purpose:  PurposeUpload,
-	}, expiresAt); err != nil {
+	if err := ValidateScopedUploadTarget(binding, osid, cliUploadID, expiresAt); err != nil {
 		return err
 	}
 	if !uuidPattern.MatchString(durableJobID) {
@@ -351,15 +347,11 @@ func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error 
 		if err != nil {
 			return err
 		}
-		appID, uploadID, ok := strings.Cut(model.DeployConfig, ":")
-		if !ok || appID == "" || uploadID == "" {
+		osid, uploadID, ok := strings.Cut(model.DeployConfig, ":")
+		if !ok || osid == "" || uploadID == "" {
 			return fmt.Errorf("scoped token has malformed deploy_config")
 		}
-		if err := ValidateUploadAuthorityBinding(binding, UploadAuthorityTarget{
-			AppID:    appID,
-			UploadID: uploadID,
-			Purpose:  PurposeUpload,
-		}, model.ExpiresAt); err != nil {
+		if err := ValidateScopedUploadTarget(binding, osid, uploadID, model.ExpiresAt); err != nil {
 			return err
 		}
 		token.Purpose = PurposeUpload

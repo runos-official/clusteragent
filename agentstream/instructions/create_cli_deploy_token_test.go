@@ -27,7 +27,7 @@ func instructionBinding() datastore.UploadAuthorityBinding {
 		ClusterID:     "abc",
 		AppID:         "appaa",
 		Action:        "apps.deploy",
-		Scope:         "acct/accta/cluster/abc/ns/default/app/appaa",
+		Scope:         "acct/accta/cluster/abc/ns/app-appaa/app/appaa",
 		UploadID:      "00000000-0000-4000-8000-000000000003",
 		Purpose:       datastore.PurposeUpload,
 		DecisionID:    "decision-fixture",
@@ -84,7 +84,7 @@ func TestCreateCLIDeployToken_SelectsLegacyOrScopedStorage(t *testing.T) {
 		const durableJobID = "00000000-0000-4000-8000-000000000005"
 		createScopedUploadToken = func(_ string, appID, uploadID, _ string, _ []datastore.BuildArg, _ time.Time, got datastore.UploadAuthorityBinding, gotDurableJobID string) error {
 			scopedCalls++
-			if appID != binding.AppID || uploadID != binding.UploadID || got.BindingID != binding.BindingID {
+			if appID != "app-"+binding.AppID || uploadID != binding.UploadID || got.BindingID != binding.BindingID {
 				t.Fatalf("scoped store received wrong target or binding: app=%q upload=%q binding=%q", appID, uploadID, got.BindingID)
 			}
 			if gotDurableJobID != durableJobID {
@@ -93,7 +93,7 @@ func TestCreateCLIDeployToken_SelectsLegacyOrScopedStorage(t *testing.T) {
 			return nil
 		}
 		payload, err := commons.JsonB64Encode(CreateCLIDeployTokenRequest{
-			OSID:                        binding.AppID,
+			OSID:                        "app-" + binding.AppID,
 			CliUploadID:                 binding.UploadID,
 			ExpirySeconds:               300,
 			AuthorizationClassification: datastore.AuthorizationScoped,
@@ -120,10 +120,10 @@ func TestCreateCLIDeployToken_SelectsLegacyOrScopedStorage(t *testing.T) {
 func TestCreateCLIDeployToken_RejectsAmbiguousAuthorization(t *testing.T) {
 	binding := instructionBinding()
 	tests := []CreateCLIDeployTokenRequest{
-		{OSID: binding.AppID, CliUploadID: binding.UploadID, AuthorizationBinding: &binding},
-		{OSID: binding.AppID, CliUploadID: binding.UploadID, AuthorizationClassification: datastore.AuthorizationScoped},
-		{OSID: binding.AppID, CliUploadID: binding.UploadID, AuthorizationClassification: datastore.AuthorizationLegacy, AuthorizationBinding: &binding},
-		{OSID: binding.AppID, CliUploadID: binding.UploadID, AuthorizationClassification: "implicit", AuthorizationBinding: &binding},
+		{OSID: "app-" + binding.AppID, CliUploadID: binding.UploadID, AuthorizationBinding: &binding},
+		{OSID: "app-" + binding.AppID, CliUploadID: binding.UploadID, AuthorizationClassification: datastore.AuthorizationScoped},
+		{OSID: "app-" + binding.AppID, CliUploadID: binding.UploadID, AuthorizationClassification: datastore.AuthorizationLegacy, AuthorizationBinding: &binding},
+		{OSID: "app-" + binding.AppID, CliUploadID: binding.UploadID, AuthorizationClassification: "implicit", AuthorizationBinding: &binding},
 		{Purpose: datastore.PurposeBuildImage, Repo: "fixture-repo", Tags: []string{"latest"}, AuthorizationClassification: datastore.AuthorizationScoped, AuthorizationBinding: &binding},
 	}
 	for i, req := range tests {
@@ -324,7 +324,7 @@ func TestCreateCLIDeployToken_ScopedPurposeAndExpiry(t *testing.T) {
 				return nil
 			}
 			payload, err := commons.JsonB64Encode(CreateCLIDeployTokenRequest{
-				OSID: binding.AppID, CliUploadID: binding.UploadID, Purpose: tc.purpose,
+				OSID: "app-" + binding.AppID, CliUploadID: binding.UploadID, Purpose: tc.purpose,
 				ExpirySeconds: tc.expirySeconds, AuthorizationClassification: datastore.AuthorizationScoped,
 				AuthorizationBinding: &binding,
 			})

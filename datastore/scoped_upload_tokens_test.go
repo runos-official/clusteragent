@@ -31,7 +31,7 @@ func testUploadAuthorityBinding(now time.Time) UploadAuthorityBinding {
 		ClusterID:     "abc",
 		AppID:         "appaa",
 		Action:        "apps.deploy",
-		Scope:         "acct/accta/cluster/abc/ns/default/app/appaa",
+		Scope:         "acct/accta/cluster/abc/ns/app-appaa/app/appaa",
 		UploadID:      "00000000-0000-4000-8000-000000000003",
 		Purpose:       PurposeUpload,
 		DecisionID:    "decision-fixture",
@@ -48,7 +48,7 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	const raw = "scoped-upload-token-fixture"
 
 	const durableJobID = "00000000-0000-4000-8000-000000000004"
-	if err := CreateScopedUploadToken(raw, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err != nil {
+	if err := CreateScopedUploadToken(raw, "app-"+binding.AppID, binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err != nil {
 		t.Fatalf("CreateScopedUploadToken: %v", err)
 	}
 
@@ -105,6 +105,24 @@ func TestScopedUploadToken_RoundTripAndReplayMetadata(t *testing.T) {
 	}
 }
 
+func TestScopedUploadLookupRejectsChangedRuntimeOSID(t *testing.T) {
+	setupTestDB(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	binding := testUploadAuthorityBinding(now)
+	const raw = "scoped-upload-readback-target"
+	if err := CreateScopedUploadToken(raw, "app-"+binding.AppID, binding.UploadID, "", nil, now.Add(5*time.Minute), binding, "00000000-0000-4000-8000-000000000004"); err != nil {
+		t.Fatal(err)
+	}
+	for _, osid := range []string{binding.AppID, "svc-" + binding.AppID, "app-other"} {
+		if err := testDB(t).Model(&UploadTokenModel{}).Where("token_hash = ?", hashToken(raw)).Update("deploy_config", osid+":"+binding.UploadID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := GetUploadableToken(raw); err == nil {
+			t.Fatalf("lookup accepted stored OSID %q for app %q", osid, binding.AppID)
+		}
+	}
+}
+
 // TestCreateScopedUploadToken_RequiresDurableJobID proves a scoped upload
 // with a missing or malformed durable job id refuses the mint rather than
 // silently selecting legacy (no-recheck) behavior for the later
@@ -118,7 +136,7 @@ func TestCreateScopedUploadToken_RequiresDurableJobID(t *testing.T) {
 	binding := testUploadAuthorityBinding(now)
 
 	for _, durableJobID := range []string{"", "not-a-uuid", "00000000-0000-4000-8000-00000000000Z"} {
-		if err := CreateScopedUploadToken("tok-"+durableJobID, "appaa", binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err == nil {
+		if err := CreateScopedUploadToken("tok-"+durableJobID, "app-"+binding.AppID, binding.UploadID, "Dockerfile", nil, now.Add(5*time.Minute), binding, durableJobID); err == nil {
 			t.Errorf("durableJobID %q: expected an error, got none", durableJobID)
 		}
 	}
@@ -249,7 +267,7 @@ func TestUploadToken_RejectsInconsistentAuthorizationRows(t *testing.T) {
 			raw := "inconsistent-token-" + string(rune('a'+i))
 			row := UploadTokenModel{
 				TokenHash:                   hashToken(raw),
-				DeployConfig:                "appaa:00000000-0000-4000-8000-000000000003",
+				DeployConfig:                "app-appaa:00000000-0000-4000-8000-000000000003",
 				ExpiresAt:                   now.Add(5 * time.Minute),
 				Purpose:                     tc.purpose,
 				AuthorizationClassification: tc.classification,

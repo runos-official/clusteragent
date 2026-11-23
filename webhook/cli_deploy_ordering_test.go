@@ -63,6 +63,7 @@ type uploadHarness struct {
 	claimErr                    error
 	pushed                      bool
 	cliStarted                  bool
+	cliStartedOSID              string
 	cliStartedClassification    string
 	cliStartedAuthorityJobID    string
 	buildImgRun                 bool
@@ -163,9 +164,10 @@ func (h *uploadHarness) install() {
 		h.pushed = true
 		return h.pushErr
 	}
-	startCLIDeploymentAsync = func(_ []byte, _, _, _ string, _ []datastore.BuildArg, authorizationClassification, authorityJobID string, _ *agentstream.BuildKitConfig, end func()) {
+	startCLIDeploymentAsync = func(_ []byte, osid, _, _ string, _ []datastore.BuildArg, authorizationClassification, authorityJobID string, _ *agentstream.BuildKitConfig, end func()) {
 		h.mu.Lock()
 		h.cliStarted = true
+		h.cliStartedOSID = osid
 		h.cliStartedClassification = authorizationClassification
 		h.cliStartedAuthorityJobID = authorityJobID
 		h.mu.Unlock()

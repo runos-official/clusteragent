@@ -181,11 +181,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 			return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
 		}
 		expiresAt = bindingExpiry
-		if err := datastore.ValidateUploadAuthorityBinding(*req.AuthorizationBinding, datastore.UploadAuthorityTarget{
-			AppID:    req.OSID,
-			UploadID: req.CliUploadID,
-			Purpose:  datastore.PurposeUpload,
-		}, expiresAt); err != nil {
+		if err := datastore.ValidateScopedUploadTarget(*req.AuthorizationBinding, req.OSID, req.CliUploadID, expiresAt); err != nil {
 			response := CreateCLIDeployTokenResponse{Success: false, Message: "Invalid authorization binding"}
 			jsonResponse, _ := commons.JsonB64Encode(response)
 			return "CREATE_CLI_DEPLOY_TOKEN_RESPONSE", jsonResponse, nil
