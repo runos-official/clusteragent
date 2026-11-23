@@ -16,6 +16,9 @@ const scopedUploadStorageVersion = "runos.scoped-upload-storage.v2"
 const (
 	PurposeUpload = "upload"
 	PurposePull   = "pull"
+	// Older receivers select by purpose alone. Keep scoped rows outside every
+	// legacy lookup, even on versions that predate authorization classification.
+	scopedUploadPurpose = "scoped_upload_v2"
 	// PurposeBuildImage marks an app-less build-and-push token (obj-47):
 	// the uploaded tarball is a generic build context to be built and
 	// pushed to explicit Harbor target ref(s), NOT an app deploy. There is
@@ -157,7 +160,7 @@ func CreateScopedUploadToken(token, osid, cliUploadID, dockerfile string, buildA
 		Dockerfile:                  dockerfile,
 		BuildArgs:                   buildArgsJSON,
 		ExpiresAt:                   expiresAt,
-		Purpose:                     PurposeUpload,
+		Purpose:                     scopedUploadPurpose,
 		AuthorizationClassification: AuthorizationScoped,
 		AuthorizationBindingVersion: scopedUploadStorageVersion,
 		AuthorizationBinding:        string(bindingJSON),
@@ -245,7 +248,7 @@ func encodeBuildArgs(buildArgs []BuildArg) (string, error) {
 
 // GetUploadToken retrieves an upload-purpose (app deploy) token by its raw value.
 func GetUploadToken(token string) (*UploadToken, error) {
-	return getTokenByPurpose(token, PurposeUpload)
+	return getTokenByPurposes(token, PurposeUpload, scopedUploadPurpose)
 }
 
 // GetPullToken retrieves a pull-purpose token by its raw value.
@@ -258,7 +261,7 @@ func GetPullToken(token string) (*UploadToken, error) {
 // (obj-47). The shared handler branches on the returned Purpose. Pull tokens
 // are excluded so the single-use purpose isolation is preserved.
 func GetUploadableToken(token string) (*UploadToken, error) {
-	return getTokenByPurposes(token, PurposeUpload, PurposeBuildImage)
+	return getTokenByPurposes(token, PurposeUpload, PurposeBuildImage, scopedUploadPurpose)
 }
 
 func getTokenByPurpose(token string, purpose string) (*UploadToken, error) {
@@ -328,6 +331,9 @@ func getTokenByPurposes(token string, purposes ...string) (*UploadToken, error) 
 }
 
 func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error {
+	if (model.Purpose == scopedUploadPurpose) != (model.AuthorizationClassification == AuthorizationScoped) {
+		return errors.New("stored token purpose does not match scoped classification")
+	}
 	switch model.AuthorizationClassification {
 	case AuthorizationLegacy:
 		if model.AuthorizationBindingVersion != "" || strings.TrimSpace(model.AuthorizationBinding) != "" {
@@ -352,10 +358,11 @@ func loadAuthorizationBinding(model UploadTokenModel, token *UploadToken) error 
 		if err := ValidateUploadAuthorityBinding(binding, UploadAuthorityTarget{
 			AppID:    appID,
 			UploadID: uploadID,
-			Purpose:  model.Purpose,
+			Purpose:  PurposeUpload,
 		}, model.ExpiresAt); err != nil {
 			return err
 		}
+		token.Purpose = PurposeUpload
 		token.AuthorizationBinding = &binding
 		return nil
 	default:
