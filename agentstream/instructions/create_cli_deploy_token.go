@@ -68,6 +68,8 @@ type CreateCLIDeployTokenRequest struct {
 	DurableJobID string `json:"durableJobId,omitempty"`
 }
 
+const ScopedUploadAckVersion = "runos.scoped-upload-ack.v1"
+
 // ScopedUploadAck identifies the immutable authority and target saved for a scoped upload.
 type ScopedUploadAck struct {
 	Version   string `json:"version"`
@@ -221,7 +223,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 		storeErr = createScopedUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt, binding, req.DurableJobID)
 		if storeErr == nil {
 			scopedAck = &ScopedUploadAck{
-				Version: "runos.scoped-upload-ack.v1", BindingID: binding.BindingID,
+				Version: ScopedUploadAckVersion, BindingID: binding.BindingID,
 				AccountID: binding.AccountID, ClusterID: binding.ClusterID, AppID: binding.AppID, UploadID: binding.UploadID,
 			}
 		}

@@ -594,6 +594,10 @@ func handleInstruction(instruction *l2sec.ToClusterAgent, lt *Lifetime) {
 		return
 	}
 
+	if handleScopedDeploymentInstruction(instruction, lt) {
+		return
+	}
+
 	handler, exists := instructions.Map[instruction.Type]
 	if !exists {
 		handler, exists = streamingHandler(instruction)
