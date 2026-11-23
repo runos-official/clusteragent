@@ -68,13 +68,24 @@ type CreateCLIDeployTokenRequest struct {
 	DurableJobID string `json:"durableJobId,omitempty"`
 }
 
+// ScopedUploadAck identifies the immutable authority and target saved for a scoped upload.
+type ScopedUploadAck struct {
+	Version   string `json:"version"`
+	BindingID string `json:"bindingId"`
+	AccountID string `json:"aid"`
+	ClusterID string `json:"cid"`
+	AppID     string `json:"appId"`
+	UploadID  string `json:"uploadId"`
+}
+
 // CreateCLIDeployTokenResponse holds the response after creating a token
 type CreateCLIDeployTokenResponse struct {
-	Success   bool   `json:"success"`
-	Token     string `json:"token,omitempty"`
-	ExpiresAt string `json:"expiresAt,omitempty"` // ISO8601 timestamp
-	UploadURL string `json:"uploadUrl,omitempty"` // /cli-deploy/{token}
-	Message   string `json:"message,omitempty"`
+	Success   bool             `json:"success"`
+	Token     string           `json:"token,omitempty"`
+	ExpiresAt string           `json:"expiresAt,omitempty"` // ISO8601 timestamp
+	UploadURL string           `json:"uploadUrl,omitempty"` // /cli-deploy/{token}
+	Message   string           `json:"message,omitempty"`
+	ScopedAck *ScopedUploadAck `json:"scopedAck,omitempty"`
 }
 
 const (
@@ -198,6 +209,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 	// the Harbor tag + BuildKit jobID (legacy callers may omit it, in which
 	// case the upload handler mints one at upload time).
 	var storeErr error
+	var scopedAck *ScopedUploadAck
 	if req.Purpose == datastore.PurposeBuildImage {
 		uploadID := req.CliUploadID
 		if uploadID == "" {
@@ -205,7 +217,14 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 		}
 		storeErr = createBuildImageToken(token, uploadID, req.Repo, req.Tags, req.HarborOsid, req.Dockerfile, req.BuildArgs, expiresAt)
 	} else if authorization == datastore.AuthorizationScoped {
-		storeErr = createScopedUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt, *req.AuthorizationBinding, req.DurableJobID)
+		binding := *req.AuthorizationBinding
+		storeErr = createScopedUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt, binding, req.DurableJobID)
+		if storeErr == nil {
+			scopedAck = &ScopedUploadAck{
+				Version: "runos.scoped-upload-ack.v1", BindingID: binding.BindingID,
+				AccountID: binding.AccountID, ClusterID: binding.ClusterID, AppID: binding.AppID, UploadID: binding.UploadID,
+			}
+		}
 	} else {
 		storeErr = createUploadToken(token, req.OSID, req.CliUploadID, req.Dockerfile, req.BuildArgs, expiresAt)
 	}
@@ -231,6 +250,7 @@ func CreateCLIDeployToken(jsonB64 string) (string, string, error) {
 		ExpiresAt: expiresAt.Format(time.RFC3339Nano),
 		UploadURL: fmt.Sprintf("/cli-deploy/%s", token),
 		Message:   "CLI deploy token created successfully",
+		ScopedAck: scopedAck,
 	}
 
 	jsonResponse, err := commons.JsonB64Encode(response)
