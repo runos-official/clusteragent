@@ -38,7 +38,7 @@ func TestScopedDeploymentInstructions(t *testing.T) {
 	if err := commons.JsonB64Decode(answer.JsonB64, &caps); err != nil {
 		t.Fatal(err)
 	}
-	if answer.Type != get+"_RESPONSE" || caps.Version != "runos.scoped-deployment-capabilities.v1" || !caps.StageRecheck || caps.ScopedUploadAck != "runos.scoped-upload-ack.v1" {
+	if answer.Type != get+"_RESPONSE" || caps.Version != "runos.scoped-deployment-capabilities.v2" || !caps.StageRecheck || caps.ScopedUploadAck != "runos.scoped-upload-ack.v1" {
 		t.Fatalf("unexpected capabilities: %v %+v", answer.Type, caps)
 	}
 	for kind, response := range map[string]string{

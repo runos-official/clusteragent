@@ -53,7 +53,7 @@ func scopedDeploymentReply(req *l2sec.ToClusterAgent, handler func(string) (stri
 			Version         string `json:"version"`
 			StageRecheck    bool   `json:"stageRecheck"`
 			ScopedUploadAck string `json:"scopedUploadAck"`
-		}{"runos.scoped-deployment-capabilities.v1", true, instructions.ScopedUploadAckVersion}
+		}{"runos.scoped-deployment-capabilities.v2", true, instructions.ScopedUploadAckVersion}
 		payload, err := commons.JsonB64Encode(caps)
 		return getScopedDeploymentCapabilities + "_RESPONSE", payload, err
 	}
