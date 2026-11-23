@@ -59,7 +59,7 @@ type VcsFetchSourceRequest struct {
 	// either direction - a scoped classification with a missing or
 	// malformed ConductorJobID refuses outright, it does not fall back to
 	// legacy.
-	AuthorizationClassification string `json:"authorizationClassification,omitempty"`
+	AuthorizationClassification vcsAuthorizationClass `json:"authorizationClassification,omitempty"`
 }
 
 // VcsFetchSourceServiceYaml carries one runos.service.*.yaml file's contents
@@ -301,7 +301,7 @@ func VcsFetchSource(jsonB64 string) (string, string, error) {
 		ContextPath:                 paths.ContextPath,
 		DockerfileDir:               paths.DockerfileDir,
 		DockerfileFilename:          paths.DockerfileFilename,
-		AuthorizationClassification: req.AuthorizationClassification,
+		AuthorizationClassification: string(req.AuthorizationClassification),
 		ConductorJobID:              cacheJobID,
 	})
 

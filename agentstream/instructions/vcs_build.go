@@ -61,7 +61,7 @@ type VcsBuildRequest struct {
 	// rechecks; omitted or any other value is an explicit legacy deploy
 	// and never performs a recheck, even though ConductorJobID may still
 	// be present. There is no fallback in either direction.
-	AuthorizationClassification string `json:"authorizationClassification,omitempty"`
+	AuthorizationClassification vcsAuthorizationClass `json:"authorizationClassification,omitempty"`
 }
 
 // isScoped reports this request's EXPLICIT classification. Never inferred
@@ -225,7 +225,7 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 	// entry from another binding, app, job, or source identity must never
 	// satisfy this request (plan "VCS propagation"), and this never falls
 	// back to treating either side's mismatch as legacy.
-	if paths.AuthorizationClassification != req.AuthorizationClassification || paths.ConductorJobID != cacheJobID {
+	if paths.AuthorizationClassification != string(req.AuthorizationClassification) || paths.ConductorJobID != cacheJobID {
 		return replyVcsBuild(replyType, VcsBuildResponse{
 			Success: false,
 			Message: "fetched source does not match this build's authorization",
@@ -289,7 +289,7 @@ func VcsBuild(jsonB64 string) (string, string, error) {
 			BuildOnly:                   req.BuildOnly,
 			Repo:                        cleanRepoURL,
 			Branch:                      req.Branch,
-			AuthorizationClassification: req.AuthorizationClassification,
+			AuthorizationClassification: string(req.AuthorizationClassification),
 			AuthorityJobID:              cacheJobID,
 			// Cleanup deletes the specific workdir this build used, from
 			// this job's own isolated cache slot (review finding 1400): a
