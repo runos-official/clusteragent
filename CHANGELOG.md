@@ -7,6 +7,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.3.0-rc.9
+
+This hidden release candidate republishes the scoped upload validation from
+v1.3.0-rc.8 for integrated verification. It includes the same cluster agent code.
+
 ## v1.3.0-rc.8
 
 This hidden release candidate makes scoped upload validation match Conductor's app identity.
