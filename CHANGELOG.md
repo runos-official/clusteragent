@@ -7,6 +7,37 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.3.0
+
+This release adds the cluster agent's part of scoped machine credentials. A deployment that starts with a scoped credential is bound to that credential's authority for its whole life, and the agent asks again before each later stage. It needs the Conductor and Nodeward releases of the same work.
+
+### Added
+- **A scoped upload carries its authority with it.** The agent stores the authority binding of a scoped upload, and enforces the upload's purpose and the expiry of the binding.
+- **The agent asks again before it keeps an archive.** Before it persists an uploaded archive, the agent rechecks that the scoped authority still holds. A credential that was revoked or narrowed after the upload started stops here.
+- **The agent asks again before each queued build stage.** A build that waits in the queue is rechecked when it starts, not only when it was accepted.
+- **The control connection reports which scoped deployment instructions the agent supports.**
+
+### Changed
+- **Each agent stream has one lifetime.** A recheck permit belongs to the stream that granted it. A permit from a stream that closed or was replaced is refused, so an upload cannot continue on authority from a connection that is gone.
+- **A refused upload records its failure before the token is claimed**, and a late refusal cannot overwrite the result of the upload that won.
+- **The Dockerfile target check and the extraction agree.** The check before the token claim and the later extraction use the same rules for path components, symlinks and entry order, so a build context is not refused at one step and accepted at the other.
+- **The agent confirms the exact scope and expiry it saved for a scoped upload**, and refuses unknown authorization classes and scoped instructions with missing bindings.
+- **A scoped deployment reports success after Kubernetes accepts the authorized image update.** Each retry obtains a fresh deployment permit.
+- **Scoped mutations use versioned instructions and a matching upload acknowledgement.** A stored scoped upload can only be consumed by an agent that understands its generation.
+
+### Fixed
+- **The agent verifies the Kubernetes app name against its canonical app ID and namespace** when an upload token is created and when it is consumed.
+
+### Security
+- **The public-repo secret gates recognise the Account API Key and Roid's OAuth client-secret shape.** `make leakcheck` and the release sensitivity scan flag both, alongside the personal access token shape.
+
+### Known limit
+- When the shared build configuration names one registry and its credentials name another, and both stay that way, the agent cannot tell. A build-image upload could then push to a registry that was not the one verified. This needs a change on the control plane and is tracked for a later release.
+
+## v1.3.0-rc.10
+
+This hidden release candidate is cut from the release commit for final verification. It includes the same cluster agent code as v1.3.0-rc.9.
+
 ## v1.3.0-rc.9
 
 This hidden release candidate republishes the scoped upload validation from
