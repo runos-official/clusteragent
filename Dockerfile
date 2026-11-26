@@ -1,14 +1,14 @@
 # Base images are pinned by digest in addition to the tag so a re-tag upstream
 # can't silently change what we build/ship. To refresh after a deliberate base
 # bump, resolve the new multi-arch index digest with:
-#   docker buildx imagetools inspect golang:1.26.10-alpine3.23   # copy the Digest
+#   docker buildx imagetools inspect golang:1.26.11-alpine3.23   # copy the Digest
 #   docker buildx imagetools inspect alpine:3.22
 # The build stage runs natively on the BUILD platform (no QEMU) and
 # cross-compiles to the TARGET platform with Go's own toolchain. The agent is
 # now CGO-free (pure-Go GORM + Postgres + glebarez SQLite drivers), so no C
 # toolchain or sqlite-dev is needed and the resulting binary is already static.
-# Go base matches the go.mod toolchain line (go1.26.10, FCR 1654).
-FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine3.23@sha256:0525c952defebc693cdaf62cdf43afa32be5a7f377e99260642ea19c240c708e AS build_deps
+# Go base matches the go.mod toolchain line (go1.26.11).
+FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine3.23@sha256:23f198931d4bd83b4f5a613bd75656257ae8bf832dcbc2db80e1050b5219ca2a AS build_deps
 
 RUN apk add --no-cache git
 

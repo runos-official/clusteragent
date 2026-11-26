@@ -4,7 +4,7 @@ Thanks for contributing to the RunOS cluster agent.
 
 ## Prerequisites
 
-- **Go 1.24+** (see `go.mod`). CGO must be enabled for the SQLite driver
+- **Go 1.26.11+** (see the `toolchain` line in `go.mod`). CGO must be enabled for the SQLite driver
   (`CGO_ENABLED=1`); `make build` sets this for you.
 - **Docker Buildx** if you build the container image locally.
 

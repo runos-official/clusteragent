@@ -29,6 +29,7 @@ This release adds the cluster agent's part of scoped machine credentials. A depl
 - **The agent verifies the Kubernetes app name against its canonical app ID and namespace** when an upload token is created and when it is consumed.
 
 ### Security
+- **The agent builds with Go 1.26.11 instead of Go 1.26.10.** Go 1.26.11 fixes GO-2026-6859, a race in net/http that can crash an HTTP/1 server, which govulncheck reported as reachable from this code. The go.mod toolchain line and the build image (golang:1.26.11-alpine3.23, pinned by digest) move together.
 - **The public-repo secret gates recognise the Account API Key and Roid's OAuth client-secret shape.** `make leakcheck` and the release sensitivity scan flag both, alongside the personal access token shape.
 
 ### Known limit
