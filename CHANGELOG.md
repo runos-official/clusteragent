@@ -7,6 +7,20 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.4.0-rc.1
+
+This hidden release candidate lets the cluster agent roll out with no gap. Conductor uses a rolling update only for an agent at v1.4.0 or newer, so older agents keep the Recreate strategy.
+
+### Added
+
+- The agent steps aside when a newer pod of its own Deployment holds the connection. It stops reconnecting, reports not Ready, skips certificate renewal and keeps its running builds until the drain. It reconnects when no newer pod has held the connection for one minute.
+- A new `/readyz` endpoint on the `:8080` listener. It reports Ready after the first answered heartbeat, while the agent is not displaced or draining and the HTTPS webhook accepts connections. `/health` is unchanged.
+- A new `siblings` package reads the agent pods of the Deployment.
+
+### Changed
+
+- The startup build cleanup waits until no other agent pod runs (at most 38 minutes), so the build pods of a draining agent are not removed as orphans.
+
 ## v1.3.0
 
 This release adds the cluster agent's part of scoped machine credentials. A deployment that starts with a scoped credential is bound to that credential's authority for its whole life, and the agent asks again before each later stage. It needs the Conductor and Nodeward releases of the same work.
