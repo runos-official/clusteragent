@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -125,5 +126,37 @@ func TestReconcileUntilDone_GivesUpAfterTheCapAndStillReleases(t *testing.T) {
 	}
 	if released != 1 {
 		t.Fatalf("released = %d, want exactly 1 after the cap", released)
+	}
+}
+
+// A rolling update starts the new agent pod while the old one still runs.
+// The old pod's build pods and open build rows are not orphans then, so the
+// new pod must not sweep or close them until the old pod has gone. Before
+// this change the new pod cleaned up at once and killed the old pod's
+// builds.
+func TestStartupCleanup_WaitsUntilNoOtherAgentPodRuns(t *testing.T) {
+	var events []string
+	alone := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		startupCleanup(
+			func() { <-alone; events = append(events, "alone") },
+			func() { events = append(events, "sweep pods") },
+			func(string) (int, error) { events = append(events, "close rows"); return 0, nil },
+			func() { events = append(events, "release") },
+			time.Millisecond, time.Second,
+		)
+	}()
+	select {
+	case <-done:
+		t.Fatalf("cleanup ran while another agent pod still ran: %v", events)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(alone)
+	<-done
+	want := "[alone sweep pods close rows release]"
+	if got := fmt.Sprint(events); got != want {
+		t.Fatalf("events = %s, want %s", got, want)
 	}
 }

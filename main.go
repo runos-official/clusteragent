@@ -22,6 +22,7 @@ import (
 	"github.com/runos-official/clusteragent/datastore"
 	"github.com/runos-official/clusteragent/dns01"
 	"github.com/runos-official/clusteragent/drain"
+	"github.com/runos-official/clusteragent/siblings"
 	"github.com/runos-official/clusteragent/sqlwrapper"
 	"github.com/runos-official/clusteragent/version"
 	"github.com/runos-official/clusteragent/webhook"
@@ -82,27 +83,25 @@ func main() {
 	// just made.
 	drain.Hold()
 
-	// One-shot build cleanup: sweep orphaned per-build BuildKit pods (their
-	// builds died with the previous agent process) and tear down the legacy
-	// shared buildkitd daemon if this cluster still runs one.
-	podSweepDone := make(chan struct{})
-	go func() {
-		defer close(podSweepDone)
-		k8sClient, err := agentstream.NewK8sClient()
-		if err != nil {
-			log.Printf("Build startup cleanup skipped, no k8s client: %v", err)
-			return
-		}
-		buildkitclient.StartupCleanup(k8sClient.GetClientset())
-	}()
-
-	// Close the build rows that the previous process left pending or busy. The
-	// system database may not be ready yet, so this retries. It releases the
-	// hold once the pod sweep above has also finished.
-	go reconcileUntilDone(datastore.FailNonTerminalBuildKitJobs, func() {
-		<-podSweepDone
-		drain.Release()
-	}, reconcileRetryEvery, reconcileMaxWait)
+	// One-shot build cleanup, once no other agent pod runs (a rolling update
+	// keeps the old pod running until this one is Ready). Sweep orphaned
+	// per-build BuildKit pods (their builds died with the previous agent
+	// process), tear down the legacy shared buildkitd daemon if this cluster
+	// still runs one, then close the build rows that the previous process
+	// left pending or busy. The system database may not be ready yet, so the
+	// row cleanup retries. The hold is released at the end.
+	k8sClient, k8sErr := agentstream.NewK8sClient()
+	go startupCleanup(
+		func() { waitUntilAlone(k8sClient, k8sErr) },
+		func() {
+			if k8sErr != nil {
+				log.Printf("Build startup cleanup skipped, no k8s client: %v", k8sErr)
+				return
+			}
+			buildkitclient.StartupCleanup(k8sClient.GetClientset())
+		},
+		datastore.FailNonTerminalBuildKitJobs, drain.Release,
+		reconcileRetryEvery, reconcileMaxWait)
 
 	// Start services
 	go dns01.Start()
@@ -119,4 +118,26 @@ func main() {
 	timeout := drainTimeout()
 	log.Printf("Received %s: draining for up to %s", sig, timeout)
 	shutdown(drainWithProgress, datastore.FailNonTerminalBuildKitJobs, timeout)
+}
+
+// waitUntilAlone blocks until no other agent pod runs, or until aloneMaxWait
+// has passed. Without a Kubernetes client it returns at once, as before.
+func waitUntilAlone(k8sClient *agentstream.K8sClient, k8sErr error) {
+	if k8sErr != nil {
+		return
+	}
+	self := siblings.SelfName()
+	list := func() ([]siblings.Pod, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return siblings.List(ctx, k8sClient.GetClientset())
+	}
+	start := time.Now()
+	if siblings.WaitUntilAlone(list, self, aloneCheckEvery, aloneMaxWait, time.Sleep, time.Now) {
+		if waited := time.Since(start); waited > aloneCheckEvery {
+			log.Printf("Build startup cleanup: the other agent pod has gone after %s", waited.Round(time.Second))
+		}
+		return
+	}
+	log.Printf("Build startup cleanup: another agent pod still runs after %s; cleaning up anyway", aloneMaxWait)
 }
