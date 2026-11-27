@@ -83,6 +83,10 @@ func (sm *streamManager) startCertMonitor() {
 		case <-ticker.C:
 			sm.checkAndRenew()
 		case <-sigChan:
+			if Displaced() {
+				log.Println("Cert monitor: received SIGUSR1, but this pod stepped aside for a newer agent pod; not renewing")
+				continue
+			}
 			log.Println("Cert monitor: received SIGUSR1, forcing certificate renewal...")
 			if err := sm.renewCert(); err != nil {
 				log.Printf("Cert monitor: manual renewal failed: %v", err)
@@ -92,6 +96,13 @@ func (sm *streamManager) startCertMonitor() {
 }
 
 func (sm *streamManager) checkAndRenew() {
+	// A pod that stepped aside for a newer agent pod leaves the shared
+	// certificate Secret to the pod that holds the connection.
+	if Displaced() {
+		log.Println("Cert monitor: this pod stepped aside for a newer agent pod; skipping the check")
+		return
+	}
+
 	// Always log cert status on each daily check
 	LogCertStatus(sm.clusterAgentTLS)
 
@@ -113,7 +124,11 @@ func (sm *streamManager) checkAndRenew() {
 		log.Printf("Cert monitor: certificate expiring within %d days, initiating renewal...", renewalThresholdDays)
 	}
 
-	if err := sm.renewCert(); err != nil {
+	renew := sm.renew
+	if renew == nil {
+		renew = sm.renewCert
+	}
+	if err := renew(); err != nil {
 		log.Printf("Cert monitor: renewal failed: %v", err)
 	}
 }

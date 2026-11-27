@@ -34,6 +34,14 @@ type streamManager struct {
 	// heartbeatInterval is how often the stream sends a heartbeat. Zero means
 	// defaultHeartbeatInterval; tests set it shorter.
 	heartbeatInterval time.Duration
+
+	// renew renews the agent certificate. Nil means renewCert; tests set it.
+	renew func() error
+
+	// handover decides when this agent steps aside for a newer pod of its
+	// Deployment (stepaside.go). Nil turns the handover off; tests leave it
+	// nil unless they test it.
+	handover *handover
 }
 
 const defaultHeartbeatInterval = 5 * time.Second
@@ -50,6 +58,7 @@ func Start() {
 	log.Println("Connecting to the RunOS servers...")
 
 	sm := bootstrap()
+	sm.handover = newHandover(sm.k8s)
 
 	// Start daily certificate monitoring and auto-renewal
 	go sm.startCertMonitor()
@@ -254,7 +263,7 @@ func retryStepVoid(name string, op func() error) {
 // blip. Disconnection is surfaced via the health endpoint (StreamConnected),
 // not by crashing.
 func (sm *streamManager) runWithReconnect() {
-	sm.reconnectLoop(reconnectDeps{
+	d := reconnectDeps{
 		establish: sm.establishAndMaintainStream,
 		connect: func(ctx context.Context) (l2sec.NodewardClient, *grpc.ClientConn, error) {
 			return ConnectToServer(sm.clusterAgentTLS, sm.serverHost, ctx)
@@ -262,7 +271,12 @@ func (sm *streamManager) runWithReconnect() {
 		sleep:   time.Sleep,
 		now:     time.Now,
 		backoff: newReconnectBackoff(nil),
-	})
+	}
+	if sm.handover != nil {
+		d.stepAside = sm.handover.stepAsideAfter
+		d.waitAside = sm.handover.waitAside
+	}
+	sm.reconnectLoop(d)
 }
 
 // reconnectDeps are the parts of the reconnect loop a test swaps out.
@@ -272,6 +286,10 @@ type reconnectDeps struct {
 	sleep     func(time.Duration)
 	now       func() time.Time
 	backoff   *reconnectBackoff
+	// stepAside and waitAside are the handover (stepaside.go). Nil means
+	// the loop always reconnects.
+	stepAside func(error) bool
+	waitAside func()
 }
 
 func (sm *streamManager) reconnectLoop(d reconnectDeps) {
@@ -288,12 +306,20 @@ func (sm *streamManager) reconnectLoop(d reconnectDeps) {
 			return
 		}
 
-		// Full jitter, no attempt ceiling. The schedule starts again only
-		// after the stream stayed up a while (FPL315).
-		bo.connectionEnded(d.now().Sub(started))
-		delay := bo.next()
-		log.Printf("THROTTLED stream disconnected: %v. Reconnecting in %s (attempt %d)", err, delay, bo.attempt)
-		d.sleep(delay)
+		if d.stepAside != nil && d.stepAside(err) {
+			// A newer pod of this Deployment holds the connection. Do not
+			// take it back: wait aside until Kubernetes stops this pod, or
+			// until no newer pod holds the connection any more.
+			log.Printf("Stream ended (%v); stepped aside for a newer agent pod", err)
+			d.waitAside()
+		} else {
+			// Full jitter, no attempt ceiling. The schedule starts again only
+			// after the stream stayed up a while (FPL315).
+			bo.connectionEnded(d.now().Sub(started))
+			delay := bo.next()
+			log.Printf("THROTTLED stream disconnected: %v. Reconnecting in %s (attempt %d)", err, delay, bo.attempt)
+			d.sleep(delay)
+		}
 
 		// Try to reconnect. A fresh per-attempt timeout, never a shared budget.
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrapConnectTimeout)
@@ -333,6 +359,9 @@ func (sm *streamManager) establishAndMaintainStream() error {
 	stream, err := sm.client.ClusterAgentStream(streamCtx)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
+	}
+	if sm.handover != nil {
+		go sm.handover.watch(streamCtx, cancelStream)
 	}
 
 	return sm.runStream(streamCtx, stream, nil)
@@ -470,6 +499,9 @@ func (sm *streamManager) runHeartbeat(ctx context.Context, lt *Lifetime) error {
 			}
 
 			consecutiveFailures = 0
+			// An answered heartbeat proves the server routes replies to this
+			// stream: this agent holds the connection (Ready, stepaside.go).
+			connectionHeld.Store(true)
 			log.Printf("Received heartbeat response: %s", res.Type)
 		}
 	}

@@ -30,6 +30,14 @@ const (
 	reconcileRetryEvery = 3 * time.Second
 	reconcileMaxWait    = 2 * time.Minute
 
+	// aloneCheckEvery and aloneMaxWait bound the wait for the old agent pod
+	// to go before the startup cleanup. The old pod drains for at most the
+	// Deployment's termination grace period (37 minutes), so after
+	// aloneMaxWait the cleanup runs anyway: a pod that never goes (its node
+	// is down) must not stop builds for ever.
+	aloneCheckEvery = 5 * time.Second
+	aloneMaxWait    = 38 * time.Minute
+
 	reasonRestart = "build interrupted by agent restart: the previous agent process ended while the build ran"
 )
 
@@ -122,4 +130,16 @@ func reconcileUntilDone(failRows failRowsFunc, release func(), every, maxWait ti
 		}
 		time.Sleep(every)
 	}
+}
+
+// startupCleanup runs the one-shot build cleanup of a new agent process,
+// while the work hold keeps new builds out. It first waits until no other
+// agent pod runs (waitAlone). A rolling update starts this pod while the
+// old pod still runs, and the old pod's build pods and open build rows are
+// not orphans until it has gone. Then it sweeps the build pods, closes the
+// build rows that are still open, and releases the hold.
+func startupCleanup(waitAlone func(), sweep func(), failRows failRowsFunc, release func(), every, maxWait time.Duration) {
+	waitAlone()
+	sweep()
+	reconcileUntilDone(failRows, release, every, maxWait)
 }
