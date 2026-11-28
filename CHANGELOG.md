@@ -7,6 +7,24 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release pipeline extracts the section matching the pushed tag (`## vX.Y.Z`)
 as the GitHub release notes, so every released version needs a section here.
 
+## v1.4.0
+
+This release lets the cluster agent roll out with no gap. During an update the new agent pod starts beside the old one and takes the control connection before the old pod stops. Conductor uses a rolling update only between agents at v1.4.0 or newer. The first update from an older agent still replaces the pod in place, and every later update rolls.
+
+### Added
+
+- **The agent steps aside for a newer pod of its own Deployment.** When a newer pod holds the control connection, the older agent stops reconnecting, reports not Ready, skips certificate renewal and keeps its running builds until the drain. It reconnects when no newer pod has held the connection for one minute.
+- **A new `/readyz` endpoint on the `:8080` listener.** It reports Ready after the first answered heartbeat, while the agent is not displaced or draining and the HTTPS webhook accepts connections. `/health` is unchanged.
+- **A new `siblings` package reads the agent pods of the Deployment.**
+
+### Changed
+
+- **The startup build cleanup waits until no other agent pod runs** (at most 38 minutes), so the build pods of a draining agent are not removed as orphans.
+
+## v1.4.0-rc.2
+
+This hidden release candidate is cut from the release commit for final verification. It includes the same cluster agent code as v1.4.0-rc.1.
+
 ## v1.4.0-rc.1
 
 This hidden release candidate lets the cluster agent roll out with no gap. Conductor uses a rolling update only for an agent at v1.4.0 or newer, so older agents keep the Recreate strategy.
